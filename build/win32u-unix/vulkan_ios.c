@@ -27,6 +27,34 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#ifdef MADEIRA_MOLTENVK
+extern void *madeira_vulkan_symbol(const char *name);
+#endif
+static char ios_vulkan_token;
+static void *ios_vulkan_open(const char *name, int flags)
+{
+    if (strcmp(name, "madeira-static-moltenvk")) return dlopen(name, flags);
+#ifndef MADEIRA_MOLTENVK
+    return NULL;
+#else
+    fprintf(stderr, "[vk-win32u] binding statically linked MoltenVK backend\n");
+    return &ios_vulkan_token;
+#endif
+}
+static void *ios_vulkan_sym(void *handle, const char *name)
+{
+    if (handle != &ios_vulkan_token) return dlsym(handle, name);
+#ifdef MADEIRA_MOLTENVK
+    return madeira_vulkan_symbol(name);
+#else
+    return NULL;
+#endif
+}
+static int ios_vulkan_close(void *handle)
+{
+    return handle == &ios_vulkan_token ? 0 : dlclose(handle);
+}
+
 static void *madeira_vulkan_dlopen( const char *name, int flags );
 static int madeira_vulkan_pthread_once( pthread_once_t *once, void (*init)(void) );
 
@@ -35,8 +63,12 @@ static int madeira_vulkan_pthread_once( pthread_once_t *once, void (*init)(void)
 #undef SONAME_LIBVULKAN
 #define SONAME_LIBVULKAN "MADEIRA_VULKAN_LIBRARY"
 #define dlopen( name, flags ) madeira_vulkan_dlopen( name, flags )
+#define dlsym ios_vulkan_sym
+#define dlclose ios_vulkan_close
 #define pthread_once( once, init ) madeira_vulkan_pthread_once( once, init )
 #include "../../wine/dlls/win32u/vulkan.c"
+#undef dlsym
+#undef dlclose
 #undef dlopen
 #undef pthread_once
 
@@ -71,7 +103,7 @@ static void *madeira_vulkan_dlopen( const char *name, int flags )
     }
     /* MoltenVK: errors only, as for Zink (opengl_ios.c); madeira.cfg env.MVK_* wins */
     setenv( "MVK_CONFIG_LOG_LEVEL", "1", 0 );
-    if (!(handle = dlopen( path, flags )))
+    if (!(handle = ios_vulkan_open( path, flags )))
         dprintf( 2, "[winios-vk] cannot load %s: %s\n", path, dlerror() );
     else
         dprintf( 2, "[winios-vk] Vulkan library %s loaded\n", path );
@@ -79,137 +111,5 @@ static void *madeira_vulkan_dlopen( const char *name, int flags )
 }
 
 
-/***********************************************************************
- * winios Vulkan driver: VK_KHR_win32_surface on VK_EXT_metal_surface
- *
- * Mirrors winemac.drv's vulkan.c. The surface's layer is the CAMetalLayer a
- * D3D swapchain on the same window would present to (IOSDisplayShim.m); the
- * window is marked as presenting through Metal, like a DXMT swapchain's. Without
- * a layer (or without VK_EXT_metal_surface) it falls back to win32u's own
- * headless surface, which renders but shows nothing.
- */
 
-/* app/Madeira/IOSDisplayShim.m; weak so a build without it still links */
-extern void *madeira_vulkan_layer_for_hwnd( void *hwnd ) __attribute__((weak));
-
-static BOOL winios_vk_metal_surface;
-
-static VkResult winios_vulkan_surface_create( HWND hwnd, const struct vulkan_instance *instance,
-                                              VkSurfaceKHR *surface, struct client_surface **client )
-{
-    VkMetalSurfaceCreateInfoEXT info = {.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT};
-    VkResult res;
-
-    if (!(*client = nulldrv_client_surface_create( hwnd ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
-
-    if (winios_vk_metal_surface && instance->p_vkCreateMetalSurfaceEXT && madeira_vulkan_layer_for_hwnd)
-        info.pLayer = madeira_vulkan_layer_for_hwnd( hwnd );
-
-    if (info.pLayer)
-    {
-        res = instance->p_vkCreateMetalSurfaceEXT( instance->host.instance, &info, NULL, surface );
-        dprintf( 2, "[winios-vk] metal surface for hwnd %p (layer %p): %d\n", hwnd, info.pLayer, res );
-    }
-    else if (instance->p_vkCreateHeadlessSurfaceEXT)
-    {
-        VkHeadlessSurfaceCreateInfoEXT headless = {.sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT};
-        res = instance->p_vkCreateHeadlessSurfaceEXT( instance->host.instance, &headless, NULL, surface );
-        dprintf( 2, "[winios-vk] no CAMetalLayer for hwnd %p: headless surface (nothing is shown): %d\n",
-                 hwnd, res );
-    }
-    else res = VK_ERROR_INCOMPATIBLE_DRIVER;
-
-    if (res)
-    {
-        client_surface_release( *client );
-        *client = NULL;
-    }
-    return res;
-}
-
-static VkBool32 winios_get_physical_device_presentation_support( struct vulkan_physical_device *physical_device,
-                                                                 uint32_t queue )
-{
-    return VK_TRUE;
-}
-
-static void winios_map_instance_extensions( struct vulkan_instance_extensions *extensions )
-{
-    if (winios_vk_metal_surface)
-    {
-        if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_EXT_metal_surface = 1;
-        if (extensions->has_VK_EXT_metal_surface) extensions->has_VK_KHR_win32_surface = 1;
-    }
-    else
-    {
-        if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_EXT_headless_surface = 1;
-        if (extensions->has_VK_EXT_headless_surface) extensions->has_VK_KHR_win32_surface = 1;
-    }
-}
-
-static void winios_map_device_extensions( struct vulkan_device_extensions *extensions )
-{
-}
-
-static const struct vulkan_driver_funcs winios_vulkan_driver_funcs =
-{
-    .p_vulkan_surface_create = winios_vulkan_surface_create,
-    .p_get_physical_device_presentation_support = winios_get_physical_device_presentation_support,
-    .p_map_instance_extensions = winios_map_instance_extensions,
-    .p_map_device_extensions = winios_map_device_extensions,
-};
-
-/* ml1380: does the library offer VK_EXT_metal_surface? MoltenVK exports every entry
- * point, so the old dlsym( "vkCreateMetalSurfaceEXT" ) test found it. A Mesa driver
- * used as the library (KosmicKrisp) exports only vkGetInstanceProcAddr and
- * vkGetDeviceProcAddr: that test failed, the driver fell back to
- * VK_EXT_headless_surface, which a Metal-platform Mesa build does not offer, and
- * every vkCreateInstance that enabled VK_KHR_win32_surface failed with
- * VK_ERROR_EXTENSION_NOT_PRESENT. Ask the library's own extension list instead.
- * MADEIRA_VK_SURFACE_QUERY=0 restores the dlsym-only test. */
-static BOOL winios_vk_library_has_extension( void *vulkan_handle, const char *name, BOOL *headless )
-{
-    PFN_vkGetInstanceProcAddr gipa = dlsym( vulkan_handle, "vkGetInstanceProcAddr" );
-    PFN_vkEnumerateInstanceExtensionProperties enumerate;
-    VkExtensionProperties *props;
-    uint32_t count = 0, i;
-    BOOL found = FALSE;
-
-    *headless = FALSE;
-    if (!gipa) return FALSE;
-    enumerate = (PFN_vkEnumerateInstanceExtensionProperties)gipa( NULL, "vkEnumerateInstanceExtensionProperties" );
-    if (!enumerate || enumerate( NULL, &count, NULL ) || !count) return FALSE;
-    if (!(props = calloc( count, sizeof(*props) ))) return FALSE;
-    if (enumerate( NULL, &count, props ) >= 0)
-    {
-        for (i = 0; i < count; i++)
-        {
-            if (!strcmp( props[i].extensionName, name )) found = TRUE;
-            if (!strcmp( props[i].extensionName, "VK_EXT_headless_surface" )) *headless = TRUE;
-        }
-    }
-    free( props );
-    return found;
-}
-
-UINT winios_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs )
-{
-    const char *query = getenv( "MADEIRA_VK_SURFACE_QUERY" );
-    BOOL exported, listed = FALSE, headless = FALSE;
-
-    if (version != WINE_VULKAN_DRIVER_VERSION)
-    {
-        ERR( "version mismatch, win32u wants %u but driver has %u\n", version, WINE_VULKAN_DRIVER_VERSION );
-        return STATUS_INVALID_PARAMETER;
-    }
-    exported = vulkan_handle && dlsym( vulkan_handle, "vkCreateMetalSurfaceEXT" );
-    if (vulkan_handle && !(query && *query == '0'))
-        listed = winios_vk_library_has_extension( vulkan_handle, "VK_EXT_metal_surface", &headless );
-    winios_vk_metal_surface = exported || listed;
-    dprintf( 2, "[winios-vk] ml1380 driver ready (%s surfaces; exported=%d listed=%d headless=%d%s)\n",
-             winios_vk_metal_surface ? "VK_EXT_metal_surface" : "headless", exported, listed, headless,
-             !winios_vk_metal_surface && !headless && !(query && *query == '0')
-                 ? "; the library offers neither, so VK_KHR_win32_surface is unavailable" : "" );
-    *driver_funcs = &winios_vulkan_driver_funcs;
-    return STATUS_SUCCESS;
-}
+#include "vulkan_surface_ios.c"

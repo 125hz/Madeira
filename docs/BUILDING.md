@@ -177,3 +177,11 @@ rebuild, signing and installation has NOT been performed. Until it is,
 docs/LICENSING.md keeps the relink capability marked unverified. The
 alternative the LGPL offers, shipping the application's object files, is
 not currently done.
+
+## Optional experimental Windows x64 Vulkan route
+
+See `build/vulkan-ios/README.md` for the pinned MoltenVK input, explicit
+`MADEIRA_MOLTENVK=1` native builds and optional app link flag, Wine DLL builds,
+and Windows-side enumerate/readback/presentation fixtures. The normal native
+build and app link do not require MoltenVK. Existing prerequisites above still
+apply; this route is not a replacement bootstrap or complete Vulkan support.

@@ -12220,6 +12220,7 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             libname = "winemetal";
             funcs64 = (const void *)dxmt_winemetal_unix_call_funcs;
             funcs_wow64 = (const void *)dxmt_winemetal_unix_call_wow64_funcs;
+
         } else if (wow && ((match && strstr(match, "d3d9shim")) ||
                            (modname && strstr(modname, "d3d9shim")))) {
             /* The i386 D3D9 shim, bound to the native ARM64 frontend.  A

@@ -11,6 +11,12 @@ APP_LIB="$REPO_ROOT/app/Madeira/libntdll_unix.a"
 
 mkdir -p "$OBJ_DIR"
 
+# Optional Vulkan route; do not change the normal native build.
+VULKAN_FLAGS=()
+if [ "${MADEIRA_MOLTENVK:-0}" = 1 ]; then
+    VULKAN_FLAGS=(-DMADEIRA_MOLTENVK=1)
+fi
+
 # Detect optional diagnostic fields in the SDK used for this target build.
 # Keep SDK versions without this member buildable; it is not a runtime requirement.
 RUSAGE_PAGE_WAIT_FLAGS=()
@@ -18,6 +24,7 @@ if printf '#include <sys/resource.h>\nvoid probe(struct rusage_info_v6 *r) { (vo
     xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
         -miphoneos-version-min=17.0 -x c -fsyntax-only - >/dev/null 2>&1; then
     RUSAGE_PAGE_WAIT_FLAGS=(-DMADEIRA_HAVE_RUSAGE_PAGE_WAIT_TIME_MACH=1)
+
 fi
 
 SUCCEEDED=0
@@ -33,6 +40,7 @@ compile_one() {
     if xcrun -sdk iphoneos clang \
         -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
         -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
+        "${VULKAN_FLAGS[@]}" \
         -Wno-implicit-function-declaration -Wno-int-conversion \
         -include "$WINE_BUILD/include/config.h" \
         -include "$BUILD_DIR/shims/wine_ios_exit.h" \
@@ -73,6 +81,7 @@ compile_unixlib() {
     if xcrun -sdk iphoneos clang \
         -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
         -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
+        "${VULKAN_FLAGS[@]}" \
         -Wno-implicit-function-declaration -Wno-int-conversion \
         -include "$WINE_BUILD/include/config.h" \
         -include "$BUILD_DIR/shims/wine_ios_exit.h" \
