@@ -45,7 +45,7 @@ fi
 export PATH="$VENV/bin:$PATH"
 
 # Patches are applied once; the marker keeps re-runs idempotent.
-for p in "$HERE"/patches/*.patch; do
+for p in "$HERE"/patches/[0-9]*.patch; do  # kosmickrisp-ios-* belong to build-kosmickrisp.sh
     [ -e "$p" ] || continue
     m="$SRC/.madeira-applied-$(basename "$p")"
     if [ ! -f "$m" ]; then
@@ -57,6 +57,11 @@ done
 mkdir -p "$B"
 sed "s|@SDK@|$SDK|g" "$HERE/ios-arm64.cross" > "$B/ios-arm64.cross"
 
+# On-disk shader cache (ml1342): GLSL->NIR and Zink's SPIR-V/pipeline caches persist
+# between runs, compressed with the SDK's zlib. The GL driver points
+# MESA_SHADER_CACHE_DIR at Library/Caches (build/win32u-unix/opengl_ios.c).
+CACHE_OPTS=(-Dshader-cache=enabled -Dshader-cache-default=true -Dshader-cache-max-size=256M -Dzlib=enabled)
+
 if [ ! -f "$B/build.ninja" ]; then
     meson setup "$B" "$SRC" --cross-file "$B/ios-arm64.cross" \
         --buildtype=release -Db_ndebug=true --default-library=shared \
@@ -66,11 +71,14 @@ if [ ! -f "$B/build.ninja" ]; then
         -Dosmesa=true \
         -Dopengl=true -Dgles1=disabled -Dgles2=disabled \
         -Dglx=disabled -Degl=disabled -Dgbm=disabled \
-        -Dllvm=disabled -Dshader-cache=disabled -Dxmlconfig=disabled \
+        -Dllvm=disabled "${CACHE_OPTS[@]}" -Dxmlconfig=disabled \
         -Dzstd=disabled -Dlibunwind=disabled -Dvalgrind=disabled -Dlmsensors=disabled \
         -Dexpat=disabled -Dbuild-tests=false \
         -Dvideo-codecs= \
         -Dmoltenvk-dir="$MVK"
+else
+    # an existing build dir from before ml1342 had the cache off
+    meson configure "$B" "${CACHE_OPTS[@]}"
 fi
 ninja -C "$B"
 
