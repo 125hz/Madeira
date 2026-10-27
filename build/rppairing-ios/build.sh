@@ -15,6 +15,12 @@ REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
 TARGET=aarch64-apple-ios
 export IPHONEOS_DEPLOYMENT_TARGET=17.0
 
+if [[ "${GITHUB_ACTIONS:-}" == true && -s "$REPO_ROOT/app/Madeira/libmadeira_rppairing.a" &&
+      -s "$REPO_ROOT/app/Madeira/legal/LICENSES-rppairing-crates.txt" ]]; then
+    echo "Using the input-matched pairing iOS cache"
+    exit 0
+fi
+
 cd "$BUILD_DIR"
 rustup target add "$TARGET"
 cargo build --release --locked --target "$TARGET"

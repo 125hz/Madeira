@@ -24,17 +24,19 @@ jobs:
       ipa: ${{ steps.key.outputs.ipa }}
       reuse: ${{ steps.ipa.outputs.cache-hit }}
       sdk: ${{ steps.sdk.outputs.key }}
+      ipaenv: ${{ steps.sdk.outputs.ipa }}
     steps:
       - uses: actions/checkout@v4
       - name: Check build reuse rules
         run: |
           python3 tests/host/check-build-inputs.py
+          python3 tests/host/check-ci-component-keys.py
           python3 tests/host/check-ci-llvm-cache.py
           python3 tests/host/check-clean-bootstrap.py
       - id: sdk
         run: bash tools/build/ci-input-key.sh
       - id: key
-        run: echo "ipa=ipa-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.sdk.outputs.key }}-$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+        run: echo "ipa=ipa-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.sdk.outputs.ipa }}-$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
       - id: ipa
         uses: actions/cache/restore@v4
         with:
@@ -140,6 +142,11 @@ jobs:
         with:
           key: plan19-${{ steps.sdk.outputs.key }}-${{ steps.key.outputs.key }}
           path: app/Madeira/i386-windows
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          key: mingw-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build/setup-llvm-mingw.sh') }}
+          path: toolchains/llvm-mingw-*
       - name: Build the 32-bit (i386) Windows DLLs
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -162,6 +169,7 @@ jobs:
     runs-on: xcode-27
     env:
       MADEIRA_PLANNED_SDK: ${{ needs.plan.outputs.sdk }}
+      MADEIRA_PLANNED_IPA: ${{ needs.plan.outputs.ipaenv }}
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
@@ -190,14 +198,13 @@ jobs:
           key: plan19-${{ steps.sdk.outputs.key }}-${{ needs.i386.outputs.key }}
           fail-on-cache-miss: true
           path: app/Madeira/i386-windows
-      # Third-party stages only change with their pins or build scripts. Each
-      # script skips when its output exists, so a cache hit leaves just
-      # Madeira's own code (wineserver, ntdll/win32u unix, the app) to build.
+      # Independent caches retain libraries whose own build inputs have not changed.
       - id: pins
         run: |
           echo "wine=$(git rev-parse HEAD:wine)" >> "$GITHUB_OUTPUT"
           echo "dxmt=$(git rev-parse HEAD:dxmt)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      # Seed the split caches only when every legacy input still matches.
+      - uses: actions/cache/restore@v4
         with:
           key: plan19-${{ steps.sdk.outputs.key }}-deps-v2-${{ hashFiles('build/gnutls-ios/**', 'build/ffmpeg/build.sh', 'build/ffmpeg/src/**', 'build/freetype-ios/build.sh', 'tools/build/build-freetype-ios.sh', 'tools/build/setup-llvm-mingw.sh') }}
           path: |
@@ -208,15 +215,48 @@ jobs:
             build/ffmpeg/obj
             build/freetype-ios/build
             research/freetype
+      - id: cache-mingw
+        uses: actions/cache@v4
+        with:
+          key: mingw-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build/setup-llvm-mingw.sh') }}
+          path: toolchains/llvm-mingw-*
+      - id: cache-gnutls
+        uses: actions/cache@v4
+        with:
+          key: plan19-${{ steps.sdk.outputs.key }}-gnutls-${{ hashFiles('build/gnutls-ios/build.sh', 'build/gnutls-ios/src/**', 'tools/build/sync-gnutls-libs.sh') }}
+          path: |
+            toolchains/gnutls-ios
+            build/gnutls-ios/obj/*.done
+      - id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          key: plan19-${{ steps.sdk.outputs.key }}-ffmpeg-${{ hashFiles('build/ffmpeg/build.sh', 'build/ffmpeg/src/**') }}
+          path: |
+            toolchains/ffmpeg-ios
+            build/ffmpeg/obj
+      - id: cache-freetype
+        uses: actions/cache@v4
+        with:
+          key: plan19-${{ steps.sdk.outputs.key }}-freetype-${{ hashFiles('build/freetype-ios/build.sh', 'tools/build/build-freetype-ios.sh') }}
+          path: |
+            build/freetype-ios/build
+            research/freetype
+      - id: cache-rppairing
+        uses: actions/cache@v4
+        with:
+          key: plan19-${{ steps.sdk.outputs.rust }}-rppairing-${{ hashFiles('build/rppairing-ios/**', '.cargo/**', 'rust-toolchain', 'rust-toolchain.toml') }}
+          path: |
+            app/Madeira/libmadeira_rppairing.a
+            app/Madeira/legal/LICENSES-rppairing-crates.txt
       - uses: actions/cache@v4
         with:
-          key: plan19-${{ steps.sdk.outputs.key }}-wine-host-${{ steps.pins.outputs.wine }}-${{ hashFiles('tools/build/build-wine.sh') }}
+          key: plan19-${{ steps.sdk.outputs.key }}-wine-host-${{ steps.pins.outputs.wine }}-${{ hashFiles('tools/build/build-wine.sh', 'tools/build/setup-llvm-mingw.sh') }}
           path: |
             wine/build-macos
             wine/build-arm64ec
       - uses: actions/cache@v4
         with:
-          key: plan19-${{ steps.sdk.outputs.key }}-dxmt-ios-${{ steps.pins.outputs.dxmt }}-${{ steps.pins.outputs.wine }}-${{ hashFiles('build/dxmt-ios/**', 'tools/build/build-dxmt-ios.sh', 'tools/build/build-shader-headers.sh', 'tools/build/build-llvm-ios.sh') }}
+          key: plan19-${{ steps.sdk.outputs.graphics }}-dxmt-ios-${{ steps.pins.outputs.dxmt }}-${{ steps.pins.outputs.wine }}-${{ hashFiles('build/dxmt-ios/build.sh', 'tools/build/build-dxmt-ios.sh', 'tools/build/build-shader-headers.sh', 'tools/build/build-llvm-ios.sh', 'build/madeira-d3d12/deps.sh', 'madeira-d3d12/src/**', 'madeira-d3d12/tests/native/**', 'madeira-d3d12/third_party/**', 'app/Madeira/d3d12/**') }}
           path: |
             app/Madeira/libdxmt_combined.a
             build/dxmt-ios/shader-headers

@@ -65,6 +65,36 @@ restored FEX/DXMT output set; LLVM also checks its archive checksum list and
 required headers. Its source-header cache does not need an LLVM Git checkout.
 Local source builds keep their normal incremental path.
 
+CI keeps separate caches for LLVM, FEX, the 32-bit Windows DLLs, the MinGW
+toolchain, Wine host tools, GnuTLS, FFmpeg, FreeType, Rust pairing and native
+DXMT. Each key includes its own recipes and source inputs. Native, Rust,
+graphics and app settings have separate fingerprints. The Rust fingerprint
+uses the compiler selected in the pairing crate's directory.
+
+| Change | Outputs rebuilt on a cache miss |
+| --- | --- |
+| App source, resources, docs or unrelated workflow edits | App and IPA |
+| FEX pin or recipe | FEX, app and IPA |
+| Wine pin | Wine host tools, Windows DLLs, native DXMT, app and IPA |
+| DXMT pin or shader-header recipe | Windows DLLs, native DXMT, app and IPA |
+| LLVM recipe | LLVM, native DXMT, app and IPA |
+| MinGW recipe | MinGW, Wine host tools, Windows DLLs, app and IPA |
+| GnuTLS, FFmpeg or FreeType recipe/source | That library, app and IPA |
+| Rust source, Cargo inputs, compiler or Rust flags | Pairing library, app and IPA |
+| Native DXMT/converter source or Metal settings | Native DXMT, app and IPA |
+| App configuration or MoltenVK setting | App and IPA |
+| Xcode, SDK, native compiler/flags or runner image | Compiled dependencies, app and IPA |
+
+The downloaded MinGW toolchain has its own host-platform and recipe key.
+No cache uses a prefix fallback. An exact match for the old combined dependency
+cache can seed the new separate caches. Missing pairing notices or LLVM
+archives do not count as a complete restored build.
+
+The host checks cover all 4,096 combinations of twelve representative source
+changes, further Cargo/configuration inputs, and sixteen combinations of native,
+Rust, graphics and app settings. These checks verify the declared invalidation
+rules. The full workflow verifies the native build, IPA package and cache restores.
+
 You can override parallelism with, for example:
 
 ```sh

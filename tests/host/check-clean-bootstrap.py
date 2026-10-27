@@ -95,6 +95,14 @@ ar() { touch "$2"; }
     assert result.returncode == 0, result.stdout + result.stderr
     assert (pipeline / 'trace.packaged').exists()
     print('PASS: the IPA entry point prepares the Rust target, pairing archive and notices before packaging')
+    for name in ['rustup', 'cargo']:
+        (tools / name).write_text('#!/bin/bash\nexit 86\n')
+    cached_env = dict(os.environ, GITHUB_ACTIONS='true', PATH=str(tools) + os.pathsep + os.environ['PATH'])
+    helper = pairing / 'build.sh'
+    assert subprocess.run(['bash', str(helper)], env=cached_env, capture_output=True).returncode == 0
+    (pipeline / 'app/Madeira/legal/LICENSES-rppairing-crates.txt').unlink()
+    assert subprocess.run(['bash', str(helper)], env=cached_env, capture_output=True).returncode != 0
+    print('PASS: a complete pairing cache skips its compiler; missing notices require a rebuild')
 
 for relative in ['build/wineserver/build.sh', 'build/dxmt-ios/build.sh', 'build/fex-ios/build.sh',
                  'build/fex-arm64ec/build.sh', 'build/freetype-ios/build.sh',

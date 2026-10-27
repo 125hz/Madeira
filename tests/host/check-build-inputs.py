@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import textwrap
 import zipfile
+import shutil
+from itertools import product
 
 root = Path(__file__).resolve().parents[2]
 workflow = (root / '.github/workflows/build.yml').read_text()
@@ -24,39 +26,68 @@ with tempfile.TemporaryDirectory(prefix='madeira-build-inputs-') as folder:
     folder = Path(folder)
     for name, content in {
         'xcodebuild': '#!/bin/sh\necho Xcode-test\n',
-        'xcrun': '#!/bin/sh\nif [ "$1" = --sdk ]; then cat "$SDK_INPUT"; else echo clang-test; fi\n',
+        'xcrun': '#!/bin/sh\nif [ "$1" = --sdk ]; then cat "$SDK_INPUT"; else cat "$CLANG_INPUT"; fi\n',
+        'rustc': '#!/bin/sh\ncat "$RUST_INPUT"\n',
+        'git': '#!/bin/sh\nif [ "$1 $2" = "rev-parse --show-toplevel" ]; then echo "$REPO_INPUT"; else exec "$GIT_INPUT" "$@"; fi\n',
     }.items():
         p = folder / name
         p.write_text(content)
         p.chmod(0o755)
     sdk = folder / 'sdk'
     sdk.write_text('27.1\n')
+    clang = folder / 'clang-input'
+    clang.write_text('clang-test\n')
+    rust = folder / 'rust-input'
+    rust.write_text('rust-test\n')
     output = folder / 'output'
     env = dict(os.environ, PATH=str(folder) + os.pathsep + os.environ['PATH'],
-               SDK_INPUT=str(sdk), GITHUB_OUTPUT=str(output))
-    for key in ('CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'CONFIGURATION', 'MADEIRA_MOLTENVK', 'ImageOS', 'ImageVersion', 'MADEIRA_PLANNED_SDK'):
+               SDK_INPUT=str(sdk), CLANG_INPUT=str(clang), RUST_INPUT=str(rust), GITHUB_OUTPUT=str(output),
+               REPO_INPUT=str(root), GIT_INPUT=shutil.which('git'))
+    native_flags = ('CC', 'CXX', 'AR', 'RANLIB', 'CFLAGS', 'CXXFLAGS', 'CPPFLAGS', 'LDFLAGS',
+                    'SDKROOT', 'MACOSX_DEPLOYMENT_TARGET', 'IPHONEOS_DEPLOYMENT_TARGET', 'ImageOS', 'ImageVersion')
+    rust_flags = ('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTUP_TOOLCHAIN')
+    graphics_flags = ('DXMT_METAL_STD', 'MADEIRA_ONLY', 'MADEIRA_MSC_ROOT')
+    app_flags = ('CONFIGURATION', 'MADEIRA_MOLTENVK')
+    for key in (*native_flags, *rust_flags, *graphics_flags, *app_flags, 'MADEIRA_PLANNED_SDK', 'MADEIRA_PLANNED_IPA'):
         env.pop(key, None)
     def fingerprint(extra=None):
         output.unlink(missing_ok=True)
-        subprocess.run(['bash', '-euo', 'pipefail', '-c', script], env=dict(env, **(extra or {})), check=True)
-        return output.read_text().strip()
+        subprocess.run(['bash', '-euo', 'pipefail', '-c', script], cwd=root, env=dict(env, **(extra or {})), check=True)
+        return dict(line.split('=', 1) for line in output.read_text().splitlines())
     first = fingerprint()
     assert first == fingerprint()
     assert first == fingerprint({'JOBS': '3'})
     sdk.write_text('27.2\n')
     assert first != fingerprint()
     sdk.write_text('27.1\n')
-    for key in ('CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'CONFIGURATION', 'MADEIRA_MOLTENVK', 'ImageOS', 'ImageVersion'):
-        assert first != fingerprint({key: 'changed'}), key
-    assert fingerprint({'MADEIRA_PLANNED_SDK': first.split('=', 1)[1]}) == first
-    mismatch = subprocess.run(['bash', '-euo', 'pipefail', '-c', script],
-                              env=dict(env, MADEIRA_PLANNED_SDK='wrong'), capture_output=True)
-    assert mismatch.returncode != 0, 'a different runner image must not publish under the planned key'
+    all_keys = {'key', 'rust', 'graphics', 'ipa'}
+    for flags, changed in [(native_flags, all_keys), (rust_flags, {'rust', 'ipa'}),
+                           (graphics_flags, {'graphics', 'ipa'}), (app_flags, {'ipa'})]:
+        for key in flags:
+            result = fingerprint({key: 'changed'})
+            assert {name for name in first if first[name] != result[name]} == changed, key
+    for file, changed in [(clang, all_keys), (rust, {'rust', 'ipa'})]:
+        original = file.read_text()
+        file.write_text('changed\n')
+        result = fingerprint()
+        assert {name for name in first if first[name] != result[name]} == changed
+        file.write_text(original)
+    dimensions = [('CFLAGS', all_keys), ('RUSTFLAGS', {'rust', 'ipa'}),
+                  ('DXMT_METAL_STD', {'graphics', 'ipa'}), ('CONFIGURATION', {'ipa'})]
+    for selected in product([False, True], repeat=len(dimensions)):
+        result = fingerprint({name: 'changed' for (name, _), enabled in zip(dimensions, selected) if enabled})
+        expected = set().union(*(changed for (_, changed), enabled in zip(dimensions, selected) if enabled))
+        assert {name for name in first if first[name] != result[name]} == expected
+    for name, expected in [('MADEIRA_PLANNED_SDK', first['key']), ('MADEIRA_PLANNED_IPA', first['ipa'])]:
+        assert fingerprint({name: expected}) == first
+        mismatch = subprocess.run(['bash', '-euo', 'pipefail', '-c', script],
+                                  cwd=root, env=dict(env, **{name: 'wrong'}), capture_output=True)
+        assert mismatch.returncode != 0, 'a mismatched runner must not publish under the planned key'
 
     key_step = re.search(r'        run: (echo "ipa=.+)\n', workflow)
     assert key_step
     key_script = key_step[1].replace('${{ runner.os }}', 'macOS').replace('${{ runner.arch }}', 'ARM64')
-    key_script = key_script.replace('${{ steps.sdk.outputs.key }}', first.split('=', 1)[1])
+    key_script = key_script.replace('${{ steps.sdk.outputs.ipa }}', first['ipa'])
     tree = folder / 'repo'
     tree.mkdir()
     def git(*args):
@@ -108,4 +139,5 @@ for p in [root / 'tools/build-ipa.sh', *(root / 'tools/build').glob('*.sh')]:
     assert '$ROOT/scripts/' not in p.read_text(), p
     subprocess.run(['bash', '-n', str(p)], check=True)
 print('PASS SDK/flag invalidation, stable keys, matching restore keys and build script syntax')
+print('PASS isolated Rust/graphics/app inputs and all 16 combinations of build-setting changes')
 print('PASS identical-tree IPA reuse, source/component invalidation and cached IPA rejection')
