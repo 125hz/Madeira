@@ -610,15 +610,16 @@ enum PointerRoute: String {
 
 enum PointerPolicy {
     static func cursorShown(desktop: Bool, directEnabled: Bool, reports: UInt32, shown: Bool,
-                            routingEnabled: Bool = true) -> Bool {
+                            routingEnabled: Bool = true, relative: Bool = false) -> Bool {
         if !routingEnabled { return desktop || (directEnabled && shown) }
+        if relative { return false }
         if desktop { return reports == 0 || shown }
         return directEnabled && shown
     }
     /// - focused: the mouse belongs to the program right now;
     /// - hover: the system reports where the pointer is (iPad, not AssistiveTouch);
     /// - locked: pointer lock is on (motion only, no position);
-    /// - cursorShown: the program shows a cursor (always, in the desktop session);
+    /// - cursorShown: the program shows a cursor and Relative mode is off;
     /// - absoluteAllowed: MADEIRA_POINTER_ABSOLUTE.
     static func route(focused: Bool, hover: Bool, locked: Bool, cursorShown: Bool,
                       absoluteAllowed: Bool) -> PointerRoute {
@@ -1472,6 +1473,8 @@ final class HardwareInput: ObservableObject {
     /// the next touch or absolute move re-syncs them).
     private func followDesktopCursor(_ dx: Int32, _ dy: Int32, sync: Bool) {
         DispatchQueue.main.async {
+            // BCD dd2fe9c: mouse-look must not receive a second, absolute cursor move.
+            guard !Self.mouseRoutingEnabled || HardwareInput.shared.cursorShownForRoute else { return }
             let cur = MetalBackedView.cursor
             let desk = Self.desktopSize()
             let p = DesktopCursor.advance(x: Double(cur.x), y: Double(cur.y), dx: dx, dy: dy,
@@ -1619,7 +1622,7 @@ final class HardwareInput: ObservableObject {
     private var cursorShownForRoute: Bool {
         PointerPolicy.cursorShown(desktop: Self.desktopMode, directEnabled: Self.directCursorEnabled,
                                   reports: cursorState.reports, shown: cursorState.shown != 0,
-                                  routingEnabled: Self.mouseRoutingEnabled)
+                                  routingEnabled: Self.mouseRoutingEnabled, relative: InputSettings.shared.relative)
     }
 
     private func updateRoute() {
@@ -1694,17 +1697,24 @@ final class HardwareInput: ObservableObject {
         }
         let now = CACurrentMediaTime()
         motionLock.lock(); let lastDelta = lastGCDeltaAt; motionLock.unlock()
+        // Adapted from BCD dd2fe9c (2026-10-27): relative mode need not report a hidden cursor.
+        let relative = Self.mouseRoutingEnabled && InputSettings.shared.relative
+        let shown = !relative && cursorState.shown != 0
+        let hiddenFor = relative ? AutoLock.hiddenDelay
+            : (cursorState.reports == 0 || cursorHiddenSince == 0 ? 0 : now - cursorHiddenSince)
+        let sinceReport = Self.mouseRoutingEnabled && (Self.desktopMode || relative)
+            ? 0 : (lastReportAt == 0 ? .infinity : now - lastReportAt)
         let action = AutoLock.decide(
-            locked: pointerLocked, lockedByUs: lockedByUs, cursorShown: cursorState.shown != 0,
-            hiddenFor: cursorState.reports == 0 || cursorHiddenSince == 0 ? 0 : now - cursorHiddenSince,
+            locked: pointerLocked, lockedByUs: lockedByUs, cursorShown: shown,
+            hiddenFor: hiddenFor,
             pointerOver: pointerOver, focused: baseFocused,
-            sinceReport: lastReportAt == 0 ? .infinity : now - lastReportAt,
+            sinceReport: sinceReport,
             sinceMotion: lastDelta == 0 ? .infinity : now - lastDelta)
         switch action {
         case .lock where !autoLockSuppressed:
-            setPointerLocked(true, byUs: true, why: "the program hides its cursor")
+            setPointerLocked(true, byUs: true, why: relative ? "relative pointer mode" : "the program hides its cursor")
         case .unlock:
-            setPointerLocked(false, byUs: true, why: cursorState.shown != 0 ? "the program shows its cursor"
+            setPointerLocked(false, byUs: true, why: shown ? "the program shows its cursor"
                              : baseFocused ? "the program stopped reporting" : "focus lost")
         default:
             break
