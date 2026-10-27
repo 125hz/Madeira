@@ -160,6 +160,11 @@ final class DepotDownloader {
             let values = try? installURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             let available = UInt64(max(0, values?.volumeAvailableCapacityForImportantUsage ?? Int64.max))
             if available < remaining { throw SteamError.insufficientDiskSpace(needed: remaining, available: available) }
+            let headroom = available > remaining ? available - remaining : 0
+            if headroom < 1_073_741_824 {
+                let freeMB = headroom / (1024 * 1024)
+                SteamLog.event("[steam-depot] low disk space warning: \(freeMB) MB free after install")
+            }
         }
 
         // 3. Chunks.

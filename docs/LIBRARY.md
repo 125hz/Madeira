@@ -268,6 +268,11 @@ frames arrive (Metal presents or a desktop surface); after 30 seconds it offers
 until the game's own window is shown, and adds **Show desktop**
 (`docs/MADEIRA_DOCK.md`, "Starting screen"). A row of round glyph-only buttons (their words are
 VoiceOver labels) holds **Show live log**, which shows the most recent log lines.
+Lines known to be harmless in a normal session (Wine's other display drivers,
+Windows' sign-in packages, Steam's optional modules such as SDL3 and
+steamservice, the WoW64 CPU fallback, FEX's code-buffer mprotect note) show in
+grey as "harmless: …" instead of as errors; out of memory (c0000017) never does
+(`tests/host/check-harmless-warnings.py`).
 
 The small menu button (drag to move; it fades after three seconds) opens the
 in-game menu:
@@ -282,7 +287,10 @@ in-game menu:
    pointer settings;
 3. the performance overlay and its fields (FPS, average frame time, CPU load
    with the busiest thread, GPU load with GPU time per frame, memory
-   footprint, battery, and the thermal state: Cool, Warm, Hot or Critical; a
+   footprint, JIT memory (the JIT pool's use from its own log lines, such as
+   "JIT 374/560 MB", "(small)" when iPadOS gave the pool less room at launch,
+   "FULL" once a DLL did not fit; counted with Live logs off too), battery,
+   and the thermal state: Cool, Warm, Hot or Critical; a
    change is logged as `[thermal]` while the overlay is shown), then
    **Diagnostics**: **Capture the next frame** and **GPU sync** F1/F6/F5/F0,
    the developer overlay's CAP and F pills, for Direct3D 12 games (shown only with
@@ -454,6 +462,17 @@ Log tags: `[frontend]`, `[library]` (ml1163: each game's start mode, batch, serv
 `[session-once]`, `[library-surface]`, `[library-metadata]`, `[onboarding]`,
 `[frontend-controller]`, `[frontend-keyboard]`, `[device-load]`, `[promote]`, `[thermal-cap]`.
 
+**Session summary.** When a session returns to the library (or when Madeira
+goes to the background), `LogSummary` reads the log once and writes
+`Documents/madeira-summary.txt`: the program, the programs started and how
+each ended (exit code, or the Windows error in plain words and where it
+crashed), the JIT pool's size and use and whether it ran out, out-of-memory
+and wrong-architecture DLLs, other missing DLLs minus a known-harmless list,
+Quit game and force close, iPadOS refusing a second 32-bit program, and Madeira
+Dock's result in words. A session that never got back is summarised at the
+next launch from `madeira-log.prev.txt`. `tests/host/check-log-summary.py`
+covers it on synthetic logs.
+
 ## Tests
 
 `tests/host/check-frontend.py` (profiles incl. resolution and scaling,
@@ -464,6 +483,8 @@ math, controller commands, the exit hook, and the presence of the details and
 in-game menu options), `tests/host/check-runtime-settings.py`
 (`MadeiraConfig.set` and the Settings defaults) and
 `tests/host/check-library-api.py` (renderer detection and the badge).
+`tests/host/check-jit-pool-meter.py` covers the JIT memory field's parsing
+(split pools, the small-pool note) and that it counts with Live logs off.
 `tests/host/check-onboarding.py` covers first-run setup: the JIT choices,
 pairing import, pages with and without Dock, the done key, the
 `MADEIRA_ONBOARDING` switch, and the wiring (no Wine session, no pool or
