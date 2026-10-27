@@ -1039,23 +1039,33 @@ final class LibraryModel: ObservableObject {
 
     /// What an entry can start: an executable, or (ml1163) a batch file run through cmd.exe.
     static let programExtensions: Set<String> = ["exe", "bat", "cmd"]
+    /// The path relative to drive_c that reaches `url`, or nil when it is
+    /// outside drive_c. Files on an external drive are reached through
+    /// drive_c/External/<name> (ExternalDrives.swift).
+    static func relativeToDrive(_ url: URL) -> String? {
+        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+        if path.hasPrefix(drive.path + "/") { return String(path.dropFirst(drive.path.count + 1)) }
+        for root in ExternalDrives.shared.roots where path.hasPrefix(root.path + "/") {
+            return "External/" + root.name + "/" + path.dropFirst(root.path.count + 1)
+        }
+        return nil
+    }
     static func executable(_ relative: String) throws -> URL {
         let url = drive.appendingPathComponent(relative).resolvingSymlinksInPath().standardizedFileURL
-        guard url.path.hasPrefix(drive.path + "/"), programExtensions.contains(url.pathExtension.lowercased()),
+        guard relativeToDrive(url) != nil, programExtensions.contains(url.pathExtension.lowercased()),
               FileManager.default.fileExists(atPath: url.path) else {
             throw LibraryError.message("Choose an executable (.exe, .bat or .cmd) inside drive_c.")
         }
         return url
     }
     static func inspect(_ url: URL) throws -> LibraryEntry {
-        guard url.resolvingSymlinksInPath().path.hasPrefix(drive.path + "/") else {
-            throw LibraryError.message("The executable must be inside drive_c.")
+        guard let relative = relativeToDrive(url) else {
+            throw LibraryError.message("The executable must be inside drive_c or an external drive.")
         }
         if ["bat", "cmd"].contains(url.pathExtension.lowercased()) {
             // ml1163: a batch file has no PE header. Like every entry it starts
             // directly by default, as upstream starts every game; the details page
             // warns that Wine then stops when cmd.exe, its first process, exits.
-            let relative = String(url.resolvingSymlinksInPath().path.dropFirst(drive.path.count + 1))
             return LibraryEntry(title: url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " "),
                                 relativePath: relative, bits: 0)
         }
@@ -1069,7 +1079,6 @@ final class LibraryModel: ObservableObject {
         guard pe.count == 6, Array(pe.prefix(4)) == [0x50, 0x45, 0, 0] else { throw LibraryError.message("Missing PE header.") }
         let machine = Int(pe[4]) | Int(pe[5]) << 8
         guard machine == 0x14c || machine == 0x8664 else { throw LibraryError.message("Only x86 and x64 executables are supported.") }
-        let relative = String(url.resolvingSymlinksInPath().path.dropFirst(drive.path.count + 1))
         let name = url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " ")
         var entry = LibraryEntry(title: name, relativePath: relative, bits: machine == 0x14c ? 32 : 64)
         entry.graphicsAPI = graphicsImports(url)
@@ -2889,6 +2898,7 @@ struct LibraryView: View {
             }
             if settingsShow(".NET", "Mono", "Wine Mono", "framework", "download") { WineMonoSettingsSection() }
             if settingsShow("saves", "backup", "restore", "save games") { SavesSection() }
+            if settingsShow("external", "drive", "USB", "SSD", "storage") { ExternalDrivesSection() }
             if settingsShow("appearance", "liquid metal", "metal", "glass") {
                 Section {
                     Toggle("Liquid metal", isOn: $liquidMetal.on)
@@ -3203,7 +3213,12 @@ struct ExecutableBrowser: View {
             do {
                 // ml1163: .bat and .cmd files are listed too (they run through cmd.exe).
                 files = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: .skipsHiddenFiles)
-                    .filter { ($0.hasDirectoryPath || LibraryModel.programExtensions.contains($0.pathExtension.lowercased())) && $0.resolvingSymlinksInPath().path.hasPrefix(LibraryModel.drive.path + "/") }
+                    // External drives are linked in as symlinks: list them as folders.
+                    .map { url in
+                        let isDir = (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                        return URL(fileURLWithPath: url.path, isDirectory: isDir == true)
+                    }
+                    .filter { ($0.hasDirectoryPath || LibraryModel.programExtensions.contains($0.pathExtension.lowercased())) && LibraryModel.relativeToDrive($0) != nil }
                     .sorted { if $0.hasDirectoryPath != $1.hasDirectoryPath { return $0.hasDirectoryPath }; return $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             } catch { self.error = error.localizedDescription }
         }
@@ -3562,6 +3577,7 @@ struct LibraryDetail: View {
                     Text(entry.launchArguments).font(.caption.monospaced()).textSelection(.enabled)
                 }
             } header: { Text("Executable") }
+            if model.entries.contains(where: { $0.id == entry.id }) { GameMoveSection(entry: $entry) }
         }
     }
 
@@ -3588,6 +3604,7 @@ struct LibraryDetail: View {
         }
         if entry.steamAppID == nil && entry.desktop != true {
             Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
+            if model.entries.contains(where: { $0.id == entry.id }) { GameMoveSection(entry: $entry) }
             Section { Button("Remove from library", role: .destructive) { remove = true } }
         }
         if let error { Section { Text(error).foregroundStyle(.red) } }

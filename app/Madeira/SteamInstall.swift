@@ -24,8 +24,9 @@ enum SteamInstallPaths {
 
     /// Whether an install (its drive-relative library folder) is in the library
     /// Madeira downloads into, and so can be updated or removed here.
+    /// A library on an external drive (drive_c/External/<name>/...) counts too.
     static func isManaged(library: String) -> Bool {
-        library.caseInsensitiveCompare(libraryRelative) == .orderedSame
+        library.caseInsensitiveCompare(libraryRelative) == .orderedSame || library.hasPrefix("External/")
     }
 }
 
