@@ -33,13 +33,39 @@ code = r'''
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+typedef struct { uint64_t __x[29], __fp, __lr, __sp, __pc; } arm_thread_state64_t;
+typedef struct { __uint128_t __v[32]; } arm_neon_state64_t;
+typedef uintptr_t mach_vm_address_t;
+typedef size_t mach_vm_size_t;
+typedef unsigned mach_msg_type_number_t;
+typedef int mach_port_t;
+typedef int *vm_region_info_t;
+typedef struct { int protection; } vm_region_basic_info_data_64_t;
+#define VM_REGION_BASIC_INFO_COUNT_64 1
+#define VM_REGION_BASIC_INFO_64 1
+#define MACH_PORT_NULL 0
+#define KERN_SUCCESS 0
+#define arm_thread_state64_get_pc(s) ((s).__pc)
+static int mach_task_self(void) { return 0; }
+static int mach_vm_region(int task, uintptr_t *address, size_t *size, int flavor,
+                          int *info, unsigned *count, int *object)
+{
+    (void)task; (void)address; (void)size; (void)flavor;
+    (void)info; (void)count; (void)object;
+    return 1;
+}
+static int mach_port_deallocate(int task, int object) { (void)task; (void)object; return 0; }
 #define VM_PROT_WRITE PROT_WRITE
 void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
 size_t ios_jit_pool_size_global;
 static uintptr_t anon_rx, anon_rw;
 static size_t anon_size;
 static uintptr_t second_rx, second_rw;
-static uintptr_t trapped_page;
+static uintptr_t trapped_page, low_start;
+static size_t low_size;
+int ios_jit_low_contains(uintptr_t addr) { return low_start && addr >= low_start && addr - low_start < low_size; }
+void ios_jit_anon_alias_note_write(unsigned long long addr) { (void)addr; }
+int ios_jit_pool_pc_is_fex(uintptr_t pc);
 static int logical_prot = PROT_READ | PROT_WRITE | PROT_EXEC;
 int ios_page_expected_prot(const void *addr)
 {
@@ -60,6 +86,7 @@ code += function('static int ios_mach_emulate_casp(uint32_t insn, uintptr_t rw_a
 code += function('static int ios_alias_write_is_trapped( uintptr_t addr )')
 code += function('static int ios_alias_write( uintptr_t addr, const void *source, size_t size, uintptr_t *blocked,\n                            int honor_guest_prot )')
 code += function('static int ios_alias_store_pair( uint32_t insn, uintptr_t addr, uint64_t gpr[32], uintptr_t *blocked,\n                                 int honor_guest_prot )')
+code += function('int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,')
 code += r'''
 static uintptr_t fex_pool_start, fex_pool_end;
 int ios_jit_pool_pc_is_fex(uintptr_t pc) { return pc >= fex_pool_start && pc < fex_pool_end; }
@@ -217,6 +244,33 @@ int main(void)
     assert(ios_alias_write(second_rx - 6, data, 8, &blocked, 0));
     assert(!memcmp(backing + 0x4000 - 6, data, 6) && !memcmp(backing + 0x8000, data + 6, 2));
     trapped_page = 0; second_rx = second_rw = 0;
+    /* The sampler and exception path share the same two-page store checks. */
+    second_rx = anon_rx + 0x4000; second_rw = (uintptr_t)backing + 2 * 0x4000;
+    arm_thread_state64_t state = {0};
+    state.__sp = second_rx - 8; state.__fp = 11; state.__lr = 22; state.__pc = jit_pc;
+    uint32_t pair = stp(1, 1, 2, 29, 30, 31);
+    trapped_page = second_rx;
+    memset(backing, 0x5a, 3 * 0x4000);
+    assert(ios_store_split_crossing(pair, &state, NULL, 0, 0, 0) == -1);
+    assert(backing[0x3fff] == 0x5a && state.__sp == second_rx - 8);
+    trapped_page = 0;
+    assert(ios_store_split_crossing(pair, &state, NULL, 0, 0, 0) == 1);
+    assert(state.__sp == second_rx + 8);
+    assert(*(uint64_t *)(backing + 0x4000 - 8) == 11 && *(uint64_t *)(backing + 0x8000) == 22);
+    state.__fp = second_rx - 8; state.__x[0] = 33; state.__x[1] = 44;
+    assert(ios_store_split_crossing(stp(1, 1, 2, 0, 1, 29), &state, NULL, 0, 0, 0) == 1);
+    assert(state.__fp == second_rx + 8 && state.__lr == 22);
+    assert(*(uint64_t *)(backing + 0x4000 - 8) == 33 && *(uint64_t *)(backing + 0x8000) == 44);
+    /* Low pool views use the main pool's alias distance, with their own bounds. */
+    ios_jit_rx_base_global = (void *)(anon_rx + 0x100000);
+    ios_jit_rw_base_global = (void *)((uintptr_t)backing + 0x100000);
+    ios_jit_pool_size_global = 0x4000;
+    low_start = anon_rx; low_size = 0x4000; anon_size = 0;
+    second_rx = second_rw = 0;
+    assert(ios_alias_write(low_start + 8, data, 16, &blocked, 1));
+    assert(!memcmp(backing + 8, data, 16));
+    assert(!ios_alias_write(low_start + low_size - 1, data, 2, &blocked, 1));
+    low_start = low_size = 0; ios_jit_rx_base_global = ios_jit_rw_base_global = NULL;
     /* RunCASPAL: caspal x6, x7, x2, x3, [x0] (0x4866fc02) on the RW alias. */
     uint64_t g[29] = {0}, cell[2] __attribute__((aligned(16))) = {11, 22};
     g[6] = 11; g[7] = 22; g[2] = 33; g[3] = 44;

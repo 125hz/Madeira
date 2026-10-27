@@ -93,7 +93,13 @@ prelude = r'''
 #include <sys/mman.h>
 #include <pthread.h>
 #include <signal.h>
+#ifdef __linux__
 #include <linux/falloc.h>
+#else
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#define MAP_FIXED_NOREPLACE 0 /* mmap hint: never replaces an existing mapping on Darwin */
+#endif
 typedef unsigned long ULONG_PTR;
 #define VPROT_READ       0x01
 #define VPROT_WRITE      0x02
@@ -164,11 +170,13 @@ static void *anon_mmap_fixed( void *a, size_t l, int prot, int flags )
 static int fail_malloc;
 static void *test_malloc( size_t n ) { return fail_malloc ? NULL : malloc( n ); }
 #define malloc( n ) test_malloc( n )
+#ifdef __linux__
 struct fpunchhole { unsigned fp_flags; unsigned reserved; off_t fp_offset; off_t fp_length; };
 #define F_PUNCHHOLE 99
 static int test_fcntl( int fd, int cmd, struct fpunchhole *ph )
 { (void)cmd; return fallocate( fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, ph->fp_offset, ph->fp_length ); }
 #define fcntl( fd, cmd, arg ) test_fcntl( fd, cmd, arg )
+#endif
 /* ml1291: the punch thread returns ranges to the free list under Wine's virtual lock */
 static pthread_mutex_t virtual_mutex = PTHREAD_MUTEX_INITIALIZER;
 #ifdef __linux__
@@ -205,6 +213,20 @@ static void env( const char *cov, const char *mn, const char *rmax )
 static const char *prot_of( const void *p )
 {
     static char out[3];
+#ifdef __APPLE__
+    mach_vm_address_t address = (mach_vm_address_t)p;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    strcpy(out, "??");
+    if (mach_vm_region(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64,
+                       (vm_region_info_t)&info, &count, &object) == KERN_SUCCESS) {
+        out[0] = info.protection & VM_PROT_READ ? 'r' : '-';
+        out[1] = info.protection & VM_PROT_WRITE ? 'w' : '-';
+    }
+    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+#else
     char line[512];
     FILE *f = fopen( "/proc/self/maps", "r" );
     strcpy( out, "??" );
@@ -215,6 +237,7 @@ static const char *prot_of( const void *p )
         { out[0] = perm[0]; out[1] = perm[1]; break; }
     }
     if (f) fclose( f );
+#endif
     return out;
 }
 
