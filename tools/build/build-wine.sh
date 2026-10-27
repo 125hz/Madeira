@@ -22,12 +22,7 @@ fi
 
 # The iOS static libraries only consume config.h, the build tools and the
 # widl-generated headers, so build just those instead of every PE module.
-if [[ ! -f "$WINE/build-macos/include/dwrite.h" || ! -x "$WINE/build-macos/tools/winebuild/winebuild" ]]; then
-  echo "Building Wine host tools and headers..."
-  make -C "$WINE/build-macos" -j"$JOBS" tools/all tools/widl/all tools/winebuild/all include/all
-else
-  echo "Wine host tree: cached"
-fi
+make -C "$WINE/build-macos" -j"$JOBS" tools/all tools/widl/all tools/winebuild/all include/all
 
 # Madeira's ntdll iOS build currently includes generated dwrite headers from a
 # directory named build-arm64ec. Configure that tree reproducibly and build only
@@ -42,9 +37,4 @@ if [[ ! -f "$WINE/build-arm64ec/Makefile" ]]; then
   )
 fi
 
-if [[ ! -f "$WINE/build-arm64ec/include/dwrite.h" || ! -f "$WINE/build-arm64ec/include/dwrite_3.h" ]]; then
-  echo "Generating Wine ARM64EC headers..."
-  make -C "$WINE/build-arm64ec" -j"$JOBS" include/dwrite.h include/dwrite_3.h
-else
-  echo "Wine ARM64EC headers: cached"
-fi
+make -C "$WINE/build-arm64ec" -j"$JOBS" include/dwrite.h include/dwrite_3.h

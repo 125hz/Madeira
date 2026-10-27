@@ -6,10 +6,6 @@ SRC="$ROOT/FEX"
 BUILD="$SRC/build-ios"
 OUT="$BUILD/FEXCore/Source/libFEXCore.a"
 
-if [[ -f "$OUT" && -f "$BUILD/FEXCore/Source/libJemallocLibs.a" ]]; then
-  echo "FEX iOS: cached"
-  exit 0
-fi
 
 # Options mirror build/fex-ios/build.sh. Do not define FEX_IOS_HOST here: in
 # this FEX fork it selects the code for FEX running as a Windows PE under Wine

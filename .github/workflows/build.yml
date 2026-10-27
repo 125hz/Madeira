@@ -16,10 +16,15 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+      - id: sdk
+        shell: bash
+        run: |
+          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | sort | sed -n '/^\(CFLAGS\|CXXFLAGS\|LDFLAGS\|CONFIGURATION\|MADEIRA_MOLTENVK\)=/p'; } | shasum -a 256 | cut -c1-20)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
       - id: cache
         uses: actions/cache@v4
         with:
-          key: llvm-ios-15.0.7-${{ hashFiles('tools/build/build-llvm-ios.sh') }}
+          key: plan19-${{ runner.os }}-${{ runner.arch }}-${{ steps.sdk.outputs.key }}-llvm-ios-15.0.7-${{ hashFiles('tools/build/build-llvm-ios.sh', '.github/workflows/build.yml') }}
           path: |
             toolchains/llvm-ios-build/lib/*.a
             toolchains/llvm-ios-build/include
@@ -37,12 +42,17 @@ jobs:
       key: ${{ steps.key.outputs.key }}
     steps:
       - uses: actions/checkout@v4
+      - id: sdk
+        shell: bash
+        run: |
+          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | sort | sed -n '/^\(CFLAGS\|CXXFLAGS\|LDFLAGS\|CONFIGURATION\|MADEIRA_MOLTENVK\)=/p'; } | shasum -a 256 | cut -c1-20)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
       - id: key
-        run: echo "key=fex-ios-$(git rev-parse HEAD:FEX)-${{ hashFiles('tools/build/build-fex-ios.sh', 'tools/build/fex-ios.patch') }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=fex-ios-$(git rev-parse HEAD:FEX)-${{ hashFiles('tools/build/build-fex-ios.sh', '.github/workflows/build.yml') }}" >> "$GITHUB_OUTPUT"
       - id: cache
         uses: actions/cache@v4
         with:
-          key: ${{ steps.key.outputs.key }}
+          key: plan19-${{ steps.sdk.outputs.key }}-${{ steps.key.outputs.key }}
           path: |
             FEX/build-ios
             !FEX/build-ios/**/*.o
@@ -60,12 +70,17 @@ jobs:
       key: ${{ steps.key.outputs.key }}
     steps:
       - uses: actions/checkout@v4
+      - id: sdk
+        shell: bash
+        run: |
+          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | sort | sed -n '/^\(CFLAGS\|CXXFLAGS\|LDFLAGS\|CONFIGURATION\|MADEIRA_MOLTENVK\)=/p'; } | shasum -a 256 | cut -c1-20)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
       - id: key
         run: echo "key=i386-windows-$(git rev-parse HEAD:wine)-$(git rev-parse HEAD:dxmt)-${{ hashFiles('build/wine-i386/build.sh', 'tools/build/setup-llvm-mingw.sh', 'tools/build/build-shader-headers.sh') }}" >> "$GITHUB_OUTPUT"
       - id: cache
         uses: actions/cache@v4
         with:
-          key: ${{ steps.key.outputs.key }}
+          key: plan19-${{ steps.sdk.outputs.key }}-${{ steps.key.outputs.key }}
           path: app/Madeira/i386-windows
       - name: Build the 32-bit (i386) Windows DLLs
         if: steps.cache.outputs.cache-hit != 'true'
@@ -91,9 +106,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - id: sdk
+        shell: bash
+        run: |
+          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | sort | sed -n '/^\(CFLAGS\|CXXFLAGS\|LDFLAGS\|CONFIGURATION\|MADEIRA_MOLTENVK\)=/p'; } | shasum -a 256 | cut -c1-20)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v4
         with:
-          key: llvm-ios-15.0.7-${{ hashFiles('tools/build/build-llvm-ios.sh') }}
+          key: plan19-${{ runner.os }}-${{ runner.arch }}-${{ steps.sdk.outputs.key }}-llvm-ios-15.0.7-${{ hashFiles('tools/build/build-llvm-ios.sh', '.github/workflows/build.yml') }}
           fail-on-cache-miss: true
           path: |
             toolchains/llvm-ios-build/lib/*.a
@@ -101,14 +121,14 @@ jobs:
             toolchains/llvm-project/llvm/include
       - uses: actions/cache/restore@v4
         with:
-          key: ${{ needs.fex.outputs.key }}
+          key: plan19-${{ steps.sdk.outputs.key }}-${{ needs.fex.outputs.key }}
           fail-on-cache-miss: true
           path: |
             FEX/build-ios
             !FEX/build-ios/**/*.o
       - uses: actions/cache/restore@v4
         with:
-          key: ${{ needs.i386.outputs.key }}
+          key: plan19-${{ steps.sdk.outputs.key }}-${{ needs.i386.outputs.key }}
           fail-on-cache-miss: true
           path: app/Madeira/i386-windows
       # Third-party stages only change with their pins or build scripts. Each
@@ -120,7 +140,7 @@ jobs:
           echo "dxmt=$(git rev-parse HEAD:dxmt)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
         with:
-          key: deps-v2-${{ hashFiles('build/gnutls-ios/**', 'build/ffmpeg/build.sh', 'build/ffmpeg/src/**', 'build/freetype-ios/build.sh', 'tools/build/build-freetype-ios.sh', 'tools/build/setup-llvm-mingw.sh') }}
+          key: plan19-${{ steps.sdk.outputs.key }}-deps-v2-${{ hashFiles('build/gnutls-ios/**', 'build/ffmpeg/build.sh', 'build/ffmpeg/src/**', 'build/freetype-ios/build.sh', 'tools/build/build-freetype-ios.sh', 'tools/build/setup-llvm-mingw.sh') }}
           path: |
             toolchains/llvm-mingw-*
             toolchains/gnutls-ios
@@ -130,13 +150,13 @@ jobs:
             research/freetype
       - uses: actions/cache@v4
         with:
-          key: wine-host-${{ steps.pins.outputs.wine }}-${{ hashFiles('tools/build/build-wine.sh') }}
+          key: plan19-${{ steps.sdk.outputs.key }}-wine-host-${{ steps.pins.outputs.wine }}-${{ hashFiles('tools/build/build-wine.sh') }}
           path: |
             wine/build-macos
             wine/build-arm64ec
       - uses: actions/cache@v4
         with:
-          key: dxmt-ios-${{ steps.pins.outputs.dxmt }}-${{ steps.pins.outputs.wine }}-${{ hashFiles('build/dxmt-ios/**', 'tools/build/build-dxmt-ios.sh', 'tools/build/build-shader-headers.sh', 'tools/build/build-llvm-ios.sh') }}
+          key: plan19-${{ steps.sdk.outputs.key }}-dxmt-ios-${{ steps.pins.outputs.dxmt }}-${{ steps.pins.outputs.wine }}-${{ hashFiles('build/dxmt-ios/**', 'tools/build/build-dxmt-ios.sh', 'tools/build/build-shader-headers.sh', 'tools/build/build-llvm-ios.sh') }}
           path: |
             app/Madeira/libdxmt_combined.a
             build/dxmt-ios/shader-headers

@@ -43,9 +43,9 @@ also uses iOS 18.0 as its effective deployment target.
 ## Re-running the build
 
 Toolchains and expensive native build outputs are cached under their existing
-ignored build directories. Re-running `./tools/build-ipa.sh` reuses them when
-they are already present. Delete an individual ignored build directory to force
-that component to rebuild.
+ignored build directories. Re-running `./tools/build-ipa.sh` reconfigures the source builds and uses their incremental compile rules.
+An existing archive alone does not skip FEX, DXMT, LLVM or Wine headers.
+The CI keys also include the Xcode/SDK/compiler identity and build inputs.
 
 You can override parallelism with, for example:
 
