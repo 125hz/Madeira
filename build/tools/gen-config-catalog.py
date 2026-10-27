@@ -47,6 +47,22 @@ OVERLAY = {
                 "kind": "int", "default": "10",
                 "note": "Default 10 ms between pasted characters. Range 5-100 ms; use a longer interval for games "
                         "that miss fast text input. Enforced at delivery as well as queueing. Restart the session after changing it."},
+    # The iOS audio driver (build/ntdll-unix/audio_null_ios.c): the two a player may need.
+    "env.MADEIRA_AUDIO_LEAD_MS": {"category": "Audio", "title": "Sound buffer",
+                "kind": "choice", "default": "",
+                "choices": [("", "60 ms (default)"), ("100", "100 ms"), ("150", "150 ms"), ("200", "200 ms"),
+                            ("300", "300 ms")],
+                "note": "How much sound Madeira keeps queued ahead of the speaker (10-500 ms, default 60). If a "
+                        "game's sound crackles or sounds scratchy, a larger buffer usually clears it, at the cost "
+                        "of sound lagging slightly behind the picture: Black Ops II's Zombies crackled at 60 ms "
+                        "and was clean at 150. A game's own config can set it for that game alone. Applies at "
+                        "the next game start."},
+    "env.MADEIRA_AUDIO_DOWNMIX": {"category": "Audio", "title": "Mix surround sound down to stereo",
+                "kind": "bool", "default": "1",
+                "note": "On by default: a game that plays 5.1 or 7.1 sound has every channel folded into the "
+                        "two speakers, so voices (in the centre channel), bass and the rear channels are heard. "
+                        "Off keeps only the front left and right channels, as Madeira did before, which loses "
+                        "most dialogue in a surround game. Applies at the next game start."},
     "env.MADEIRA_PIN_GRAPHICS_DLLS": {"category": "Memory & JIT pool", "title": "Keep graphics DLLs loaded",
                 "kind": "bool", "default": "0",
                 "note": "Default off. On a D3D12 device/probe call, pins already loaded D3D12, DXGI and Wine Metal "

@@ -65,19 +65,20 @@ for m in re.finditer(r'static let (\w+) = GameRecommendation\(\n\s*id: "([^"]+)"
     lines = [line[len(indent):] if line.startswith(indent) else line for line in body.split('\n')]
     presets[ident] = dict(name=name, title=title, version=int(version), lines=lines, switches=' '.join((switches or '').split()))
 assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'ghost-of-tsushima', 'god-of-war',
-                        'horizon-zero-dawn', 'standard'}, sorted(presets)
+                        'horizon-zero-dawn', 'black-ops-2', 'standard'}, sorted(presets)
 assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,\n'
-        '                      standard]') in lists_src
+        '                      blackOps2, standard]') in lists_src
 
 # madeira-bcd's defaults where upstream's differ: every game madeira-bcd ran had them,
 # so every game's own list ends with them. The standard list reaches every other game
-# and the Desktop, and has none of them.
+# and the Desktop, and has none of them; nor has Black Ops II's, which ran without them.
+NO_FORK_DEFAULTS = ('standard', 'black-ops-2')
 FORK_DEFAULTS = ["# madeira-bcd's defaults, which this list was tested with (upstream's differ).",
                  'env.MADEIRA_FREE_DELAY_MS = 2000', 'env.MADEIRA_CTX_CPU_AREA = 2', 'env.MADEIRA_WAIT_CHILDREN = 1',
                  'env.MADEIRA_JIT_DUMP = 0']
 for ident, p in presets.items():
-    if ident == 'standard':
-        assert not set(FORK_DEFAULTS) & set(p['lines']), (ident, "the standard list has none of madeira-bcd's defaults")
+    if ident in NO_FORK_DEFAULTS:
+        assert not set(FORK_DEFAULTS) & set(p['lines']), (ident, "the list has none of madeira-bcd's defaults")
         p['tested'], p['fork'] = p['lines'][2:], []
         continue
     assert p['lines'][-len(FORK_DEFAULTS):] == FORK_DEFAULTS, (ident, "the list ends with madeira-bcd's defaults")
@@ -105,7 +106,7 @@ for ident, p in presets.items():
         if key != 'env.WINEDLLOVERRIDES':
             named = named.replace('socialclubhelper.exe', '')
         assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
-print('PASS: eight lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
+print('PASS: nine lists, two comment lines each, every game list ends with the four fork defaults and the standard and Black Ops II ones have none, no key twice, '
       'every non-env key in the settings catalog, no Social Club DLL lines, no variant DLL switches')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
@@ -184,6 +185,13 @@ assert 'env.MADEIRA_EC_HOOK_TRACE = 0' in presets['gta5e-other']['lines']
 # since version 3, nothing else (version 2 had the fork defaults); no switches.
 standard = presets['standard']
 assert standard['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0'] and standard['switches'] == '' and standard['version'] == 3, standard
+# Black Ops II (owner's test, 2026-10-27): the standard list it ran with, plus a 150 ms audio
+# lead, which cleared Zombies' crackle. No switches.
+bo2 = presets['black-ops-2']
+assert bo2['tested'] == ['env.MADEIRA_AUDIO_LEAD_MS = 150', 'env.MADEIRA_EC_HOOK_TRACE = 0'] and bo2['switches'] == '' \
+    and bo2['version'] == 1, bo2
+assert not any(line.startswith('env.MADEIRA_AUDIO_LEAD_MS')
+               for p in presets.values() if p is not bo2 for line in p['lines']), 'the 150 ms audio lead is Black Ops II\'s only'
 assert 'if size != GameRecommendation.screen720 { entry.resolution = size }\n            else if let lines720 = ResolutionChoices.screen720Value { entry.resolution = lines720 }' in apply_src
 gta = presets['gta5e-steam']
 assert 'env.MADEIRA_CHILD_ARGS = PlayGTAV.exe -nobattleye' in gta['lines']
@@ -263,7 +271,7 @@ assert got['switches'] == ('avx: true, nvidia: true, wineVCRT: false, fastSync: 
                            'resolution: "1280x720", display: "fit"'), got['switches']
 assert not any(line.startswith(('view-census', 'typed-view-align', 'typed-view-shadow'))
                for p in presets.values() if p is not hzd and p is not got for line in p['lines']), 'the typed-view fix is HZD\'s and GoT\'s only'
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476, 480 and 514 test lines (v10), line for line with its switches (720 lines of this screen), and outside Steam the same without the Dock lines, with the ec-hook reporter off (v1); GTA V Enhanced keeps its tested lines plus the stamped orphan-lock mode (v2) and, from Steam, the VC++ engine block (v3), GoW its tested lines; Horizon Zero Dawn has build 491\'s proven list plus build 494\'s frame-rate switches (v16), GoT the owner\'s build 515 list (v3); every other game and the Desktop the standard list (v3)')
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476, 480 and 514 test lines (v10), line for line with its switches (720 lines of this screen), and outside Steam the same without the Dock lines, with the ec-hook reporter off (v1); GTA V Enhanced keeps its tested lines plus the stamped orphan-lock mode (v2) and, from Steam, the VC++ engine block (v3), GoW its tested lines; Horizon Zero Dawn has build 491\'s proven list plus build 494\'s frame-rate switches (v16), GoT the owner\'s build 515 list (v3); Black Ops II the standard list plus a 150 ms audio lead (v1); every other game and the Desktop the standard list (v3)')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')
@@ -273,6 +281,10 @@ assert 'installFolder == "red dead redemption 2"' in match and 'installFolder ==
 assert 'case "ghostoftsushima.exe":' in match and 'case "gow.exe":' in match and 'case "rdr2.exe", "playrdr2.exe":' in match
 assert 'case "horizonzerodawn.exe":\n            return horizonZeroDawn' in match
 assert 'if steamAppID == horizonZeroDawnAppID || installFolder == "horizon zero dawn" { return horizonZeroDawn }' in match
+# Black Ops II: campaign, Zombies and multiplayer share one folder and list.
+assert 'static let blackOps2AppIDs: Set<Int> = [202970, 212910, 202990]' in lists_src
+assert 'if blackOps2AppIDs.contains(steamAppID ?? 0) || installFolder == "call of duty black ops ii" { return blackOps2 }' in match
+assert 'case "t6sp.exe", "t6zm.exe", "t6mp.exe":\n            return blackOps2' in match
 # GoT, GoW and Horizon Zero Dawn from Steam: their App IDs, and their folders as for RDR2 and GTA V Enhanced.
 assert 'installFolder == "ghost of tsushima director\'s cut"' in match and 'installFolder == "godofwar"' in match
 assert 'case "playgtav.exe", "gta5_enhanced.exe":' in match and 'return inSteam ? gta5EnhancedSteam : gta5EnhancedOther' in match
@@ -451,9 +463,15 @@ check(id(#"C:\Horizon - Zero Down CE\HorizonZeroDawn.exe"#) == "horizon-zero-daw
 check(id(steam + #"\Horizon Zero Dawn\HorizonZeroDawn.exe"#) == "horizon-zero-dawn", "its program inside Steam")
 check(id(steam + #"\Horizon Zero Dawn"#, 1151640) == "horizon-zero-dawn", "Horizon Zero Dawn from Steam")
 check(id(#"C:\Games\Horizon Zero Dawn Remastered\HorizonZeroDawnRemastered.exe"#) == "none", "the remaster is another game")
+check(id(steam + #"\Call of Duty Black Ops II"#, 202970) == "black-ops-2" && id(steam + #"\Call of Duty Black Ops II"#, 212910) == "black-ops-2",
+      "Black Ops II's campaign and Zombies from Steam")
+check(id(steam + #"\Call of Duty Black Ops II"#) == "black-ops-2", "Black Ops II by its Steam folder")
+check(id(steam + #"\Call of Duty Black Ops II\t6zm.exe"#) == "black-ops-2" && id(#"D:\BO2\T6SP.EXE"#) == "black-ops-2",
+      "Black Ops II by its programs")
+check(id(steam + #"\Call of Duty Black Ops"#, 42700) == "none", "the first Black Ops is another game")
 check(id(#"C:\Games\Foo\foo.exe"#) == "none" && id(steam + #"\Portal 2"#, 620) == "none", "other games")
 check(id("") == "none" && id("C:\\") == "none", "no path")
-print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced and RDR2 inside and outside Steam, GoT, GoW and Horizon Zero Dawn by their programs, others none")
+print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced and RDR2 inside and outside Steam, GoT, GoW, Horizon Zero Dawn and Black Ops II by their programs, others none")
 
 // The lists themselves.
 check(Set(R.all.map(\.id)).count == R.all.count, "ids are unique")

@@ -131,7 +131,7 @@ check('readback-swap: on by default (as before); off keeps only READBACK buffers
       'ConfigOption(key: "readback-swap"' in catalog)
 configs = [c.split('"""')[0] for c in recs.split('config: """')[1:]]
 check('typed-view-shadow is in Horizon Zero Dawn\'s and Ghost of Tsushima\'s lists only; the experiments in none',
-      len(configs) == 8 and sum('typed-view-shadow = 1' in c for c in configs) == 2 and
+      len(configs) == 9 and sum('typed-view-shadow = 1' in c for c in configs) == 2 and
       not any(k in c for c in configs for k in ('vis-trace', 'readback-far', 'fence-strict', 'desc-guard', 'readback-swap')))
 
 harness = r'''
