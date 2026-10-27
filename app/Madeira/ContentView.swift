@@ -1445,6 +1445,7 @@ struct ContentView: View {
         .ignoresSafeArea()
         .background(Color.black)
         .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
     }
 
     /// Portrait: classic tooling layout — header, badges, 240pt game strip,
@@ -4181,6 +4182,8 @@ struct TouchControlsOverlay: View {
             .onDisappear { GamepadInput.shared.configureTouch(controls: []); TouchMouseGate.padOverlay = false }
         }
         .ignoresSafeArea()
+        .statusBarHidden(library.current != nil)
+        .persistentSystemOverlays(library.current != nil ? .hidden : .automatic)
     }
 
     /// Every control in ONE GlassEffectContainer: on iOS 26 the system merges
