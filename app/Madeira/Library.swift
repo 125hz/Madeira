@@ -462,15 +462,9 @@ struct LibraryEntry: Codable, Identifiable {
               launchWindowsPath.utf8.count < 1024, (steamWorkingWindowsPath?.utf8.count ?? 0) < 512 else {
             throw LibraryError.message("The saved launch profile contains invalid display or argument values.")
         }
-        var quoted = false, inToken = false, tokens = 0
-        for character in launchArguments {
-            if character == "\"" { quoted.toggle() }
-            if !quoted && (character == " " || character == "\t") { inToken = false }
-            else if !inToken { tokens += 1; inToken = true }
+        guard LaunchArgumentText.valid(launchArguments) else {
+            throw LibraryError.message("Use balanced double quotes, no control characters, and at most 64 launch arguments in 4 KB.")
         }
-        // WineProcessBridge takes at most 64 arguments in 4 KB.
-        guard launchArguments.utf8.count < 4096 else { throw LibraryError.message("The complete launch command is too long.") }
-        guard !quoted, tokens <= 64 else { throw LibraryError.message("Use balanced double quotes and at most 64 launch arguments in total.") }
         // build/madeira_cfg.h reads at most 64 KB of a file.
         guard (config?.utf8.count ?? 0) < 60_000, config?.contains("\0") != true else {
             throw LibraryError.message("This game's config is too long.")
@@ -5480,6 +5474,19 @@ private struct LaunchFloodShape: Shape {
 /// curly ones, which breaks flags such as `--rendering-driver opengl3` and
 /// quoted paths.
 enum LaunchArgumentText {
+    static func valid(_ text: String) -> Bool {
+        guard text.utf8.count < 4096 else { return false }
+        var quoted = false, inToken = false, tokens = 0, slashes = 0
+        for byte in text.utf8 {
+            if (byte < 32 && byte != 9) || byte == 127 { return false }
+            if byte == 34 && slashes % 2 == 0 { quoted.toggle() }
+            if !quoted && (byte == 32 || byte == 9) { inToken = false }
+            else if !inToken { tokens += 1; inToken = true }
+            slashes = byte == 92 ? slashes + 1 : 0
+        }
+        return !quoted && tokens <= 64
+    }
+
     static func plain(_ s: String) -> String {
         var out = s
         for (from, to) in [("\u{2014}", "--"), ("\u{2013}", "--"), ("\u{2212}", "-"),

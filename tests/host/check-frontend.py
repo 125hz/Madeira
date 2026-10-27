@@ -114,6 +114,7 @@ struct GestureZone: Codable, Identifiable, Equatable { var id = UUID() }   // Li
 enum LibraryError: LocalizedError { case message(String) }
 func env(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
 '''
+swift += block(lib, 'enum LaunchArgumentText {') + '\n'
 swift += block(lib, 'struct LibraryEntry: Codable, Identifiable') + '\n'
 swift += block(lib, 'enum SyncEngine: String, CaseIterable, Identifiable') + '\n'
 swift += '\n'.join(l for l in display.splitlines() if not l.startswith('import ')) + '\n'

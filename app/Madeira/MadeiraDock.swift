@@ -236,7 +236,7 @@ enum MadeiraDock {
                     ? "Steam signed in but did not confirm this game's license in time. Export the log before trying again."
                     : "Steam did not finish signing in. Check the connection and try again."
             }
-            if result == 50, fields["launch-user-arguments-invalid"] != nil {
+            if result == 54, fields["launch-user-arguments-invalid"] != nil {
                 return "The game's launch arguments are invalid or too long. Edit them in Game details and try again."
             }
             if result == 35 { return "Steam did not confirm a license for this game on the signed-in account." }

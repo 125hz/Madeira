@@ -985,7 +985,7 @@ static int madeira_split_launch_args(const char *input, char *storage, size_t st
     length = strnlen(s, storage_capacity);
     if (length >= storage_capacity) return -1;
     for (size_t i = 0; i < length; i++)
-        if ((unsigned char)s[i] < 32 && s[i] != '\t') return -1;
+        if (((unsigned char)s[i] < 32 && s[i] != '\t') || (unsigned char)s[i] == 127) return -1;
     while (*s) {
         unsigned int quotes = 0, backslashes = 0;
         while (*s == ' ' || *s == '\t') s++;
