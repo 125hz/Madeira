@@ -75,5 +75,31 @@ with tempfile.TemporaryDirectory(prefix='madeira-ci-llvm-') as tmp:
     local_env = dict(env, GITHUB_ACTIONS='false')
     assert subprocess.run(['bash', str(dxmt_helper)], env=local_env, capture_output=True).returncode != 0
     assert trace.exists(), 'local builds must keep their existing rebuild path'
+    trace.unlink()
+
+    gnutls = fixture / 'build/gnutls-ios'
+    (gnutls / 'obj').mkdir(parents=True)
+    script = gnutls / 'build.sh'
+    script.write_text((root / 'build/gnutls-ios/build.sh').read_text())
+    for stage in ['gmp', 'nettle', 'gnutls']:
+        (gnutls / 'obj' / (stage + '.done')).touch()
+    prefix = fixture / 'toolchains/gnutls-ios/lib'
+    prefix.mkdir(parents=True)
+    for lib in ['gmp', 'nettle', 'hogweed', 'gnutls']:
+        (prefix / ('lib' + lib + '.a')).write_bytes(b'archive\n')
+    for name in ['xcrun', 'sysctl']:
+        path = tools / name
+        path.write_text('#!/bin/sh\necho 1\n')
+        path.chmod(0o755)
+    for name in ['tar', 'make']:
+        path = tools / name
+        path.write_text('#!/bin/sh\necho build >> "$TRACE"\nexit 86\n')
+        path.chmod(0o755)
+    assert subprocess.run(['bash', str(script)], env=env, capture_output=True).returncode == 0
+    assert not trace.exists(), 'restored GnuTLS stage markers must prevent a rebuild'
+    (gnutls / 'obj/gmp.done').unlink()
+    assert subprocess.run(['bash', str(script)], env=env, capture_output=True).returncode != 0
+    assert trace.exists(), 'missing stage markers must request a real build'
 print('PASS: complete LLVM cache skips clone/build; damaged or missing archives are refused')
 print('PASS: complete FEX/DXMT CI caches skip rebuilds; missing outputs and local builds do not')
+print('PASS: GnuTLS output and stage-marker caches skip completed stages together')

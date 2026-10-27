@@ -19,6 +19,7 @@ assert workflow.count('run: bash tools/build/ci-input-key.sh') == 5
 assert workflow.count('MADEIRA_PLANNED_SDK: ${{ needs.plan.outputs.sdk }}') == 4
 assert "'.github/workflows/build.yml')" not in workflow, 'workflow-only edits must not rebuild LLVM/FEX'
 assert 'toolchains/llvm-ios-build/.madeira-cache.sha256' in workflow
+assert 'toolchains/gnutls-ios' in workflow and 'build/gnutls-ios/obj/*.done' in workflow
 with tempfile.TemporaryDirectory(prefix='madeira-build-inputs-') as folder:
     folder = Path(folder)
     for name, content in {

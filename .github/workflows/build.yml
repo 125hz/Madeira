@@ -210,6 +210,7 @@ jobs:
           path: |
             toolchains/llvm-mingw-*
             toolchains/gnutls-ios
+            build/gnutls-ios/obj/*.done
             toolchains/ffmpeg-ios
             build/ffmpeg/obj
             build/freetype-ios/build
