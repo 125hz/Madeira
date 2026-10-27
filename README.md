@@ -84,6 +84,15 @@ own forks; upstream checkouts will not build here. The build has several parts
 (the Wine unix libraries, the ARM64EC Windows modules, FEX, DXMT and the app)
 and some inputs that are not in the repository, such as the toolchains.
 [`docs/BUILDING.md`](docs/BUILDING.md) walks through all of it.
+git clone --recurse-submodules <this repo>
+cd Madeira
+./tools/build-ipa.sh   # produces dist/Madeira.ipa
+```
+
+See [`BUILDING.md`](BUILDING.md) for prerequisites, timing, and re-run notes.
+
+Note that `FEX`, `wine` and `research/dxmt` are submodules pointing at forks
+containing the iOS work; upstream clones will not build here.
 
 ### Repository layout
 
