@@ -40,7 +40,7 @@ harness = r'''
 #define MB ((size_t)1 << 20)
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define IOS_POOL_REUSE_GRACE_SEC 3
-struct ios_pool_free { size_t off, size; time_t freed_at; int advised; };
+struct ios_pool_free { size_t off, size; time_t freed_at; int advised; uint64_t tag; };
 static struct ios_pool_free ios_pool_freelist[8];
 static unsigned ios_pool_free_count;
 static size_t ios_jit_pool_size_global, jit_pool_offset, ios_jit_tail_reserved;
@@ -82,10 +82,10 @@ int main(int argc, char **argv)
     ios_jit_low_size_global = 316 * MB;
     ios_jit_low_reserved = 311 * MB;
     ios_pool_free_count = 4;
-    ios_pool_freelist[0] = (struct ios_pool_free){MB, MB/2, 50, 1};
-    ios_pool_freelist[1] = (struct ios_pool_free){2*MB, MB, 98, 0};
-    ios_pool_freelist[2] = (struct ios_pool_free){4*MB, 8*MB, 90, 3};
-    ios_pool_freelist[3] = (struct ios_pool_free){16*MB, 2*MB, 97, 1};
+    ios_pool_freelist[0] = (struct ios_pool_free){MB, MB/2, 50, 1, 0};
+    ios_pool_freelist[1] = (struct ios_pool_free){2*MB, MB, 98, 0, 0};
+    ios_pool_freelist[2] = (struct ios_pool_free){4*MB, 8*MB, 90, 3, 0};
+    ios_pool_freelist[3] = (struct ios_pool_free){16*MB, 2*MB, 97, 1, 0};
     if (which == 1) {
         jit_pool_offset = ios_jit_pool_size_global + 1;
         ios_jit_low_reserved = ios_jit_low_size_global + 1;

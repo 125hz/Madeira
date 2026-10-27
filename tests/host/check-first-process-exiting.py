@@ -80,6 +80,8 @@ harness = r'''
 #include <pthread.h>
 #include <stdio.h>
 
+#include <stdint.h>
+typedef uintptr_t ULONG_PTR;
 typedef int BOOL;
 #define TRUE 1
 #define FALSE 0
@@ -122,6 +124,7 @@ static int trylock_from( void *peb )
 
 int main( void )
 {
+    (void)ios_dead_peb_next; /* Unused part of the extracted production table. */
     BOOL *first;
 
     ios_register_proc_socket( CHILD1, 10 );

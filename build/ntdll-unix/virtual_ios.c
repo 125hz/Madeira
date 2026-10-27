@@ -660,6 +660,7 @@ void ios_jit_describe_pool_addr( const void *addr, char *buf, size_t buflen )
  * 0 if it came off the virgin bump. Read immediately after the call by the
  * copy-verify probe so a failed copy can be attributed to reuse or not. */
 static int ios_pool_last_alloc_reused;
+static __thread int ios_pool_last_same_image;
 
 /* Defined next to decommit_pages; declared here so the allocator can check a
  * range against the LIVE ledger before handing it out (task #34 double-handout
@@ -2931,6 +2932,8 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
     time_t now = time( NULL );
     int i, bump_ok;
 
+    ios_pool_last_same_image = 0;
+
     /* Reclaimed image ranges can also live in region C. WoW64's emulator
      * accepts executable storage only inside the main pool span. */
     if (ios_jit_low_size_global && ios_wow_base() && anchor_off == (size_t)-1)
@@ -3095,7 +3098,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
      * exact layout, poisoned or not. Its non-executable pages are that
      * image's writable sections, which are this image's writable sections
      * too, so nothing executable lands on them. */
-    if (tag)
+    if (tag && off == (size_t)-1)
     {
         for (i = 0; i < ios_pool_free_count; i++)
         {
@@ -3111,6 +3114,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
             off = ios_pool_freelist[i].off;
             ios_pool_freelist[i] = ios_pool_freelist[--ios_pool_free_count];
             ios_pool_last_alloc_reused = 1;
+            ios_pool_last_same_image = 1;
             {
                 static int same_n;
                 if (same_n++ < 40)
@@ -3447,8 +3451,15 @@ static uint64_t ios_pool_image_tag( const void *image_base, size_t image_size, s
 #define IOS_TAG_MIX(v) do { uint64_t _v = (uint64_t)(v); int _b; \
         for (_b = 0; _b < 8; _b++) { h ^= (_v >> (_b * 8)) & 0xff; h *= 1099511628211ULL; } } while (0)
     if (!image_base || image_size < 0x1000 || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if (dos->e_lfanew < 0 || (size_t)dos->e_lfanew > image_size - sizeof(*nt)) return 0;
     nt = (const IMAGE_NT_HEADERS *)((const char *)image_base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.SizeOfOptionalHeader < offsetof(IMAGE_OPTIONAL_HEADER, SizeOfImage) + sizeof(DWORD) ||
+        nt->FileHeader.SizeOfOptionalHeader > image_size - dos->e_lfanew - offsetof(IMAGE_NT_HEADERS, OptionalHeader))
+        return 0;
+    sec = IMAGE_FIRST_SECTION( nt );
+    if (nt->FileHeader.NumberOfSections >
+        (image_size - ((const char *)sec - (const char *)image_base)) / sizeof(*sec)) return 0;
     IOS_TAG_MIX( alloc_size );
     IOS_TAG_MIX( image_size );
     IOS_TAG_MIX( nt->OptionalHeader.SizeOfImage );
@@ -3497,7 +3508,7 @@ static size_t ios_pool_alloc_range_tagged( size_t alloc_size, size_t pool_limit,
         if (off == (size_t)-1) break;
         /* ml239: see ios_pool_check_range_exec. ios_pool_last_alloc_reused tells us whether
          * this came off the freelist or the virgin bump, which is exactly the discriminator. */
-        bad = tag && ios_pool_last_alloc_reused == 2 ? 0 : ios_pool_check_range_exec( off, alloc_size, ios_pool_last_alloc_reused );
+        bad = ios_pool_last_same_image ? 0 : ios_pool_check_range_exec( off, alloc_size, ios_pool_last_alloc_reused );
         if (!bad || !quarantine || skipped_total + alloc_size > (64u << 20)) break;
         skipped_total += alloc_size;
         {
@@ -18140,6 +18151,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             size_t tramp_prealloc = ios_x18_tramp_prealloc_scan(image_base, image_size);
             size_t data_delta = ios_jit_data_align_delta(image_base, image_size);
             size_t alloc_size = image_alloc + tramp_prealloc + (data_delta ? page_size : 0);
+            uint64_t image_tag = ios_pool_image_tag( image_base, image_size, alloc_size );
             size_t offset;
             /* ios_image_reload_mode: the same image again at the base of its
              * unloaded copy -> rebuild that copy where it is. Its pool range
@@ -18168,11 +18180,10 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                             (unsigned long)image_size, reload_pe, (unsigned long)reload_size,
                             (unsigned long)(image_alloc + tramp_prealloc));
                 reload_jit = NULL;
-                offset = ios_pool_alloc_range_tagged(alloc_size, jit_pool_size - ios_jit_tail_reserved,
-                                                     ios_pool_image_tag( image_base, image_size, alloc_size ));
+                offset = ios_pool_alloc_range_tagged(alloc_size, jit_pool_size - ios_jit_tail_reserved, image_tag);
                 if (offset == (size_t)-1) offset = ios_pool_low_image_range( alloc_size );
                 if (offset == (size_t)-1 && ios_pool_recycle_code_range( alloc_size ))
-                    offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
+                    offset = ios_pool_alloc_range_tagged(alloc_size, jit_pool_size - ios_jit_tail_reserved, image_tag);
             }
             if (!reload_jit && offset != (size_t)-1 && data_delta)
             {

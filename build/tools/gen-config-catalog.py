@@ -755,16 +755,12 @@ OVERLAY = {
                 "note": "Only with env.MADEIRA_FPS_GOV_MW set: how much energy the running balance may drift above or "
                         "below the target before the cap moves one step (100-100000; unset or out of range: 1500). "
                         "Smaller moves the cap sooner and more often. Read at session start."},
-    # madeira-bcd: the orphan-lock reaper's stamped mode (wine: dlls/ntdll/unix/sync.c).
     "env.MADEIRA_LOCK_ORPHAN": {"category": "Wine core (ntdll)", "title": "Orphan-lock reaper mode",
                 "kind": "choice", "default": "",
-                "choices": [("", "As before"), ("stamped", "Only stamped locks"), ("0", "Off")],
-                "note": "The monitor releases an SRW lock it believes a dead thread left held. Unset (default): as "
-                        "before, which counts one strike per parked waiter, so a busy lock with 3 waiters is released "
-                        "at once even while its owner lives (Horizon Zero Dawn stopped with \"Error\" right after such "
-                        "a release, build 479). stamped: one strike per monitor cycle, three in a row, and only locks a "
-                        "live thread has stamped (FEX's code-buffer locks) can be released. 0: no releases. The "
-                        "dead-thread reaper is unchanged. Restart the session after changing it."},
+                "choices": [("", "Only stamped locks (default)"), ("stamped", "Only stamped locks"), ("0", "Off")],
+                "note": "Default and stamped: only a lock seen held by FEX can be released, after three monitor "
+                        "cycles with the same lock word and no live owner stamp. Guest locks are never released. "
+                        "0: no orphan-lock releases. The dead-thread reaper is unchanged. Restart the session after changing it."},
     # madeira-bcd: small staging rings in DXMT's d3d11 (the dxmt change of this wave).
     "env.DXMT_SMALL_RINGS": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Small DXMT staging rings for these programs",
                 "kind": "text", "default": "",
