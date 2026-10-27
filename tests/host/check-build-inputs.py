@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-build-inputs-') as folder:
     output = folder / 'output'
     env = dict(os.environ, PATH=str(folder) + os.pathsep + os.environ['PATH'],
                SDK_INPUT=str(sdk), GITHUB_OUTPUT=str(output))
-    for key in ('CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'CONFIGURATION', 'MADEIRA_MOLTENVK', 'ImageOS', 'ImageVersion', 'MADEIRA_PLANNED_SDK'):
+    for key in ('CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'CONFIGURATION', 'MADEIRA_MOLTENVK', 'ImageOS', 'ImageVersion', 'MADEIRA_PLANNED_SDK'):
         env.pop(key, None)
     def fingerprint(extra=None):
         output.unlink(missing_ok=True)
@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-build-inputs-') as folder:
     sdk.write_text('27.2\n')
     assert first != fingerprint()
     sdk.write_text('27.1\n')
-    for key in ('CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'CONFIGURATION', 'MADEIRA_MOLTENVK', 'ImageOS', 'ImageVersion'):
+    for key in ('CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'CONFIGURATION', 'MADEIRA_MOLTENVK', 'ImageOS', 'ImageVersion'):
         assert first != fingerprint({key: 'changed'}), key
     assert fingerprint({'MADEIRA_PLANNED_SDK': first.split('=', 1)[1]}) == first
     mismatch = subprocess.run(['bash', '-euo', 'pipefail', '-c', script],

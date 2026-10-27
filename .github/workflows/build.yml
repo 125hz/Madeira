@@ -38,6 +38,7 @@ jobs:
         run: |
           python3 tests/host/check-build-inputs.py
           python3 tests/host/check-ci-llvm-cache.py
+          python3 tests/host/check-clean-bootstrap.py
       - id: sdk
         run: bash tools/build/ci-input-key.sh
       - id: key

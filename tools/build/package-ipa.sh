@@ -17,6 +17,7 @@ required=(
   "$ROOT/app/Madeira/libntdll_unix.a"
   "$ROOT/app/Madeira/libwin32u_unix.a"
   "$ROOT/app/Madeira/libdxmt_combined.a"
+  "$ROOT/app/Madeira/libmadeira_rppairing.a"
 )
 for path in "${required[@]}"; do
   [[ -f "$path" ]] || { echo "ERROR: required build artifact missing: $path" >&2; exit 1; }

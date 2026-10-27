@@ -2,6 +2,7 @@
 """Check source bootstrap selection and source preservation without building iOS libraries."""
 from pathlib import Path
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -56,6 +57,44 @@ ar() { touch "$2"; }
     result = subprocess.run(['bash', str(script)], capture_output=True, text=True)
     assert result.returncode != 0 and keep.read_text() == 'preserve this work'
     print('PASS: an incomplete FreeType directory is preserved and reported')
+
+    pipeline = fixture / 'pipeline'
+    tools = pipeline / 'bin'
+    tools.mkdir(parents=True)
+    (pipeline / 'app/Madeira').mkdir(parents=True)
+    entry = (root / 'tools/build-ipa.sh').read_text()
+    entry_path = pipeline / 'tools/build-ipa.sh'
+    entry_path.parent.mkdir()
+    entry_path.write_text(entry)
+    for relative in set(re.findall(r'"\$ROOT/([^"]+\.sh)"', entry)) | {'build/rppairing-ios/build.sh'}:
+        path = pipeline / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('#!/bin/bash\nexit 0\n')
+        path.chmod(0o755)
+    pairing = pipeline / 'build/rppairing-ios'
+    (pairing / 'build.sh').write_text((root / 'build/rppairing-ios/build.sh').read_text())
+    (pairing / 'notices.py').write_text('from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text("notices")\n')
+    commands = {
+        'uname': 'echo Darwin',
+        'brew': 'if [ "$1" = --prefix ]; then echo "$TEST_TOOLS"; fi',
+        'git': 'exit 0',
+        'xcodebuild': 'exit 0',
+        'rustup': 'test "$*" = "target add aarch64-apple-ios"\ntouch "$TRACE.target"',
+        'cargo': 'test -f "$TRACE.target"\nmkdir -p target/aarch64-apple-ios/release\necho archive > target/aarch64-apple-ios/release/libmadeira_rppairing.a',
+    }
+    for name, body in commands.items():
+        path = tools / name
+        path.write_text('#!/bin/bash\nset -eu\n' + body + '\n')
+        path.chmod(0o755)
+    package = pipeline / 'tools/build/package-ipa.sh'
+    package.write_text('#!/bin/bash\nset -eu\ntest -s "$ROOT/app/Madeira/libmadeira_rppairing.a"\n'
+                       'test -s "$ROOT/app/Madeira/legal/LICENSES-rppairing-crates.txt"\ntouch "$TRACE.packaged"\n')
+    result = subprocess.run(['bash', str(entry_path)], capture_output=True, text=True,
+                            env=dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
+                                     TEST_TOOLS=str(tools), TRACE=str(pipeline / 'trace')))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (pipeline / 'trace.packaged').exists()
+    print('PASS: the IPA entry point prepares the Rust target, pairing archive and notices before packaging')
 
 for relative in ['build/wineserver/build.sh', 'build/dxmt-ios/build.sh', 'build/fex-ios/build.sh',
                  'build/fex-arm64ec/build.sh', 'build/freetype-ios/build.sh',

@@ -27,6 +27,7 @@ bash "$ROOT/tools/check-prefix-template.sh" "$ROOT/app/Madeira/prefix-template.t
 "$ROOT/tools/build/setup-llvm-mingw.sh"
 "$ROOT/tools/build/build-wine.sh"
 "$ROOT/tools/build/build-fex-ios.sh"
+"$ROOT/build/rppairing-ios/build.sh"
 "$ROOT/tools/build/build-freetype-ios.sh"
 
 log "Building GnuTLS stack for iOS"

@@ -8,12 +8,14 @@ Madeira is intended to be buildable from a clean clone with one command.
 - Xcode command-line tools selected with `xcode-select`
 - Homebrew
 - Git
+- Rust installed with [rustup](https://rustup.rs/)
 
 The build script installs the remaining Homebrew packages, initializes all
 submodules (including DXMT's nested header submodules), downloads the pinned compiler toolchains, builds the native iOS
 libraries, downloads the official Microsoft Visual C++ x64 Redistributable,
 extracts the required runtime DLLs locally, builds the Xcode project, and
 packages the result. Microsoft runtime DLLs are never added to Git.
+The pairing-library build installs the Rust iOS target and generates its crate notices.
 
 Expect the first run to take several hours on a typical Mac: LLVM 15 is
 compiled twice (macOS host tools, then the iOS target libraries), and FEX is
