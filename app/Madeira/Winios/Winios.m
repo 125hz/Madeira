@@ -1549,6 +1549,26 @@ static unsigned long long winios_hidden_present_interval_ns(void) {
     return (unsigned long long)ns;
 }
 
+/* Frames a HIDDEN desktop window's layer took a drawable for. DXMT's present
+ * counter (madeira_frame_count) counts the presents of every window in the
+ * session, and the launcher's hidden Chromium layer keeps presenting at
+ * MADEIRA_HIDDEN_LAYER_FPS (10) for the whole game: the FPS readouts showed the
+ * cap plus 10 (30 read 40, 60 read 70; owner, 2026-10-26). The readouts use
+ * madeira_shown_frame_count, which leaves those frames out;
+ * MADEIRA_FPS_COUNT_HIDDEN=1 counts them again. The launch checks keep
+ * madeira_frame_count (any window's first frame). */
+static _Atomic unsigned long long g_hidden_layer_frames;
+extern uint64_t madeira_frame_count(void);
+uint64_t madeira_shown_frame_count(void) {
+    static _Atomic unsigned long long last;   /* never goes back: a hidden drawable is counted before its present */
+    const char *e = getenv("MADEIRA_FPS_COUNT_HIDDEN");   /* 1: the FPS readouts count hidden windows' presents too (as before 2026-10-26) */
+    unsigned long long n = madeira_frame_count();
+    unsigned long long h = (e && e[0] == '1') ? 0 : atomic_load_explicit(&g_hidden_layer_frames, memory_order_relaxed);
+    unsigned long long r = n > h ? n - h : 0, l = atomic_load_explicit(&last, memory_order_relaxed);
+    while (r > l && !atomic_compare_exchange_weak_explicit(&last, &l, r, memory_order_relaxed, memory_order_relaxed)) ;
+    return r > l ? r : l;
+}
+
 @interface MadeiraWindowMetalLayer : CAMetalLayer
 @property (nonatomic) uintptr_t madeiraHwnd;
 - (void)madeiraSetWindowHidden:(BOOL)hidden;
@@ -1588,7 +1608,10 @@ static unsigned long long winios_hidden_present_interval_ns(void) {
         }
         __atomic_store_n(&_lastDrawableNs, now, __ATOMIC_RELAXED);
     }
-    return [super nextDrawable];
+    id<CAMetalDrawable> drawable = [super nextDrawable];
+    if (drawable && __atomic_load_n(&_windowHidden, __ATOMIC_RELAXED))
+        atomic_fetch_add_explicit(&g_hidden_layer_frames, 1, memory_order_relaxed);   /* madeira_shown_frame_count */
+    return drawable;
 }
 @end
 

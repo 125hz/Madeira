@@ -28,6 +28,8 @@ void wine_set_ui_log_callback(wine_ui_log_callback_t cb);
 uint64_t madeira_get_present_count(void);
 // DXMT presents plus OpenGL presents (Winios/WiniosGL.m)
 uint64_t madeira_frame_count(void);
+// madeira_frame_count without the frames hidden desktop windows present (Winios.m): the FPS readouts
+uint64_t madeira_shown_frame_count(void);
 // ml1174: GPU busy time for the performance overlay (winemetal_unix.c). While
 // enabled, each committed command buffer adds its GPU time (union) on completion.
 void madeira_gpu_meter_enable(int on);

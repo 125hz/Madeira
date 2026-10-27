@@ -500,7 +500,7 @@ struct FPSOverlay: View {
     private func startTimers() {
         stopTimers()
         let now = CFAbsoluteTimeGetCurrent()
-        let c = madeira_frame_count()
+        let c = madeira_shown_frame_count()
         samples = [(now, c)]
         presentCount = c
         vsyncMode = madeira_get_vsync_locked()
@@ -509,7 +509,7 @@ struct FPSOverlay: View {
         // 100ms sampling — keeps the buffer fresh
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
             let t = CFAbsoluteTimeGetCurrent()
-            let cur = madeira_frame_count()
+            let cur = madeira_shown_frame_count()
             samples.append((t, cur))
             if samples.count > bufferCapacity { samples.removeFirst() }
             presentCount = cur

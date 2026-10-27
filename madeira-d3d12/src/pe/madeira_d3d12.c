@@ -1313,6 +1313,7 @@ struct mad_pso {
     char *il_tag; int il_int;      /* madeira-bcd skin-check-trace: the input layout in short; il_int: an integer element (blend indices) */
     LONG first_used; LONG64 born_present; DWORD born_tick;   /* madeira-bcd: pso-first-use */
     SRWLOCK rlock;                                  /* serialises this pipeline's lazy build (zero = SRWLOCK_INIT) */
+    volatile LONG async_q;                          /* pso-async: handed to the background builders */
     /* madeira-bcd pso-lazy-libs: lz = the stage libraries were dropped once the
      * pipeline was created and come back from the shader cache under these keys
      * at its first draw (mad_lzlib_restore); lz_has_ps never changes after creation */
@@ -6205,11 +6206,12 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
     if (p->rps || !p->lazy) return p->rps;
     AcquireSRWLockExclusive(&p->rlock);   /* per pipeline: builds of different pipelines run in parallel */
     if (!p->rps && p->lazy) {
-        obj_handle_t err = 0;
+        obj_handle_t err = 0, built = 0;
         LONG64 t0 = mad_qpc();   /* madeira-bcd */
         if (!p->lz || mad_lzlib_restore(p))   /* madeira-bcd pso-lazy-libs: the libraries come back first */
-            p->rps = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &p->vd, &err)
-                               : MTLDevice_newRenderPipelineState(p->device_handle, &p->rp, &err);
+            built = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &p->vd, &err)
+                              : MTLDevice_newRenderPipelineState(p->device_handle, &p->rp, &err);
+        if (built) { MemoryBarrier(); p->rps = built; }   /* pso-async: draws on other threads read rps without the lock */
         if (err) mad_log_nserror(p->vs_name, err);
         InterlockedExchangeAdd64(&g_pt_realize, mad_qpc() - t0); InterlockedIncrement(&g_pn_realize);
         if (p->rps) {
@@ -6246,6 +6248,94 @@ static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
     }
     ReleaseSRWLockExclusive(&p->rlock);
     return p->cps;
+}
+
+/* PIPELINES BUILT OFF THE RENDER THREAD (madeira.cfg pso-async, opt-in, default
+ * 0). A lazy pipeline Metal has not compiled before takes 35-50 ms at its first
+ * draw, on the thread that submits the frame: a scene that brings in dozens of
+ * new materials at once (a new district, a cutscene) holds that thread for
+ * hundreds of milliseconds and the frame rate drops to 3-10 for seconds (log
+ * 2026-10-26 22:40: 252 such builds, 12.3 s of the submitting thread, in under
+ * two minutes, while pso-warm had 4,989 pipelines still to compile). With
+ * pso-async = 1 the first draw hands the pipeline to two background threads and
+ * its draws are skipped until it is built: an object or effect shows up a few
+ * frames late instead of the frame waiting for the compiler. Only plain render
+ * pipelines go this way; a compute dispatch can produce data later passes depend
+ * on, so a compute pipeline is still built where it is first used. A queue that
+ * is full builds at the first draw as before. 0 = at the first draw (as before). */
+#define MAD_PA_MAX 2048
+static int g_pso_async = -1;
+static struct mad_pso *g_pa_q[MAD_PA_MAX];
+static LONG g_pa_head, g_pa_tail;
+static SRWLOCK g_pa_lock = SRWLOCK_INIT;
+static HANDLE g_pa_sem;
+static volatile LONG g_pa_queued, g_pa_built, g_pa_failed, g_pa_inline, g_pa_skips;
+static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T);
+static int mad_pso_async_on(void) {
+    if (g_pso_async < 0) {
+        int on = mad_pso_lazy_on() && mad_cfg_int_pe("pso-async", 0) > 0;   /* madeira.cfg pso-async: 1 = a new render pipeline is built on a background thread and its draws are skipped until it is ready (no frame waits for the compiler); 0 = built at its first draw */
+        if (on) d3d12_log("[madeira-d3d12] pso-async = 1: new render pipelines are built on 2 background threads; their draws are skipped until they are ready\n");
+        g_pso_async = on;
+    }
+    return g_pso_async;
+}
+static DWORD WINAPI mad_pa_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct mad_pso *p = NULL; obj_handle_t pool; LONG n = 0;
+        WaitForSingleObject(g_pa_sem, INFINITE);
+        AcquireSRWLockExclusive(&g_pa_lock);
+        if (g_pa_head != g_pa_tail) { p = g_pa_q[(ULONG)g_pa_head % MAD_PA_MAX]; g_pa_head++; }
+        ReleaseSRWLockExclusive(&g_pa_lock);
+        if (!p) continue;
+        pool = NSAutoreleasePool_alloc_init();
+        if (mad_pso_realize(p)) n = InterlockedIncrement(&g_pa_built);
+        else InterlockedIncrement(&g_pa_failed);
+        if (n == 1 || (n && !(n % 250)))
+            d3d12_log("[madeira-d3d12] pso-async: %ld pipelines built off the render thread (%ld failed, %ld waiting, %ld built at the draw with the queue full); "
+                      "%ld draws skipped while their pipeline was being built\n", (long)g_pa_built, (long)g_pa_failed,
+                      (long)(g_pa_queued - g_pa_built - g_pa_failed), (long)g_pa_inline, (long)g_pa_skips);
+        if (pool) NSObject_release(pool);
+        pso_Release((ID3D12PipelineState *)p);   /* the queue's reference */
+    }
+    return 0;
+}
+static int mad_pa_start(void) {
+    static volatile LONG state;   /* 0 not started, 1 starting, 2 running, 3 no threads */
+    LONG s = InterlockedCompareExchange(&state, 1, 0);
+    if (s == 0) {
+        unsigned t, n = 0;
+        g_pa_sem = CreateSemaphoreA(NULL, 0, MAD_PA_MAX, NULL);
+        for (t = 0; g_pa_sem && t < 2; t++) {
+            HANDLE h = CreateThread(NULL, 256 << 10, mad_pa_worker, NULL, 0, NULL);
+            if (h) { CloseHandle(h); n++; }
+        }
+        if (!n) d3d12_log("[madeira-d3d12] pso-async: no background thread could be created; pipelines are built at their first draw\n");
+        InterlockedExchange(&state, n ? 2 : 3);
+        return n ? 1 : 0;
+    }
+    while (s == 1) { Sleep(0); s = InterlockedCompareExchange(&state, 1, 1); }
+    return s == 2;
+}
+/* 1: the pipeline is queued (now or earlier) or built; 0: the caller builds it itself. */
+static int mad_pso_async_queue(struct mad_pso *p) {
+    if (p->rps || !p->lazy) return 1;
+    if (InterlockedCompareExchange(&p->async_q, 1, 0)) return 1;   /* queued earlier */
+    if (!mad_pa_start()) { InterlockedExchange(&p->async_q, 0); return 0; }
+    AcquireSRWLockExclusive(&g_pa_lock);
+    if (g_pa_tail - g_pa_head >= MAD_PA_MAX) {
+        ReleaseSRWLockExclusive(&g_pa_lock);
+        InterlockedExchange(&p->async_q, 0);
+        InterlockedIncrement(&g_pa_inline);
+        return 0;
+    }
+    InterlockedIncrement(&p->refs);   /* the worker releases it once the pipeline is built */
+    g_pa_q[(ULONG)g_pa_tail % MAD_PA_MAX] = p; g_pa_tail++;
+    ReleaseSRWLockExclusive(&g_pa_lock);
+    ReleaseSemaphore(g_pa_sem, 1, NULL);
+    if (InterlockedIncrement(&g_pa_queued) == 1)
+        d3d12_log("[madeira-d3d12] pso-async: first pipeline handed to the background builders\n");
+    return 1;
 }
 
 /* PARALLEL FIRST USE. Built at its first draw, a lazy pipeline is compiled on
@@ -6304,6 +6394,7 @@ static void mad_prebuild_lists(UINT count, ID3D12CommandList *const *lists) {
             struct mad_pso *p = l->cmds[k].kind == MC_PSO ? l->cmds[k].u.pso : NULL;
             if (!p) continue;
             if (p->is_compute ? (p->cps || !p->lazy_cs) : (p->rps || !p->lazy)) continue;
+            if (!p->is_compute && mad_pso_async_on() && mad_pso_async_queue(p)) continue;   /* pso-async: built in the background */
             for (j = 0; j < (UINT)n && v[j] != p; j++) ;
             if (j == (UINT)n) v[n++] = p;
         }
@@ -8398,7 +8489,11 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
      * (Astra). An engine that zeroes the count of a culled draw would have drawn
      * one instance of it. Not a skip: there is nothing to draw. */
     if ((c->kind == MC_DRAW && !c->u.draw.icount) || (c->kind == MC_DRAW_INDEXED && !c->u.drawi.inst)) { InterlockedIncrement(&g_zero_inst); return; }
-    if (e->pso && !e->pso->rps && e->pso->lazy) mad_pso_realize(e->pso);
+    if (e->pso && !e->pso->rps && e->pso->lazy) {
+        if (!e->pso->tess && mad_pso_async_on() && mad_pso_async_queue(e->pso)) {
+            if (!e->pso->rps) { InterlockedIncrement(&g_pa_skips); MAD_SKIP(e); return; }   /* pso-async: still being built */
+        } else mad_pso_realize(e->pso);
+    }
     if (!e->pso || (!e->pso->rps && !e->pso->tess)) {   /* ml1086: a tessellation pipeline may have no plain pipeline */
         if (!said_nopso++) d3d12_log("[madeira-d3d12] draw without a pipeline state; skipped\n");
         MAD_SKIP(e);
