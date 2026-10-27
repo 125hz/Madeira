@@ -50,14 +50,15 @@ enum JITPoolMeter {
         var s = previous
         if line.contains("no hole fits a ") { s.shrunk = true }
         if let r = line.range(of: "JIT pool: RX="), let size = line[r.upperBound...].range(of: "size=") {
-            s.sizeMB = Int(line[size.upperBound...].prefix { $0.isNumber })
+            let value = UInt64(line[size.upperBound...].prefix { $0.isNumber })
+            if let value, value <= UInt64.max >> 20 { s.sizeMB = Int(value) }
         }
         if let r = line.range(of: "[jit-pool] ") {
             let rest = line[r.upperBound...]
             if rest.contains("[pool-low] region C") { return s }
             if rest.hasPrefix("split pool:") || rest.hasPrefix("pool-mid:"), !rest.contains("ignored"),
                let found = Self.hole(rest, after: rest.hasPrefix("split pool:") ? "hole [0x" : "hole 2 [0x"),
-               !s.holes.contains(found) {
+               s.holes.count < 2, !s.holes.contains(where: { $0.start < found.end && found.start < $0.end }) {
                 s.holes.append(found)
                 return s
             }
@@ -77,8 +78,9 @@ enum JITPoolMeter {
         let below = s.holes.reduce(UInt64(0)) { $0 + (min(s.used, $1.end) > $1.start ? min(s.used, $1.end) - $1.start : 0) }
         let span = s.total > 0 ? s.total : UInt64(s.sizeMB ?? 0) << 20
         guard s.total > 0 || s.sizeMB != nil else { return nil }
-        let totalMB = Int((span - min(gap, span) + (1 << 19)) >> 20)
-        let usedMB = Int((s.used - min(below, s.used) + (1 << 19)) >> 20)
+        let total = span - min(gap, span), used = s.used - min(below, s.used)
+        let totalMB = (total >> 20) + (total & ((1 << 20) - 1) >= 1 << 19 ? 1 : 0)
+        let usedMB = (used >> 20) + (used & ((1 << 20) - 1) >= 1 << 19 ? 1 : 0)
         let notes = [s.shrunk ? "small" : nil, s.holes.isEmpty ? nil : "split"].compactMap { $0 }
         if s.exhausted > 0 { return "JIT FULL \(totalMB) MB" + (s.holes.isEmpty ? "" : " (split)") }
         return "JIT \(usedMB)/\(totalMB) MB" + (notes.isEmpty ? "" : " (" + notes.joined(separator: ", ") + ")")

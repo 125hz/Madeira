@@ -111,16 +111,19 @@ enum LogSummary {
         defer { try? handle.close() }
         var reader = Reader()
         var carry = Data()
+        var droppingLongLine = false
         while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
             carry.append(chunk)
             var start = carry.startIndex
             while let nl = carry[start...].firstIndex(of: 0x0A) {
-                reader.feed(String(decoding: carry[start..<nl], as: UTF8.self))
+                if !droppingLongLine { reader.feed(String(decoding: carry[start..<nl], as: UTF8.self)) }
+                droppingLongLine = false
                 start = carry.index(after: nl)
             }
             carry = Data(carry[start...])
+            if carry.count > 1 << 20 { carry.removeAll(keepingCapacity: true); droppingLongLine = true }
         }
-        if !carry.isEmpty { reader.feed(String(decoding: carry, as: UTF8.self)) }
+        if !droppingLongLine && !carry.isEmpty { reader.feed(String(decoding: carry, as: UTF8.self)) }
         return reader.facts
     }
 
@@ -392,7 +395,7 @@ enum LogSummary {
         0xC000041D: "a crash inside a window callback",
     ]
 
-    static func mb(_ bytes: UInt64) -> UInt64 { (bytes + (1 << 19)) >> 20 }
+    static func mb(_ bytes: UInt64) -> UInt64 { (bytes >> 20) + (bytes & ((1 << 20) - 1) >= 1 << 19 ? 1 : 0) }
 
     /// "[22:02:40.902] ..." -> "22:02:40"
     static func timestamp(_ line: String) -> String? {

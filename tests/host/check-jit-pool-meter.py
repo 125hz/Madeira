@@ -49,6 +49,16 @@ JITPoolMeter.note("[22:02:40.904] [ERR] ml1036: no hole fits a 896MB pool — SH
 assert(JITPoolMeter.text(JITPoolMeter.current) == "JIT 480/800 MB (small, split)")
 JITPoolMeter.note("[jit-pool] EXHAUSTED (anon RWX): want=0x1000 bump=0x37000000/0x37000000 tail_resv=0x0 freelist=0 — FAILING allocation")
 assert(JITPoolMeter.text(JITPoolMeter.current) == "JIT FULL 800 MB (split)")
+// Damaged log values must not trap while the overlay formats them.
+JITPoolMeter.reset()
+JITPoolMeter.note("JIT pool: RX=0x1, RW=0x2, size=18446744073709551615MB")
+assert(JITPoolMeter.current.sizeMB == nil)
+JITPoolMeter.note("[jit-pool] image used=0xffffffffffffffff/0xffffffffffffffff")
+assert(JITPoolMeter.text(JITPoolMeter.current) != nil)
+JITPoolMeter.reset()
+JITPoolMeter.note("[jit-pool] split pool: hole [0x100,0x300)")
+JITPoolMeter.note("[jit-pool] pool-mid: hole 2 [0x200,0x400)")
+assert(JITPoolMeter.current.holes.count == 1)
 print("PASS: JIT memory overlay: size from setup, use from loads, small pool, FULL once exhausted, reset per session, split pool holes left out, region C ignored")
 '''
 # With Live logs off the tail still reads the file (once a second), so the pool's lines

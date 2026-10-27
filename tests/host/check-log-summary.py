@@ -40,6 +40,7 @@ let cs2 = #"""
 [22:03:05.120] [INFO] [frontend] graceful close requested
 [22:03:10.898] [INFO] [dock-report] probe-result=0
 """#
+assert(LogSummary.mb(UInt64.max) == 17592186044416)
 let f = LogSummary.facts(lines: cs2.split(separator: "\n", omittingEmptySubsequences: false))
 assert(f.sawSession && f.game == "cs2.exe" && f.steamGame == "cs2.exe")
 assert(f.smallPool && f.poolWantedMB == 896 && f.poolMB == 560)

@@ -101,11 +101,17 @@ final class LogStore: ObservableObject {
                                                object: nil, queue: .main) { [logFileURL] _ in
             var task = UIBackgroundTaskIdentifier.invalid
             task = UIApplication.shared.beginBackgroundTask(withName: "madeira-summary") {
-                UIApplication.shared.endBackgroundTask(task)
+                guard task != .invalid else { return }
+                let finished = task; task = .invalid
+                UIApplication.shared.endBackgroundTask(finished)
             }
             DispatchQueue.global(qos: .utility).async {
                 LogSummary.write(from: logFileURL, source: "madeira-log.txt (this session, up to when Madeira went to the background)")
-                DispatchQueue.main.async { UIApplication.shared.endBackgroundTask(task) }
+                DispatchQueue.main.async {
+                    guard task != .invalid else { return }
+                    let finished = task; task = .invalid
+                    UIApplication.shared.endBackgroundTask(finished)
+                }
             }
         }
 
