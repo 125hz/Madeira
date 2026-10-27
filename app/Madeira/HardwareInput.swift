@@ -869,6 +869,7 @@ final class HardwareInput: ObservableObject {
             + "cursor=\(Self.directCursorEnabled ? 1 : 0) absolute=\(Self.absoluteEnabled ? 1 : 0) "
             + "lock=\(Self.lockEnabled ? 1 : 0) autolock=\(Self.autoLockEnabled ? 1 : 0) "
             + "mouse-routing=\(Self.mouseRoutingEnabled ? 1 : 0)")
+        log("phone pointer: \(String(cString: madeira_phone_pointer_status())) lock-available=\(Self.pointerLockAvailable ? 1 : 0)")
         guard Self.enabled else { return }
         appActive = UIApplication.shared.applicationState == .active
         hoverSeen = UIDevice.current.userInterfaceIdiom != .phone
