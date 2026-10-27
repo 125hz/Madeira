@@ -70,7 +70,7 @@ file is written whole.
    not the unix user `mobile`), else the one named after `$USER`. At start
    Madeira makes that profile the unix user's (`ProfileUnification`): the
    registry's profile paths are rewritten to `C:\users\mobile` and the
-   template profile's files are moved there, because a game Valve's client
+   template profile's files are copied there, because a game Valve's client
    starts in a Madeira Dock session gets its environment from the account
    name and writes under `mobile` regardless. A path
    with no placeholder is under Steam's
