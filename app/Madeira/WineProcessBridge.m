@@ -999,18 +999,14 @@ static int madeira_split_launch_args(const char *input, char *storage, size_t st
             } else if (*s == '"') {
                 if (!(backslashes & 1)) {
                     d -= backslashes / 2;
-                    quotes++;
+                    if (quotes && s[1] == '"') { *d++ = '"'; s++; }
+                    else quotes = !quotes;
                 } else {
                     d -= backslashes / 2 + 1;
                     *d++ = '"';
                 }
                 s++;
                 backslashes = 0;
-                while (*s == '"') {
-                    if (++quotes == 3) { *d++ = '"'; quotes = 0; }
-                    s++;
-                }
-                if (quotes == 2) quotes = 0;
             } else {
                 *d++ = *s++;
                 backslashes = 0;

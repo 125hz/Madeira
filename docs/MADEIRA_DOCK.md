@@ -565,14 +565,14 @@ credentials:
 ## Launch arguments and ownership timing
 
 Game details passes the saved game arguments through
-`MADEIRA_STEAM_HOST_USER_ARGS`. Dock appends them to the selected Steam launch
+`MADEIRA_STEAM_HOST_ARGUMENTS`. Dock appends them to the selected Steam launch
 option. Both the app and the host reject unbalanced unescaped quotes, control
 characters other than tabs, more than 64 arguments, and commands of 4096 bytes
 or more. Invalid arguments stop the host with code 54. Code 50 remains the
 offline sign-in result. Argument values do not appear in the host report.
 
 The host waits 500 ms after ownership setup by default. The developer override
-`MADEIRA_STEAM_HOST_POST_OWNERSHIP_WAIT_MS` accepts decimal values from 0 to
+`MADEIRA_DOCK_LICENCE_WAIT_MS` accepts decimal values from 0 to
 30000. Invalid values keep the default. This changes timing only. Valve's
 client still checks the account and the game license.
 
