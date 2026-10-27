@@ -63,6 +63,9 @@ esac
 #       the Windows Media Format reader (WMCreateReader, WMCreateSyncReader) and
 #       its winegstreamer frontend; tools/check-wine-media-dlls.py checks both in
 #       the farm after they are built
+#   explorerframe
+#       the prefix registers TaskbarList here; packaging the COM server lets
+#       ordinary ITaskbarList callers activate it (Madeira #450)
 #   netprofm
 #       the Network List Manager, for services a launcher starts in a game
 #       session
@@ -79,7 +82,7 @@ GAME_MODULES="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcrt20 msvcrt40 msvcirt
     xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_8 xaudio2_9
     x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6
     xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4
-    d2d1 wmvcore winegstreamer netprofm"
+    d2d1 wmvcore winegstreamer netprofm explorerframe"
 # shellcheck disable=SC2086 # the list is split on purpose
 [ $# -gt 0 ] || set -- cryptsp d3dx11_43 msvcp110 msvcr110 xaudio2_7 $GAME_MODULES
 [ -x "$STRIP" ] || { echo "llvm-mingw not found at $TC (docs/BUILDING.md)" >&2; exit 1; }
