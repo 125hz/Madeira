@@ -171,3 +171,4 @@ app/Madeira/arm64ec-windows/dock-notices.txt
 build/faultrep/out/
 
 .worktree/
+build/dcomp/out/
