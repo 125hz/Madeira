@@ -69,6 +69,8 @@ jobs:
           name: Madeira-ipa
           path: dist/Madeira.ipa
           if-no-files-found: error
+          overwrite: true
+          compression-level: 0
 
   llvm:
     needs: plan
@@ -235,3 +237,5 @@ jobs:
           name: Madeira-ipa
           path: dist/Madeira.ipa
           if-no-files-found: error
+          overwrite: true
+          compression-level: 0
