@@ -19,7 +19,7 @@ jobs:
       - id: sdk
         shell: bash
         run: |
-          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | sort | sed -n '/^\(CFLAGS\|CXXFLAGS\|LDFLAGS\|CONFIGURATION\|MADEIRA_MOLTENVK\)=/p'; } | shasum -a 256 | cut -c1-20)
+          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | LC_ALL=C sort | awk -F= '$1 ~ /^(CFLAGS|CXXFLAGS|LDFLAGS|CONFIGURATION|MADEIRA_MOLTENVK)$/'; } | shasum -a 256 | cut -c1-20)
           echo "key=$key" >> "$GITHUB_OUTPUT"
       - id: cache
         uses: actions/cache@v4
@@ -45,7 +45,7 @@ jobs:
       - id: sdk
         shell: bash
         run: |
-          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | sort | sed -n '/^\(CFLAGS\|CXXFLAGS\|LDFLAGS\|CONFIGURATION\|MADEIRA_MOLTENVK\)=/p'; } | shasum -a 256 | cut -c1-20)
+          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | LC_ALL=C sort | awk -F= '$1 ~ /^(CFLAGS|CXXFLAGS|LDFLAGS|CONFIGURATION|MADEIRA_MOLTENVK)$/'; } | shasum -a 256 | cut -c1-20)
           echo "key=$key" >> "$GITHUB_OUTPUT"
       - id: key
         run: echo "key=fex-ios-$(git rev-parse HEAD:FEX)-${{ hashFiles('tools/build/build-fex-ios.sh', '.github/workflows/build.yml') }}" >> "$GITHUB_OUTPUT"
@@ -73,7 +73,7 @@ jobs:
       - id: sdk
         shell: bash
         run: |
-          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | sort | sed -n '/^\(CFLAGS\|CXXFLAGS\|LDFLAGS\|CONFIGURATION\|MADEIRA_MOLTENVK\)=/p'; } | shasum -a 256 | cut -c1-20)
+          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | LC_ALL=C sort | awk -F= '$1 ~ /^(CFLAGS|CXXFLAGS|LDFLAGS|CONFIGURATION|MADEIRA_MOLTENVK)$/'; } | shasum -a 256 | cut -c1-20)
           echo "key=$key" >> "$GITHUB_OUTPUT"
       - id: key
         run: echo "key=i386-windows-$(git rev-parse HEAD:wine)-$(git rev-parse HEAD:dxmt)-${{ hashFiles('build/wine-i386/build.sh', 'tools/build/setup-llvm-mingw.sh', 'tools/build/build-shader-headers.sh') }}" >> "$GITHUB_OUTPUT"
@@ -109,7 +109,7 @@ jobs:
       - id: sdk
         shell: bash
         run: |
-          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | sort | sed -n '/^\(CFLAGS\|CXXFLAGS\|LDFLAGS\|CONFIGURATION\|MADEIRA_MOLTENVK\)=/p'; } | shasum -a 256 | cut -c1-20)
+          key=$( { xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version; xcrun clang --version; env | LC_ALL=C sort | awk -F= '$1 ~ /^(CFLAGS|CXXFLAGS|LDFLAGS|CONFIGURATION|MADEIRA_MOLTENVK)$/'; } | shasum -a 256 | cut -c1-20)
           echo "key=$key" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v4
         with:
