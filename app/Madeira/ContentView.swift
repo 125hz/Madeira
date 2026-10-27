@@ -3939,6 +3939,7 @@ final class TouchControlsModel: ObservableObject {
 
     @Published var controls: [TouchControl] = [] { didSet { save() } }
     @Published var visible = true               { didSet { save() } }
+    @Published var snapToGrid = false
     @Published var editing = false {            // transient, never persisted
         didSet {
             // ml1970: an ended edit is written back to the custom layout it came from.
@@ -4249,6 +4250,10 @@ struct TouchControlsOverlay: View {
                 }
             }
             if m.editing {
+                glassButton(m.snapToGrid ? "circle.grid.2x2.fill" : "circle.grid.2x2") {
+                    m.snapToGrid.toggle()
+                }
+                .transition(.opacity.combined(with: .scale))
                 glassButton("plus") {
                     var c = TouchControl()
                     // Stagger, so repeated adds do not stack invisibly.
@@ -4526,7 +4531,16 @@ struct TouchControlButton: View {
                 }
                 .onEnded { _ in
                     dragBase = nil
-                    if let q = control.action.stickKeys {
+                    if m.editing {
+                        guard let i = m.index(of: control.id) else { return }
+                        if m.snapToGrid {
+                            let step: Double = 0.02
+                            let snappedX = (m.controls[i].nx / step).rounded() * step
+                            let snappedY = (m.controls[i].ny / step).rounded() * step
+                            m.controls[i].nx = min(max(snappedX, 0.03), 0.97)
+                            m.controls[i].ny = min(max(snappedY, 0.03), 0.97)
+                        }
+                    } else if let q = control.action.stickKeys {
                         applyStick(-1, q)          // release every held direction
                         isDown = false
                     } else if isDown {
