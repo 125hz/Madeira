@@ -169,6 +169,7 @@ static int madeira_desktop_mode(void) {
 // Winios.m compositor: per-window CAMetalLayer inside the window's
 // compositor layer (desktop mode only).
 extern CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd);
+extern CAMetalLayer *winios_vulkan_layer_for_hwnd(void *hwnd);
 // Game sessions: the window a swapchain presents from is the game's own;
 // Winios.m's game-mode window overlay must not draw its GDI bits.
 extern void winios_note_game_metal_hwnd(void *hwnd);
@@ -187,29 +188,40 @@ static void my_release_metal_device(macdrv_metal_device d) {
     (void)d;
 }
 
-// The critical two: return a "view" handle that maps to the CAMetalLayer.
-// We pack the layer pointer directly. `v` carries the swapchain's HWND
-// (see my_get_win_data). Desktop mode: per-window layer in the desktop
-// compositor. Game mode: the fullscreen singleton, exactly as before.
-static macdrv_metal_view my_view_create_metal_view(macdrv_view v, macdrv_metal_device d) {
-    (void)d;
-    winios_note_swapchain_hwnd((void *)v);
+// The layer an HWND presents to. Desktop mode: per-window layer in the
+// desktop compositor. Game mode: the fullscreen singleton. Shared by DXMT
+// (below) and the OpenGL presenter (Winios/WiniosGL.m).
+CAMetalLayer *madeira_display_layer_for_hwnd(void *hwnd) {
     if (madeira_desktop_mode()) {
-        CAMetalLayer *layer = winios_metal_layer_for_hwnd((void *)v);
-        if (!layer) {
-            NSLog(@"[madeira-display] desktop metal layer creation failed for hwnd=%p", (void *)v);
-            return NULL;
-        }
-        fprintf(stderr, "[madeira-display] desktop metal view for hwnd=%p layer=%p\n", (void *)v, layer);
-        fflush(stderr);
-        return (macdrv_metal_view)CFBridgingRetain(layer);
+        CAMetalLayer *layer = winios_metal_layer_for_hwnd(hwnd);
+        if (!layer)
+            NSLog(@"[madeira-display] desktop metal layer creation failed for hwnd=%p", hwnd);
+        return layer;
     }
     pthread_mutex_lock(&g_lock);
     CAMetalLayer *layer = g_layer;
     pthread_mutex_unlock(&g_lock);
-    if (!layer) {
-        NSLog(@"[madeira-display] view_create_metal_view called before layer registered!");
-        return NULL;
+    if (!layer)
+        NSLog(@"[madeira-display] metal layer requested before one was registered!");
+    return layer;
+}
+
+// winevulkan's window surfaces (build/win32u-unix/vulkan_ios.c): the CAMetalLayer
+// an HWND's Vulkan swapchain presents to (VK_EXT_metal_surface retains it), the
+// same layer a D3D swapchain on that window gets, and the window is marked as a
+// Metal-presenting one like a DXMT swapchain's. NULL when there is no layer.
+
+// The critical two: return a "view" handle that maps to the CAMetalLayer.
+// We pack the layer pointer directly. `v` carries the swapchain's HWND
+// (see my_get_win_data).
+static macdrv_metal_view my_view_create_metal_view(macdrv_view v, macdrv_metal_device d) {
+    (void)d;
+    winios_note_swapchain_hwnd((void *)v);   /* [swap-win] */
+    CAMetalLayer *layer = madeira_display_layer_for_hwnd((void *)v);
+    if (!layer) return NULL;
+    if (madeira_desktop_mode()) {
+        fprintf(stderr, "[madeira-display] desktop metal view for hwnd=%p layer=%p\n", (void *)v, layer);
+        fflush(stderr);
     }
     winios_note_game_metal_hwnd((void *)v);
     return (macdrv_metal_view)CFBridgingRetain(layer);
@@ -221,6 +233,25 @@ static macdrv_metal_layer my_view_get_metal_layer(macdrv_metal_view v) {
 
 static void my_view_release_metal_view(macdrv_metal_view v) {
     if (v) CFBridgingRelease((CFTypeRef)v);
+}
+
+/* Vulkan uses the same retain contract as DXMT, with client-pixel geometry
+ * for desktop compositor layers.
+ * NULL HWND is only a native presentation-support probe, not a window. */
+void *madeira_vulkan_layer_acquire(void *hwnd) {
+    if (hwnd && madeira_desktop_mode()) {
+        winios_note_swapchain_hwnd(hwnd);
+        CAMetalLayer *layer = winios_vulkan_layer_for_hwnd(hwnd);
+        return layer ? (void *)CFBridgingRetain(layer) : NULL;
+    }
+    if (hwnd) return (void *)my_view_create_metal_view((macdrv_view)hwnd, NULL);
+    pthread_mutex_lock(&g_lock);
+    void *retained = g_layer ? (void *)CFBridgingRetain(g_layer) : NULL;
+    pthread_mutex_unlock(&g_lock);
+    return retained;
+}
+void madeira_vulkan_layer_release(void *layer) {
+    my_view_release_metal_view((macdrv_metal_view)layer);
 }
 
 static void my_on_main_thread(dispatch_block_t b) {
