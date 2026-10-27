@@ -9,6 +9,13 @@
 
 set -euo pipefail
 
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    echo "Usage: $0"
+    echo "  Builds a minimal Wine prefix snapshot for the iOS app to extract."
+    echo "  WINE and WINEBOOT override wine and wineboot executable paths."
+    exit 0
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT="$REPO_ROOT/app/Madeira/prefix-template.tar.gz"
