@@ -622,6 +622,12 @@ OVERLAY = {
                 "note": "1: with env.MADEIRA_PAD_MODE = hid, a pad that is not a PlayStation one becomes a generic HID "
                         "gamepad and leaves XInput (the old behaviour). Off: it stays on XInput.",
                 "sources": ["app/Madeira/GamepadInput.swift"]},
+    "env.MADEIRA_PSO_ARCHIVE_INLINE": {"category": "Direct3D 12", "title": "Pipeline archive: compile once",
+                "kind": "bool", "default": "1",
+                "note": "With pso-archive on: 1 (default) compiles a pipeline the saved archive does not have once, into "
+                        "an open archive, and creates it from there. 0: created, then compiled again on one queue to be "
+                        "added (the first version; it kept about a quarter of a session's pipelines).",
+                "sources": ["dxmt/src/winemetal/unix/winemetal_unix.c"]},
     "env.MADEIRA_X18_TRAMP_ALIGN": {"category": "Memory & JIT pool", "title": "x18 trampolines on their own page",
                 "kind": "bool", "default": "1",
                 "note": "1 (default): an image whose .data was shifted to a 16 KB page gets its x18 trampolines on the "

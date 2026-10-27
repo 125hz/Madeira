@@ -9,6 +9,10 @@ fell to 0.2-4 FPS for seconds at a time. With madeira.cfg pso-archive = 1,
 madeira-d3d12 names a folder per executable in its shader cache build directory
 (MadeiraCtl op 11) and winemetal looks there first, adding what it had to compile.
 
+Log 2026-10-27 01:00 (the first session with an empty directory): the queue add
+compiled every pipeline a second time and kept 1,536 of 6,027 misses; a miss is now
+compiled once, into a slot's open archive, and created from it.
+
 The same logs: a GameSir pad in env.MADEIRA_PAD_MODE = hid became a generic HID
 gamepad off XInput, which the game saw in one run of three.
 
@@ -73,7 +77,7 @@ check('chunks load once, with the first device', 'dispatch_once(&once, ^{ madeir
 load = body(wm, 'static void madeira_arch_load(id<MTLDevice> device)')
 check('an unfinished save and an unreadable chunk are deleted',
       load.count('unlink(path);') == 2 and 'strcmp(e->d_name + used, ".metalar")' in load)
-save = body(wm, 'static void madeira_arch_save(void)')
+save = body(wm, 'static void madeira_arch_save_archive(')
 check('a chunk is written to a temporary name, renamed, then joins the lookup list',
       'serializeToURL' in save and 'rename(tmp, path)' in save and 'arrayByAddingObject:a' in save)
 add = body(wm, 'static void madeira_arch_add(id descriptor, int kind)')
@@ -87,6 +91,21 @@ check('a miss is created as before and added',
       wm.count('if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 0);') == 2 and
       wm.count('if (madeira_arch && params->ret_pso && !err) madeira_arch_add(descriptor, 1);') == 1)
 check("a caller's own archives are left alone", wm.count('descriptor.binaryArchives ? nil : madeira_arch_lookup(') == 3)
+
+# --- inline add (log 90: the queue add compiled every pipeline twice) ----------------
+create = body(wm, 'static obj_handle_t madeira_arch_create(')
+check('inline: off with MADEIRA_PSO_ARCHIVE_INLINE=0', 'getenv("MADEIRA_PSO_ARCHIVE_INLINE")' in wm)
+check('inline: a free slot only (trylock), else the queue path',
+      'os_unfair_lock_trylock(&madeira_arch_slots[i].lock)' in create and 'if (!s) return 0;' in create)
+check('inline: compiled once by the add, created from that archive',
+      'addRenderPipelineFunctionsWithDescriptor:descriptor error:&e' in create and
+      '[descriptor setBinaryArchives:@[ s->open ]];' in create and '[descriptor setBinaryArchives:nil];' in create)
+check('inline: a full slot goes to the queue to be saved',
+      '>= MADEIRA_ARCH_CHUNK) {' in create and 'madeira_arch_save_handed(s->open, s->n);' in create)
+check('inline: tried before the queue path at all three sites',
+      wm.count('= madeira_arch_create(') == 3 and wm.count('if (!params->ret_pso) {\n    err = NULL;') == 3)
+check('idle slots are saved by the timer',
+      'madeira_arch_save_archive(s->open, s->n);' in body(wm, 'static void madeira_arch_arm(void)'))
 
 # --- recommendations and catalog --------------------------------------------------
 for ident in ('gta5e-steam', 'gta5e-other'):
