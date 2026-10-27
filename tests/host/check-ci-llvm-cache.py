@@ -100,6 +100,26 @@ with tempfile.TemporaryDirectory(prefix='madeira-ci-llvm-') as tmp:
     (gnutls / 'obj/gmp.done').unlink()
     assert subprocess.run(['bash', str(script)], env=env, capture_output=True).returncode != 0
     assert trace.exists(), 'missing stage markers must request a real build'
+
+    installed = fixture / 'installed'
+    installed.mkdir()
+    for name in ['a-target.dll', 'b-program.exe']:
+        (installed / name).touch()
+    for index in range(1200):
+        (installed / (f'z-{index:04}-' + 'padding' * 10 + '.tlb')).touch()
+    objdump = tools / 'objdump'
+    objdump.write_text('#!/bin/sh\nprintf "  DLL Name: %s\\n" "$TEST_IMPORT"\n')
+    objdump.chmod(0o755)
+    closure = (root / 'build/wine-i386/build.sh').read_text().split('missing=0\n', 1)[1]
+    closure_env = dict(env, DEST=str(installed), OBJDUMP=str(objdump))
+    for imported, expected in [('A-TARGET.DLL', 0), ('absent.dll', 2)]:
+        result = subprocess.run(['bash'], input='set -euo pipefail\nmissing=0\n' + closure,
+                                env=dict(closure_env, TEST_IMPORT=imported),
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert f', {expected} missing imports ==' in result.stdout, result.stdout
+        assert not result.stderr, result.stderr
 print('PASS: complete LLVM cache skips clone/build; damaged or missing archives are refused')
 print('PASS: complete FEX/DXMT CI caches skip rebuilds; missing outputs and local builds do not')
 print('PASS: GnuTLS output and stage-marker caches skip completed stages together')
+print('PASS: large DLL sets resolve present imports and report absent imports without broken pipes')
