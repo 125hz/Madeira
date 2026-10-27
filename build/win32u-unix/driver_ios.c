@@ -533,6 +533,19 @@ int winios_drv_size_game_window( HWND hwnd, int width, int height )
     return ok ? 1 : -1;
 }
 
+/* The end of a Dock session: Madeira Dock has shut Valve's client down after the
+ * game, but explorer's virtual desktop never closes by itself on iOS (server
+ * winstation.c, "desktop auto-close suppressed"). WM_CLOSE makes the desktop's
+ * message loop quit and explorer exit, which ends the session. Only the desktop
+ * window's own thread posts it, from its event pump. Returns 0 on another
+ * thread, 1 when posted, -1 on failure. */
+int winios_drv_close_desktop_if_owner( void )
+{
+    HWND desktop = get_desktop_window();
+    if (!desktop || get_window_thread( desktop, NULL ) != GetCurrentThreadId()) return 0;
+    return NtUserPostMessage( desktop, WM_CLOSE, 0, 0 ) ? 1 : -1;
+}
+
 /* ============================================================ *
  * winios window surfaces (S2): GDI window content → app compositor.
  * Modeled on win32u's offscreen surface (dce.c): the generic

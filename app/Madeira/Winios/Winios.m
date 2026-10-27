@@ -532,6 +532,13 @@ extern int winios_drv_census_owner(HWND hwnd, unsigned int *pid, unsigned int *s
 extern int winios_drv_process_image(unsigned int pid, char *out, unsigned int size);
 extern int winios_drv_post_restore(HWND hwnd);
 extern int winios_drv_foreground_if_owner(HWND hwnd);
+extern int winios_drv_close_desktop_if_owner(void);
+
+/* winios_close_desktop: the app asks explorer's desktop to close (a Dock
+ * session whose game and Steam have ended); the desktop's own thread does it
+ * from its event pump (winios_pProcessEvents). */
+static atomic_int g_close_desktop;
+void winios_close_desktop(void) { atomic_store(&g_close_desktop, 1); }
 
 /* A game's main window can be shown minimized the first time it is shown
  * (ShowWindow cmd 2, parked at -32000,-32000). On Windows the taskbar brings
@@ -1018,6 +1025,14 @@ BOOL winios_pProcessEvents(DWORD mask) {
             fflush(stderr);
         }
     }
+    if (atomic_load_explicit(&g_close_desktop, memory_order_relaxed)) {
+        int r = winios_drv_close_desktop_if_owner();
+        int expected = 1;
+        if (r && atomic_compare_exchange_strong(&g_close_desktop, &expected, 0)) {
+            fprintf(stderr, "[winios] desktop close posted=%d (the Dock session ends)\n", r);
+            fflush(stderr);
+        }
+    }
     static unsigned int cnt;
     static int quiet = -1;
     if (quiet < 0) quiet = getenv("MADEIRA_QUIET") != NULL;
@@ -1351,6 +1366,7 @@ void winios_note_game_metal_hwnd(void *hwnd) {
  * starts with no overlay windows and no known Metal windows. */
 void winios_session_reset(void) {
     atomic_store(&g_size_game_hwnd, 0);
+    atomic_store(&g_close_desktop, 0);
     winios_swapchain_hwnds_reset();   /* [swap-win]: HWND values of the last session mean nothing now */
     dispatch_async(dispatch_get_main_queue(), ^{
         g_game_input_key = nil;
