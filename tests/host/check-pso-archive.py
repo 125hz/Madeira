@@ -11,7 +11,9 @@ madeira-d3d12 names a folder per executable in its shader cache build directory
 
 Log 2026-10-27 01:00 (the first session with an empty directory): the queue add
 compiled every pipeline a second time and kept 1,536 of 6,027 misses; a miss is now
-compiled once, into a slot's open archive, and created from it.
+compiled once, into a slot's open archive, and created from it; and each new IPA
+started with an empty archive (the build directory is pruned), so the folder now
+outlives builds under a size cap.
 
 The same logs: a GameSir pad in env.MADEIRA_PAD_MODE = hid became a generic HID
 gamepad off XInput, which the game saw in one run of three.
@@ -61,8 +63,12 @@ def body(src, sig):
 # --- madeira-d3d12 -------------------------------------------------------------
 init = body(pe, 'static void mad_pso_archive_init(void)')
 check('off by default (madeira.cfg pso-archive)', 'mad_cfg_int_pe("pso-archive", 0) <= 0) return;' in init)
-check('a folder per executable in the build directory',
-      'L"%ls\\\\pso-archive-%016llx", g_sc_dir' in init and 'GetModuleFileNameW(NULL, exe, MAX_PATH)' in init)
+check('a folder per executable and switch set that outlives builds',
+      'L"%ls\\\\Madeira\\\\PipelineArchive\\\\%ls-%016llx", base, rt + 1, (unsigned long long)h.a' in init
+      and 'GetModuleFileNameW(NULL, exe, MAX_PATH)' in init)
+check('MADEIRA_PSO_ARCHIVE_PER_BUILD=1: the build directory, as first written',
+      'GetEnvironmentVariableA("MADEIRA_PSO_ARCHIVE_PER_BUILD", v, sizeof v)' in init
+      and 'L"%ls\\\\pso-archive-%016llx", g_sc_dir' in init)
 check('the unix path goes to winemetal as op 11 and is freed',
       'a.op = 11;' in init and 'HeapFree(GetProcessHeap(), 0, udir);' in init)
 check('named once the shader cache directory exists',
@@ -75,8 +81,8 @@ look = body(wm, 'static NSArray *madeira_arch_lookup(id<MTLDevice> device)')
 check('no directory: nil, so nothing changes', 'memory_order_acquire) != 2 || !device) return nil;' in look)
 check('chunks load once, with the first device', 'dispatch_once(&once, ^{ madeira_arch_load(device); });' in look)
 load = body(wm, 'static void madeira_arch_load(id<MTLDevice> device)')
-check('an unfinished save and an unreadable chunk are deleted',
-      load.count('unlink(path);') == 2 and 'strcmp(e->d_name + used, ".metalar")' in load)
+check('an unfinished save, an unreadable chunk and an old one over the cap are deleted',
+      load.count('unlink(path);') == 3 and 'strcmp(e->d_name + used, ".metalar")' in load)
 save = body(wm, 'static void madeira_arch_save_archive(')
 check('a chunk is written to a temporary name, renamed, then joins the lookup list',
       'serializeToURL' in save and 'rename(tmp, path)' in save and 'arrayByAddingObject:a' in save)
@@ -106,6 +112,16 @@ check('inline: tried before the queue path at all three sites',
       wm.count('= madeira_arch_create(') == 3 and wm.count('if (!params->ret_pso) {\n    err = NULL;') == 3)
 check('idle slots are saved by the timer',
       'madeira_arch_save_archive(s->open, s->n);' in body(wm, 'static void madeira_arch_arm(void)'))
+
+# --- kept across builds, capped ---------------------------------------------------------
+check('cap: MADEIRA_PSO_ARCHIVE_MB, default 1024', 'getenv("MADEIRA_PSO_ARCHIVE_MB")' in load and ': 1024ull) << 20;' in load)
+check('cap: over it, the oldest chunks go at load down to three quarters',
+      'qsort(files, nfiles, sizeof *files, madeira_arch_file_cmp);' in load and 'prune = total > cap;' in load
+      and 'if (prune && total > cap / 4 * 3) {' in load)
+check('cap: a full directory takes no adds (queue and inline)',
+      'if (madeira_arch_full()) return;' in add and 'madeira_arch_full()) return 0;' in create)
+check('cap: a saved chunk counts toward it',
+      'atomic_fetch_add_explicit(&madeira_arch_bytes, (unsigned long long)st.st_size' in save)
 
 # --- recommendations and catalog --------------------------------------------------
 for ident in ('gta5e-steam', 'gta5e-other'):

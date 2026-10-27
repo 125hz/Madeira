@@ -628,6 +628,16 @@ OVERLAY = {
                         "an open archive, and creates it from there. 0: created, then compiled again on one queue to be "
                         "added (the first version; it kept about a quarter of a session's pipelines).",
                 "sources": ["dxmt/src/winemetal/unix/winemetal_unix.c"]},
+    "env.MADEIRA_PSO_ARCHIVE_MB": {"category": "Direct3D 12", "title": "Pipeline archive: size cap (MB)",
+                "kind": "int", "default": "1024",
+                "note": "With pso-archive on: the most a game's pipeline archive folder keeps across builds. Over it, the "
+                        "oldest chunks are deleted at launch down to three quarters; a session adds none once it is reached.",
+                "sources": ["dxmt/src/winemetal/unix/winemetal_unix.c"]},
+    "env.MADEIRA_PSO_ARCHIVE_PER_BUILD": {"category": "Direct3D 12", "title": "Pipeline archive: one per build",
+                "kind": "bool", "default": "0",
+                "note": "1: the archive folder sits in the build's shader cache directory and goes with it when a new build "
+                        "prunes it (the first version). Off: Madeira/PipelineArchive in LOCALAPPDATA, kept across builds.",
+                "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"]},
     "env.MADEIRA_X18_TRAMP_ALIGN": {"category": "Memory & JIT pool", "title": "x18 trampolines on their own page",
                 "kind": "bool", "default": "1",
                 "note": "1 (default): an image whose .data was shifted to a 16 KB page gets its x18 trampolines on the "

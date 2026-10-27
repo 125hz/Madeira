@@ -16667,24 +16667,40 @@ static void mad_scn_init(void) {
  * session, 19 of the first 500 in the next, which then compiled for minutes at
  * 420-550 ms each). With the switch on, winemetal keeps the pipelines this game
  * compiles in Metal binary archives of its own and looks there first
- * (MadeiraCtl op 11, winemetal in DXMT): a folder per executable in this
- * build's shader cache directory, so the archives go when a new build prunes it.
- * A winemetal without op 11 answers 0 and nothing changes. */
+ * (MadeiraCtl op 11, winemetal in DXMT): a folder per executable and switch set
+ * in LOCALAPPDATA\Madeira\PipelineArchive, outside the shader cache, so a new
+ * build does not prune it (log 2026-10-27 01:00: each IPA started with an empty
+ * archive). A pipeline is found only when the converter wrote the same shader;
+ * winemetal caps the folder's size (MADEIRA_PSO_ARCHIVE_MB). Env
+ * MADEIRA_PSO_ARCHIVE_PER_BUILD=1: the folder in the build directory, as first
+ * written. A winemetal without op 11 answers 0 and nothing changes. */
 static void mad_pso_archive_init(void) {
     typedef char *(CDECL *unix_name_fn)(LPCWSTR);
     unix_name_fn unix_name = NULL;
     struct mad_sc_hash h = { 0xcbf29ce484222325ull, 0x84222325cbf29ce4ull };
-    WCHAR exe[MAX_PATH], dir[MAX_PATH];
+    WCHAR exe[MAX_PATH], dir[MAX_PATH], base[MAX_PATH];
+    const WCHAR *rt = wcsrchr(g_sc_dir, L'\\');   /* the switch set's subdirectory */
+    char v[8];
     struct madeira_ctl_args a;
     HMODULE k32;
     char *udir;
     DWORD n, i;
+    int per_build;
     if (mad_cfg_int_pe("pso-archive", 0) <= 0) return;   /* compiled pipelines kept in Metal binary archives of our own (1; 0 = Metal's cache only) */
     n = GetModuleFileNameW(NULL, exe, MAX_PATH);
     if (!n || n >= MAX_PATH) return;
     for (i = 0; i < n; i++) if (exe[i] >= 'A' && exe[i] <= 'Z') exe[i] += 'a' - 'A';
     mad_sc_feed(&h, exe, n * sizeof(WCHAR));
-    _snwprintf(dir, MAX_PATH, L"%ls\\pso-archive-%016llx", g_sc_dir, (unsigned long long)h.a);
+    n = GetEnvironmentVariableA("MADEIRA_PSO_ARCHIVE_PER_BUILD", v, sizeof v);
+    per_build = (n && n < sizeof v && v[0] == '1') || !rt;
+    n = per_build ? 0 : GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    if (n && n < MAX_PATH - 112) {
+        _snwprintf(dir, MAX_PATH, L"%ls\\Madeira\\PipelineArchive", base);
+        CreateDirectoryW(dir, NULL);
+        _snwprintf(dir, MAX_PATH, L"%ls\\Madeira\\PipelineArchive\\%ls-%016llx", base, rt + 1, (unsigned long long)h.a);
+    } else {
+        _snwprintf(dir, MAX_PATH, L"%ls\\pso-archive-%016llx", g_sc_dir, (unsigned long long)h.a);
+    }
     CreateDirectoryW(dir, NULL);
     if ((k32 = GetModuleHandleW(L"kernel32.dll")))
         unix_name = (unix_name_fn)(void *)GetProcAddress(k32, "wine_get_unix_file_name");
