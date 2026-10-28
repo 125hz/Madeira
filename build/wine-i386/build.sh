@@ -169,7 +169,7 @@ for f in "$DEST"/*; do
     while IFS= read -r imp; do
         l="$(echo "$imp" | tr '[:upper:]' '[:lower:]')"
         case "$l" in api-ms-win-*|ext-ms-win-*) continue ;; esac
-        echo "$present" | grep -qx "$l" && continue
+        grep -Fx -- "$l" <<< "$present" >/dev/null && continue
         echo "missing import: $(basename "$f") -> $imp"; missing=$((missing + 1))
     done < <("$OBJDUMP" -p "$f" 2>/dev/null | sed -n 's/^ *DLL Name: //p')
 done
