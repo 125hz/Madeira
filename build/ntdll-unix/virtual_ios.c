@@ -22737,9 +22737,11 @@ static int ios_swap_wow_in_session( void );
  * footprint (compressed 2.8 GB of the 6 GB limit) instead of evicting them from
  * the file. Such a range skips the filter and goes to the file like any other
  * (MADEIRA_SWAP_X64_CHURN=1 keeps the filter for it). A 64-bit title beside 32-bit
- * helpers (MADEIRA_SWAP_X64_TITLE, below) is not idle and keeps the filter. */
+ * helpers (MADEIRA_SWAP_X64_TITLE, below) skips it too, its churny sizes then
+ * taking donor RAM first: log 95 (vk-1027-m5, which kept the filter for such a
+ * title) left 125 blocks of three churny sizes (mostly 0xfd0000) anonymous, about
+ * 1.6 GB, and the footprint went from log 94's 5.4 GB to the 6 GB limit. */
 static int ios_swap_x64_title;
-static int ios_swap_x64_policy( void );
 static int ios_swap_x64_idle( uintptr_t b, size_t size )
 {
     static int keep = -1;
@@ -22748,8 +22750,7 @@ static int ios_swap_x64_idle( uintptr_t b, size_t size )
         const char *e = getenv( "MADEIRA_SWAP_X64_CHURN" );   /* 1: the churn filter also covers 64-bit ranges beside a 32-bit program */
         keep = e && e[0] == '1';
     }
-    ios_swap_x64_policy();   /* sets ios_swap_x64_title */
-    if (keep || ios_swap_x64_title || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;
+    if (keep || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;
     return ios_wow_window_covering( (const void *)b, (const void *)(b + size) ) == 0;
 }
 static int ios_swap_wow64_policy( void );
@@ -22762,9 +22763,45 @@ static int ios_swap_wow_churn_exempt( uintptr_t b, size_t size )
     if (ios_swap_wow64_policy() != 0) return 0;
     return ios_wow_window_covering( (const void *)b, (const void *)(b + size) ) != 0;
 }
+/* CLOSE TO THE LIMIT the churn filter yields. A churny size kept
+ * anonymous is billed to the app's footprint; log 95 reached the 6 GB jetsam limit
+ * with 1.6 GB of such blocks in it while the tier had room. Once less than
+ * MADEIRA_SWAP_CHURN_TIGHT_MB (default 768; 0 = never) is left before the limit
+ * (os_proc_available_memory, read at most every 250 ms), churny sizes are tiered
+ * like any other range: a take and a give cost less than a kill. */
+static int ios_swap_footprint_tight( void )
+{
+    extern size_t os_proc_available_memory( void );
+    static long long margin = -1;
+    static uint64_t checked;
+    static int tight, said;
+    uint64_t now;
+    if (margin < 0)
+    {
+        const char *e = getenv( "MADEIRA_SWAP_CHURN_TIGHT_MB" );   /* MB left before the app's memory limit below which churny sizes are tiered too (default 768, 0 = never) */
+        margin = e && *e ? strtoll( e, NULL, 10 ) : 768;
+        if (margin < 0) margin = 0;
+    }
+    if (!margin) return 0;
+    now = ios_swap_now_ns();
+    if (now - checked >= 250000000ull)
+    {
+        unsigned long long left = (unsigned long long)os_proc_available_memory();
+        int was = tight;
+        checked = now;
+        tight = left && left < ((unsigned long long)margin << 20);
+        if (tight != was && said < 16)
+        {
+            said++;
+            dprintf( 2, "[swap] churn filter %s: %llu MB left before the memory limit (MADEIRA_SWAP_CHURN_TIGHT_MB = %lld)\n",
+                     tight ? "OFF, churny sizes are tiered" : "back on", left >> 20, margin );
+        }
+    }
+    return tight;
+}
 static int ios_swap_churn_exempt( uintptr_t b, size_t size )
 {
-    return ios_swap_x64_idle( b, size ) || ios_swap_wow_churn_exempt( b, size );
+    return ios_swap_x64_idle( b, size ) || ios_swap_wow_churn_exempt( b, size ) || ios_swap_footprint_tight();
 }
 static int ios_swap_why( const void *base, size_t size, unsigned int vprot, struct file_view *view )
 {

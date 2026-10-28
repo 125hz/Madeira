@@ -83,7 +83,7 @@ check('madeira_cfg_int( "donor-pool-guard", 0 )' in src and 'if (level < 0 || le
       'pressure notifications stop takes only when donor-pool-guard asks (1 critical, 2 warning too)')
 # ml2021: the churn filter spares 64-bit ranges beside a 32-bit program and the 32-bit program's own ranges under the donor-only policy
 check('static int ios_swap_churn_exempt( uintptr_t b, size_t size )' in src
-      and 'return ios_swap_x64_idle( b, size ) || ios_swap_wow_churn_exempt( b, size );' in src
+      and 'return ios_swap_x64_idle( b, size ) || ios_swap_wow_churn_exempt( b, size ) || ios_swap_footprint_tight();' in src
       and src.count('ios_swap_churn_exempt( b, size )') + src.count('ios_swap_churn_exempt( b, view->size )') >= 2,
       'both churn checks (commit and whole reservation) consult the exemption')
 check('if (ios_swap_wow64_policy() != 0) return 0;' in src, "a 32-bit range is exempt only under the donor-only policy (never for the file)")
@@ -106,9 +106,15 @@ check("ios_swap_x64_title = policy == 0 && title && title[0] == '1';" in policy
       and 'getenv( "MADEIRA_SWAP_X64_TITLE" )' in policy,
       'MADEIRA_SWAP_X64_TITLE=1 (a 64-bit title beside 32-bit helpers): donor RAM first under swap-x64 unset only')
 idle = src[src.index('static int ios_swap_x64_idle( uintptr_t b, size_t size )'):src.index('static int ios_swap_wow64_policy( void );')]
-check('if (keep || ios_swap_x64_title || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;' in idle
-      and 'ios_swap_x64_policy();' in idle,
-      'such a title is not an idle launcher chain: it keeps the churn filter')
+check('if (keep || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;' in idle
+      and 'ios_swap_x64_title' not in idle.split('{', 1)[1],
+      'such a title skips the churn filter beside 32-bit programs too (log 95: kept, 1.6 GB stayed in the footprint)')
+tight = src[src.index('static int ios_swap_footprint_tight( void )'):src.index('static int ios_swap_churn_exempt( uintptr_t b, size_t size )')]
+check('getenv( "MADEIRA_SWAP_CHURN_TIGHT_MB" )' in tight and ': 768;' in tight
+      and 'tight = left && left < ((unsigned long long)margin << 20);' in tight and 'now - checked >= 250000000ull' in tight,
+      'under 768 MB left before the memory limit (read every 250 ms) the churn filter yields; 0 = never')
+check('|| ios_swap_footprint_tight();' in src[src.index('static int ios_swap_churn_exempt( uintptr_t b, size_t size )'):][:300],
+      'both churn skips (a commit and a whole reservation) go through the exemption')
 cv = (ROOT / 'app/Madeira/ContentView.swift').read_text()
 dgs = (ROOT / 'app/Madeira/DockGameSession.swift').read_text()
 check('if MadeiraConfig.flag("MADEIRA_DOCK_X64_TITLE"),' in cv
