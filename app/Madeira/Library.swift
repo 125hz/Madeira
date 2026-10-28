@@ -4645,6 +4645,63 @@ struct LibraryPillGlass: ViewModifier {
     }
 }
 
+/// The in-game menu's panel: the system material, so the game shows through it
+/// blurred (owner, 2026-10-28: the solid panel). The solid panel as before with
+/// Reduce Transparency, or MADEIRA_MENU_BLUR=0.
+struct SessionMenuBackground: ViewModifier {
+    static let blur = MadeiraConfig.flag("MADEIRA_MENU_BLUR")   // 0: the in-game menu's solid panel, as before 2026-10-28
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 28)
+        if Self.blur && !reduceTransparency { content.background(.regularMaterial, in: shape) }
+        else { content.background(Color(uiColor: .secondarySystemBackground), in: shape) }
+    }
+}
+
+/// The performance overlay's look (OverlayStyle), under its figures in the in-game menu.
+struct OverlayStyleSettings: View {
+    @AppStorage(OverlayStyle.layoutKey) private var layout = "grid"
+    @AppStorage(OverlayStyle.scaleKey) private var scale = 1.0
+    @AppStorage(OverlayStyle.backgroundKey) private var background = "glass"
+    @AppStorage(OverlayStyle.opacityKey) private var opacity = 1.0
+    @AppStorage(OverlayStyle.labelsKey) private var labels = true
+    @AppStorage(OverlayStyle.coloursKey) private var colours = false
+    @AppStorage(OverlayStyle.refreshKey) private var refresh = 1.0
+    @AppStorage(OverlayStyle.graphSecondsKey) private var graphSeconds = 4.0
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Overlay style").font(.subheadline.weight(.semibold)).padding(.top, 4)
+            Picker("Layout", selection: $layout) {
+                ForEach(OverlayStyle.layouts, id: \.id) { Text($0.name).tag($0.id) }
+            }.pickerStyle(.segmented)
+            LabeledContent("Size") { Slider(value: $scale, in: 0.6...1.8, step: 0.05) }
+            LabeledContent("Opacity") { Slider(value: $opacity, in: 0.3...1) }
+            LabeledContent("Background") {
+                Picker("Background", selection: $background) {
+                    ForEach(OverlayStyle.backgrounds, id: \.id) { Text($0.name).tag($0.id) }
+                }.pickerStyle(.segmented).frame(maxWidth: 220)
+            }
+            Toggle("Labels", isOn: $labels)
+            Toggle("Colour by frame rate", isOn: $colours)
+            LabeledContent("Updates") {
+                Picker("Updates", selection: $refresh) {
+                    Text("0.5 s").tag(0.5); Text("1 s").tag(1.0); Text("2 s").tag(2.0)
+                }.pickerStyle(.segmented).frame(maxWidth: 220)
+            }
+            LabeledContent("Graph span") {
+                Picker("Graph span", selection: $graphSeconds) {
+                    Text("2 s").tag(2.0); Text("4 s").tag(4.0); Text("8 s").tag(8.0)
+                }.pickerStyle(.segmented).frame(maxWidth: 220)
+            }
+            Text("1% lows: the frame rate of the slowest 1% of frames in the last ten seconds; 1% highs, the fastest. The graph shows each frame's time, newest on the right; a stall is a plateau as long as the stall.")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("Reset overlay style") {
+                layout = "grid"; scale = 1; background = "glass"; opacity = 1; labels = true; colours = false; refresh = 1; graphSeconds = 4
+            }.font(.subheadline)
+        }.font(.subheadline)
+    }
+}
+
 // Keep drag state in this small view. Global translation remains stable while
 // the view moves; local coordinates feed its own movement back in.
 struct LibraryFloatingItem: View {
@@ -4686,7 +4743,8 @@ struct LibraryFloatingItem: View {
                     .accessibilityLabel("Game menu").accessibilityHint("Drag to move")
             } else { LibraryMetrics().accessibilityHint("Drag to move") }
         }
-        .frame(maxWidth: isMenu ? 48 : max(48, min(390, viewport.width - insets.leading - insets.trailing - 16)))
+        // The overlay's cells have fixed widths; its One row layout can be wider than the old 390 pt cap.
+        .frame(maxWidth: isMenu ? 48 : max(48, viewport.width - insets.leading - insets.trailing - 16))
         .fixedSize(horizontal: false, vertical: true)
         .background(GeometryReader { proxy in
             Color.clear.onAppear { measured = proxy.size }.onChange(of: proxy.size) { _, size in measured = size }
@@ -4772,10 +4830,10 @@ struct LibraryHUD: View {
                 if !model.sessionMessage.isEmpty && !model.startingScreen { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
                 if !model.startingScreen { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.menu {
-                    Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
+                    Color.black.opacity(SessionMenuBackground.blur ? 0.3 : 0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
                     (bindsPage ? AnyView(bindsMenu) : AnyView(menu))
                         .frame(width: min(460, geo.size.width - 32), height: min(650, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom - 24))
-                        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 28))
+                        .modifier(SessionMenuBackground())
                         .clipShape(RoundedRectangle(cornerRadius: 28))
                         .overlay(RoundedRectangle(cornerRadius: 28).stroke(.white.opacity(0.15)))
                         .shadow(color: .black.opacity(0.6), radius: 30, y: 12)
@@ -5116,11 +5174,12 @@ struct LibraryHUD: View {
                 Divider()
                 Toggle("Performance overlay", isOn: $model.performance)
                 if model.performance {
-                    ForEach(["FPS", "Frame time", "CPU", "GPU", "RAM", "Swap & donor", "Battery", "Thermal"], id: \.self) { field in
+                    ForEach(OverlayStyle.fields, id: \.self) { field in
                         Toggle(field, isOn: Binding(get: { model.overlayFields.contains(field) }, set: { on in
                             model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
                         })).font(.subheadline)
                     }
+                    OverlayStyleSettings()
                 }
                 // The developer overlay's CAP and F pills (FPSOverlay), for library
                 // sessions: only with MADEIRA_SESSION_DIAGNOSTICS=1 (and not with
@@ -5184,11 +5243,122 @@ struct LibraryLiveLogs: View {
     }
 }
 
+/// The performance overlay's look, the same in every game (owner, 2026-10-28): its
+/// layout, size, background, opacity, labels, colours and how often the figures
+/// change. Which figures it shows stays per game (LibraryEntry.overlayFields).
+enum OverlayStyle {
+    static let layoutKey = "madeiraOverlayLayout", scaleKey = "madeiraOverlayScale"
+    static let backgroundKey = "madeiraOverlayBackground", opacityKey = "madeiraOverlayOpacity"
+    static let labelsKey = "madeiraOverlayLabels", coloursKey = "madeiraOverlayColours"
+    static let refreshKey = "madeiraOverlayRefresh", graphSecondsKey = "madeiraOverlayGraphSeconds"
+    /// "grid": up to five cells a row (as first made); "row": one long row; "column": one figure a line.
+    static let layouts: [(id: String, name: String)] = [("grid", "Grid"), ("row", "One row"), ("column", "Column")]
+    static let backgrounds: [(id: String, name: String)] = [("glass", "Glass"), ("dark", "Dark"), ("clear", "None")]
+    /// The figures the overlay can show, in the order of the menu's switches.
+    static let fields = ["FPS", "Frame time", "1% lows", "Frame graph", "CPU", "GPU", "RAM", "Swap & donor", "Battery", "Thermal"]
+}
+
+/// Frame times from the present path (madeira_frame_times_us, Winios.m) and the
+/// figures made from them: the 1% low is the frame rate of the slowest 1% of
+/// frames (their mean frame time), the 1% high that of the fastest 1%.
+enum FrameTimes {
+    static func read(windowMs: UInt32, max: Int = 2048) -> (intervals: [Double], sinceLast: Double) {
+        var buffer = [UInt32](repeating: 0, count: max)
+        var since: UInt32 = 0
+        let n = Int(madeira_frame_times_us(&buffer, Int32(max), windowMs, &since))
+        return (buffer.prefix(n).map { Double($0) / 1000 }, Double(since) / 1000)
+    }
+    /// (1% low, 1% high) in frames a second, nil without enough frames.
+    static func onePercent(_ ms: [Double]) -> (low: Double, high: Double)? {
+        guard ms.count >= 10 else { return nil }
+        let sorted = ms.sorted(), k = max(1, sorted.count / 100)
+        let slow = sorted.suffix(k).reduce(0, +) / Double(k), fast = sorted.prefix(k).reduce(0, +) / Double(k)
+        guard slow > 0, fast > 0 else { return nil }
+        return (1000 / slow, 1000 / fast)
+    }
+}
+
+/// The frame-time graph: each frame a step as wide as it lasted and as high as its
+/// time, newest on the right, so a stall is a plateau as long as the stall; the
+/// frame still being made grows at the right edge. Drawn ten times a second.
+struct FrameTimeGraph: View {
+    let width: CGFloat
+    let height: CGFloat
+    let scale: CGFloat
+    let seconds: Double
+    let colours: Bool
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.1)) { _ in
+            let (ms, since) = FrameTimes.read(windowMs: UInt32(seconds * 1000), max: 1024)
+            let sorted = ms.sorted()
+            let median = sorted.isEmpty ? 16.7 : sorted[sorted.count / 2]
+            let p99 = sorted.isEmpty ? 16.7 : sorted[min(sorted.count - 1, sorted.count * 99 / 100)]
+            // The frame still being made, once it is clearly late.
+            let pending = since > max(50, median * 2) ? since : 0
+            let top = [33.3, 50, 66.7, 100, 200, 500, 1000, 2000, 5000].first(where: { $0 >= max(p99, pending) * 1.15 }) ?? 5000
+            ZStack(alignment: .topTrailing) {
+                Canvas { context, size in
+                    let w = size.width, h = size.height
+                    func y(_ v: Double) -> CGFloat { h - CGFloat(min(v, top) / top) * (h - 1) }
+                    for guide in [16.7, 33.3] where guide < top {
+                        var line = Path(); line.move(to: CGPoint(x: 0, y: y(guide))); line.addLine(to: CGPoint(x: w, y: y(guide)))
+                        context.stroke(line, with: .color(.primary.opacity(0.18)), style: StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
+                    }
+                    // Right edge = now; walk back from the newest frame.
+                    var steps: [(x0: CGFloat, x1: CGFloat, v: Double)] = []
+                    var end = since
+                    if pending > 0 { steps.append((w - CGFloat(pending / 1000 / seconds) * w, w, pending)) }
+                    for v in ms.reversed() {
+                        let x1 = w - CGFloat(end / 1000 / seconds) * w, x0 = w - CGFloat((end + v) / 1000 / seconds) * w
+                        if x1 < 0 { break }
+                        steps.append((max(0, x0), x1, v)); end += v
+                    }
+                    guard !steps.isEmpty else { return }
+                    var outline = Path(), fill = Path()
+                    let ordered = steps.reversed()
+                    fill.move(to: CGPoint(x: ordered.first!.x0, y: h))
+                    for (i, s) in ordered.enumerated() {
+                        if i == 0 { outline.move(to: CGPoint(x: s.x0, y: y(s.v))) } else { outline.addLine(to: CGPoint(x: s.x0, y: y(s.v))) }
+                        outline.addLine(to: CGPoint(x: s.x1, y: y(s.v)))
+                        fill.addLine(to: CGPoint(x: s.x0, y: y(s.v))); fill.addLine(to: CGPoint(x: s.x1, y: y(s.v)))
+                    }
+                    fill.addLine(to: CGPoint(x: ordered.last!.x1, y: h)); fill.closeSubpath()
+                    context.fill(fill, with: .color(.primary.opacity(0.12)))
+                    context.stroke(outline, with: .color(.primary.opacity(0.85)), lineWidth: max(1, scale))
+                    // Spikes: frames over twice the median, marked in orange (red over 100 ms) with colours on.
+                    if colours {
+                        for s in steps where s.v > max(median * 2, 25) {
+                            var spike = Path(); spike.move(to: CGPoint(x: s.x0, y: y(s.v))); spike.addLine(to: CGPoint(x: s.x1, y: y(s.v)))
+                            spike.move(to: CGPoint(x: s.x0, y: y(s.v))); spike.addLine(to: CGPoint(x: s.x0, y: h))
+                            context.stroke(spike, with: .color(s.v > 100 ? .red : .orange), lineWidth: max(1.5, scale * 1.5))
+                        }
+                    }
+                }
+                Text(top >= 1000 ? String(format: "%.0f s", top / 1000) : String(format: "%.0f ms", top))
+                    .font(.system(size: 8 * scale, weight: .medium, design: .rounded).monospacedDigit())
+                    .foregroundStyle(.secondary).padding(.trailing, 2)
+            }
+            .frame(width: width, height: height)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
 struct LibraryMetrics: View {
     @ObservedObject private var model = LibraryModel.shared
+    @AppStorage(OverlayStyle.layoutKey) private var layout = "grid"
+    @AppStorage(OverlayStyle.scaleKey) private var scale = 1.0
+    @AppStorage(OverlayStyle.backgroundKey) private var background = "glass"
+    @AppStorage(OverlayStyle.opacityKey) private var opacity = 1.0
+    @AppStorage(OverlayStyle.labelsKey) private var labels = true
+    @AppStorage(OverlayStyle.coloursKey) private var colours = false
+    @AppStorage(OverlayStyle.refreshKey) private var refresh = 1.0
+    @AppStorage(OverlayStyle.graphSecondsKey) private var graphSeconds = 4.0
     @State private var lastCount: UInt64 = 0
     @State private var lastTime = Date()
+    @State private var tick = 0
     @State private var fps = 0.0
+    @State private var onePercent: (low: Double, high: Double)?
     @State private var memory = 0
     @State private var battery = -1
     /// iOS lowers clocks from .serious on, so a frame rate that sags after a few
@@ -5207,23 +5377,38 @@ struct LibraryMetrics: View {
     @State private var donatedMB = 0
     @State private var donorPoolMB = 0
     @State private var donorGuarded = 0
-    private let ticks = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    /// Half-second ticks; the figures change every `refresh` seconds (0.5, 1 or 2).
+    private let ticks = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
     /// ml2021: one cell per figure. A fixed width per cell (the widest value it can show)
     /// keeps the pill from shifting as digits change; monospaced digits keep the value
     /// still within the cell. Label above, value below, hairlines between cells, the
-    /// system material behind: no gradients, no custom colours beyond the thermal dot.
+    /// system material behind: no gradients, no custom colours beyond the thermal dot
+    /// (and, with Colours on, the frame-rate figures).
     struct Cell: Identifiable {
         let id: String
         let label: String
         let value: String
         let width: CGFloat
         var dot: Color? = nil
+        var tint: Color? = nil
+    }
+    private var s: CGFloat { CGFloat(min(max(scale, 0.5), 2)) }
+    private func speed(_ rate: Double) -> Color? {
+        guard colours, rate > 0 else { return nil }
+        return rate >= 45 ? .green : rate >= 25 ? .yellow : .red
     }
     private var cells: [Cell] {
         var result: [Cell] = []
-        if model.overlayFields.contains("FPS") { result.append(Cell(id: "fps", label: "FPS", value: String(format: "%.0f", fps), width: 44)) }
+        if model.overlayFields.contains("FPS") {
+            result.append(Cell(id: "fps", label: "FPS", value: String(format: "%.0f", fps), width: 44, tint: speed(fps)))
+        }
         if model.overlayFields.contains("Frame time") {
             result.append(Cell(id: "ms", label: "MS", value: fps > 0 ? String(format: "%.1f", 1000 / fps) : "–", width: 52))
+        }
+        if model.overlayFields.contains("1% lows") {
+            result.append(Cell(id: "low", label: "1% LOW", value: onePercent.map { String(format: "%.0f", $0.low) } ?? "–", width: 52,
+                               tint: onePercent.flatMap { speed($0.low) }))
+            result.append(Cell(id: "high", label: "1% HIGH", value: onePercent.map { String(format: "%.0f", $0.high) } ?? "–", width: 54))
         }
         if model.overlayFields.contains("CPU") {
             result.append(Cell(id: "cpu", label: "CPU", value: cpu.map { String(format: "%.0f%%", $0.total) } ?? "–", width: 50))
@@ -5253,37 +5438,93 @@ struct LibraryMetrics: View {
         }
         return result
     }
-    private func cell(_ c: Cell) -> some View {
-        VStack(spacing: 1) {
-            Text(c.label).font(.system(size: 9, weight: .medium, design: .rounded)).tracking(0.6).foregroundStyle(.secondary)
-            HStack(spacing: 4) {
-                if let dot = c.dot { Circle().fill(dot).frame(width: 6, height: 6) }
-                Text(c.value).font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit()).foregroundStyle(.primary)
-            }
+    private func value(_ c: Cell) -> some View {
+        HStack(spacing: 4 * s) {
+            if let dot = c.dot { Circle().fill(dot).frame(width: 6 * s, height: 6 * s) }
+            Text(c.value).font(.system(size: 13 * s, weight: .semibold, design: .rounded).monospacedDigit())
+                .foregroundStyle(c.tint ?? .primary)
         }
-        .frame(width: c.width)
+    }
+    private func label(_ c: Cell) -> some View {
+        Text(c.label).font(.system(size: 9 * s, weight: .medium, design: .rounded)).tracking(0.6 * s).foregroundStyle(.secondary)
+    }
+    private func cell(_ c: Cell) -> some View {
+        VStack(spacing: 1 * s) {
+            if labels { label(c) }
+            value(c)
+        }
+        .frame(width: c.width * s)
     }
     private func row(_ cells: [Cell]) -> some View {
         HStack(spacing: 0) {
             ForEach(Array(cells.enumerated()), id: \.element.id) { index, c in
-                if index > 0 { Rectangle().fill(.primary.opacity(0.12)).frame(width: 1, height: 20) }
+                if index > 0 { Rectangle().fill(.primary.opacity(0.12)).frame(width: 1, height: (labels ? 20 : 14) * s) }
                 cell(c)
             }
         }
     }
-    var body: some View {
+    /// The width a row of these cells takes (cells and hairlines).
+    private func width(_ cells: [Cell]) -> CGFloat {
+        cells.reduce(0) { $0 + $1.width * s } + CGFloat(max(0, cells.count - 1))
+    }
+    private func graph(width: CGFloat, height: CGFloat) -> some View {
+        FrameTimeGraph(width: width, height: height, scale: s, seconds: min(max(graphSeconds, 1), 10), colours: colours)
+    }
+    @ViewBuilder private var content: some View {
         let all = cells
-        // Up to five cells on a row; more wrap onto a second row so the pill stays under the
-        // viewport's width instead of truncating.
-        let split = all.count > 5 ? (all.count + 1) / 2 : all.count
-        VStack(spacing: 6) {
-            row(Array(all.prefix(split)))
-            if split < all.count { row(Array(all.suffix(from: split))) }
+        let showGraph = model.overlayFields.contains("Frame graph")
+        switch layout {
+        case "row":
+            HStack(spacing: 0) {
+                row(all)
+                if showGraph {
+                    if !all.isEmpty { Rectangle().fill(.primary.opacity(0.12)).frame(width: 1, height: (labels ? 20 : 14) * s).padding(.trailing, 4 * s) }
+                    graph(width: 120 * s, height: (labels ? 26 : 18) * s)
+                }
+            }
+        case "column":
+            VStack(alignment: .leading, spacing: 3 * s) {
+                ForEach(all) { c in
+                    HStack(spacing: 8 * s) {
+                        if labels { label(c) }
+                        Spacer(minLength: 0)
+                        value(c)
+                    }
+                    .frame(width: 112 * s)
+                }
+                if showGraph { graph(width: 112 * s, height: 34 * s) }
+            }
+            .padding(.horizontal, 2 * s)
+        default:
+            // Up to five cells on a row; more wrap onto a second row so the pill stays under the
+            // viewport's width instead of truncating.
+            let split = all.count > 5 ? (all.count + 1) / 2 : all.count
+            let first = Array(all.prefix(split)), second = Array(all.suffix(from: split))
+            VStack(spacing: 6 * s) {
+                if !first.isEmpty { row(first) }
+                if !second.isEmpty { row(second) }
+                if showGraph { graph(width: max(width(first), width(second), 150 * s), height: 34 * s) }
+            }
         }
-        .padding(.horizontal, 6).padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.primary.opacity(0.1), lineWidth: 0.5))
-        .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+    }
+    @ViewBuilder private func backdrop<V: View>(_ v: V) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 12 * s, style: .continuous)
+        switch background {
+        case "dark":
+            v.background(Color.black.opacity(0.55), in: shape)
+                .overlay(shape.strokeBorder(.white.opacity(0.12), lineWidth: 0.5))
+                .environment(\.colorScheme, .dark)
+        case "clear":
+            v.shadow(color: .black.opacity(0.9), radius: 1.5).environment(\.colorScheme, .dark)
+        default:
+            v.background(.ultraThinMaterial, in: shape)
+                .overlay(shape.strokeBorder(.primary.opacity(0.1), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+        }
+    }
+    var body: some View {
+        backdrop(content.padding(.horizontal, 6 * s).padding(.vertical, 6 * s))
+        .opacity(min(max(opacity, 0.2), 1))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(parts.joined(separator: ", "))
             .onAppear {
@@ -5293,9 +5534,13 @@ struct LibraryMetrics: View {
             .onDisappear { UIDevice.current.isBatteryMonitoringEnabled = false; madeira_gpu_meter_enable(0) }
             .onChange(of: model.overlayFields) { _, _ in applyGPUMeter() }
             .onReceive(ticks) { now in
+                tick += 1
+                guard tick % max(1, Int((refresh / 0.5).rounded())) == 0 else { return }
                 let count = madeira_shown_frame_count(); let dt = now.timeIntervalSince(lastTime)
                 let frames = count >= lastCount ? count - lastCount : 0
                 fps = Double(frames) / max(0.001, dt); lastCount = count; lastTime = now
+                // Over the last ten seconds, so a stall stays in the figure for a while.
+                if model.overlayFields.contains("1% lows") { onePercent = FrameTimes.onePercent(FrameTimes.read(windowMs: 10_000).intervals) }
                 var info = task_vm_info_data_t(); var size = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
                 let result = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(size)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &size) } }
                 if result == KERN_SUCCESS { memory = Int(info.phys_footprint / 1048576) }
@@ -5329,6 +5574,9 @@ struct LibraryMetrics: View {
         var result: [String] = []
         if model.overlayFields.contains("FPS") { result.append(String(format: "%.0f FPS", fps)) }
         if model.overlayFields.contains("Frame time") { result.append(fps > 0 ? String(format: "%.1f ms avg", 1000 / fps) : "— ms") }
+        if model.overlayFields.contains("1% lows") {
+            result.append(onePercent.map { String(format: "1%% low %.0f, 1%% high %.0f FPS", $0.low, $0.high) } ?? "1% lows —")
+        }
         if model.overlayFields.contains("CPU") {
             result.append(cpu.map { String(format: "CPU %.0f%% (top %.0f%%)", $0.total, $0.top) } ?? "CPU —")
         }

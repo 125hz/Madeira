@@ -30,6 +30,8 @@ uint64_t madeira_get_present_count(void);
 uint64_t madeira_frame_count(void);
 // madeira_frame_count without the frames hidden desktop windows present (Winios.m): the FPS readouts
 uint64_t madeira_shown_frame_count(void);
+// Frame intervals (µs, oldest first) of the last window_ms, for the overlay's graph and 1% figures (Winios.m)
+int madeira_frame_times_us(uint32_t *out, int max, uint32_t window_ms, uint32_t *since_last_us);
 // ml1174: GPU busy time for the performance overlay (winemetal_unix.c). While
 // enabled, each committed command buffer adds its GPU time (union) on completion.
 void madeira_gpu_meter_enable(int on);
