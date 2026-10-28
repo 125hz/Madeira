@@ -23,6 +23,7 @@ struct MadeiraApp: App {
                 .background(InteractionFrameRateInstaller())   // touch frame-rate request (New library grid)
                 .modifier(ClaimGamepadEvents())
                 .onAppear {
+                    ExternalDrives.shared.mountAll()
                     GamepadInput.shared.start()
                     HardwareInput.shared.start()
                     JITNetworkShortcut.shared.restoreLeftover()   // also starts its network path monitor
