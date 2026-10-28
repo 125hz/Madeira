@@ -767,6 +767,15 @@ OVERLAY = {
                         "game that waits for it (Red Dead Redemption 2) reads the smaller budget and frees textures. "
                         "Off (default): the registration is refused, as before. Set it in the game's own file; read "
                         "at session start."},
+    # the video budget's trim counts the swap tier's donor pool (winemetal, log 96).
+    "vram-count-donor": {"category": "Direct3D 9/10/11 (DXMT)",
+                "title": "Video memory budget counts donated RAM",
+                "kind": "bool", "default": "1",
+                "note": "The video memory budget a game reads shrinks as memory runs short (vram-trim-mb). On by "
+                        "default: the donor pool's memory counts as well, since it is the device's RAM even though "
+                        "it is not under the app's limit, so with a full pool on a phone with less RAM the game is "
+                        "told to keep fewer textures. 0: the trim judges the app's own memory alone, as before. "
+                        "Read at session start."},
     # madeira-bcd: the wineserver names an opened file with F_GETPATH (build/wineserver/fd_ios.c).
     "env.MADEIRA_SRV_FGETPATH": {"category": "Wine core (ntdll)", "title": "Name opened files with one call (server)",
                 "kind": "bool", "default": "0",

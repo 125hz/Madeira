@@ -133,11 +133,27 @@ check('32-bit kept in RAM %llu MB' in src, 'the donor stats line reports host fr
 check('MadeiraConfig.set("swap-wow64", choice.isEmpty ? nil : choice)' in swift and '"swap-wow64",' in swift,
       'Settings offers the 32-bit programs picker and the key is featured (not listed twice)')
 
+# Log 96: the video budget's trim counts the donated pages against the RAM cap (winemetal, in the
+# dxmt submodule; present in the build workspace).
+wm_path = ROOT / 'dxmt/src/winemetal/unix/winemetal_unix.c'
+if wm_path.exists():
+    wm = wm_path.read_text(encoding='utf-8', errors='replace')
+    check('unsigned long long *donor_pool_mb, unsigned long long *donor_guarded) __attribute__((weak));' in wm,
+          'winemetal reads the donated MB through the stats function (a weak reference)')
+    check('on = madeira_cfg_int("vram-count-donor", 1) != 0;' in wm, 'madeira.cfg vram-count-donor = 0 leaves the donor out')
+    dyn = wm[wm.index('static uint64_t madeira_ml1075_dynamic_budget(uint64_t base) {'):wm.index('static uint64_t madeira_ml1042_video_budget(uint64_t metal_recommended) {')]
+    check('if (cap && foot + donor > room && foot + donor - room > over) over = foot + donor - room;' in dyn
+          and 'if (over) budget = base > over ? base - over : 0;' in dyn,
+          'the footprint and the donated pages together are held vram-trim-mb below the RAM cap; the larger excess trims')
+else:
+    print('SKIP: dxmt submodule not checked out here')
+
 catalog = ROOT / 'app/Madeira/ConfigCatalog.generated.swift'
 if catalog.exists():
     text = catalog.read_text(encoding='utf-8')
     check('key: "env.MADEIRA_DONOR_WINDOWS"' in text, 'the config catalog documents env.MADEIRA_DONOR_WINDOWS')
     check('key: "swap-wow64"' in text, 'the config catalog documents swap-wow64')
+    check('key: "vram-count-donor"' in text, 'the config catalog documents vram-count-donor')
 
 print(f'check-donor-pool: {"OK" if not failures else f"{failures} FAILED"}')
 sys.exit(1 if failures else 0)
