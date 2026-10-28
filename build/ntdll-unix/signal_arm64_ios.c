@@ -11991,6 +11991,48 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                      di.dli_fbase );
         ios_dump_fault_region( siginfo->si_addr );
     }
+    /* A 32-bit program's call or jump to an address below 64 KB. FEX refuses to
+     * compile such a block (CompileBlock: REFUSING low/invalid RIP) and returns 0,
+     * and its dispatcher branches there, so the fault arrives here with pc = 0 and
+     * lr just past the dispatcher's CompileBlock call. Wow64PrepareForException
+     * then asks FEX's BTCpuResetToConsistentState, which raises a guest exception
+     * only for a pc inside the JIT; for pc 0 it declined, the exception was
+     * dispatched as a native one, the unwind stalled and the program ended
+     * (c0000005). Black Ops II's campaign (build 26, 2026-10-26): DestroyWindow
+     * sent its window WM_ACTIVATE while the game was shutting down to start
+     * Zombies, its window procedure called a null pointer, and the campaign
+     * ended there instead of handing over. Windows and Wine swallow an exception
+     * in a window procedure called back from the kernel; to get there the guest
+     * has to see it. With pc at the dispatcher's call, FEX takes the guest state
+     * from its frame (rip = the refused address) and raises the access violation
+     * to the 32-bit program, whose own handlers then run.
+     * MADEIRA_WOW_LOW_RIP_GUEST=0 dispatches it natively as before. */
+    {
+        extern void *ios_jit_rx_base_global;
+        extern size_t ios_jit_pool_size_global;
+        static int low_rip_guest = -1;
+        uintptr_t lp_pc = (uintptr_t)PC_sig(context), lp_lr = (uintptr_t)LR_sig(context);
+        uintptr_t lp_rx = (uintptr_t)ios_jit_rx_base_global;
+        size_t lp_sz = ios_jit_pool_size_global;
+
+        int enabled = __atomic_load_n( &low_rip_guest, __ATOMIC_RELAXED );
+        if (enabled < 0)
+        {
+            const char *e = getenv( "MADEIRA_WOW_LOW_RIP_GUEST" );
+            enabled = !(e && e[0] == '0' && !e[1]);
+            __atomic_store_n( &low_rip_guest, enabled, __ATOMIC_RELAXED );
+        }
+        if (enabled && lp_pc < 0x10000 && (uintptr_t)siginfo->si_addr == lp_pc &&
+            NtCurrentTeb()->WowTebOffset && lp_lr >= 4 &&
+            ((lp_rx && lp_lr - 4 >= lp_rx && lp_lr - 4 - lp_rx < lp_sz) || ios_jit_low_contains( lp_lr - 4 )))
+        {
+            static int low_rip_logged;
+            if (__atomic_fetch_add( &low_rip_logged, 1, __ATOMIC_RELAXED ) < 16)
+                ERR( "[wow-low-rip] guest branch to %p: pc set to the dispatcher's call %p so the "
+                     "32-bit program gets the access violation\n", (void *)lp_pc, (void *)(lp_lr - 4) );
+            PC_sig(context) = lp_lr - 4;
+        }
+    }
 #endif
     setup_exception( context, &rec );
 }
