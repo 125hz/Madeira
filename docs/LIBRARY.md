@@ -176,6 +176,13 @@ and check-frontend fails if a setting is hidden from it. A profile holds:
   because such a reservation fails (Final Fantasy Tactics - The Ivalice
   Chronicles reserves 256 GB); a program that falls back to a smaller
   reservation when a huge one fails is better off without it;
+- **Pause threads fully** (Automatic, On or Off): `MADEIRA_REAL_SUSPEND` for
+  the session (ml730: a Wine SuspendThread really stops the thread instead of
+  only snapshotting it). Automatic follows madeira.cfg's `real-suspend` when
+  set, otherwise turns it on when `GameAssembly.dll` is in the game's folder
+  (Unity IL2CPP, whose garbage collector scans suspended threads' stacks:
+  Megabonk crashed while loading without it). The launch unsets it when
+  nothing chooses it, and wineserver reads it on every call;
 - **CPU cores reported** (Automatic, 1, 2, 4 or 6) and **D3D9 anisotropic
   filtering** (Application default, up to 1×, 2×, 4× or 8×): only a choice
   other than the default exports `MADEIRA_CPU_COUNT` (wine) or

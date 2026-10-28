@@ -44,6 +44,24 @@ final class ShortcutRouter: ObservableObject {
     }
 }
 
+/// The Steam game a game in the last Dock session asked to start (LibraryModel.steamRunRequest).
+/// The next app run starts it once, if that run begins within 30 minutes.
+enum NextSteamApp {
+    private static let key = "madeira.nextSteamApp"
+    static func set(_ appID: Int) {
+        UserDefaults.standard.set(["app": appID, "at": Date().timeIntervalSince1970], forKey: key)
+    }
+    static func take() -> Int? {
+        guard let saved = UserDefaults.standard.dictionary(forKey: key) else { return nil }
+        UserDefaults.standard.removeObject(forKey: key)
+        guard let app = saved["app"] as? Int, app > 0, app <= Int(UInt32.max),
+              let at = saved["at"] as? Double else { return nil }
+        let age = Date().timeIntervalSince1970 - at
+        guard age >= 0, age < 30 * 60 else { return nil }
+        return app
+    }
+}
+
 // MARK: - Zip writing (stored)
 
 /// Uncompressed zip (saves are small, and many are compressed already). No

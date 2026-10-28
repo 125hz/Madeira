@@ -588,6 +588,21 @@ enum GameRecommendations {
         """,
         olderNvidia: true)
 
+    /// Call of Duty: Black Ops II, campaign (202970) and Zombies (212910), which
+    /// share one folder; multiplayer (202990) lives there too. Build 26
+    /// (2026-10-26): Zombies' sound crackled with the 60 ms default although the
+    /// speaker was never short (the [ios_audio] ml1230 pacing lines), and 150 ms
+    /// cleared it (owner's test, 2026-10-27). The standard list's line besides,
+    /// which it ran with; not madeira-bcd's defaults, which it did not.
+    static let blackOps2 = GameRecommendation(
+        id: "black-ops-2", title: "Call of Duty: Black Ops II", version: 1,
+        config: """
+        # Madeira's recommended settings for Call of Duty: Black Ops II.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_AUDIO_LEAD_MS = 150
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        """)
+
     /// Every other game, and the Desktop (owner's decisions, 2026-10-12): most games
     /// the owner tried outside these lists closed at start until the [ec-hook]
     /// reporter was off. It reads code a game's protection rewrites at run time
@@ -607,7 +622,7 @@ enum GameRecommendations {
         """)
 
     static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,
-                      darkSoulsRemastered, darkSoulsIII, falloutNewVegas, fallout3, standard]
+                      darkSoulsRemastered, darkSoulsIII, falloutNewVegas, fallout3, blackOps2, standard]
 
     // MARK: Recognising a game
 
@@ -615,6 +630,8 @@ enum GameRecommendations {
     static let rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500,
                horizonZeroDawnAppID = 1151640, darkSoulsRemasteredAppID = 570940, darkSoulsIIIAppID = 374320
     static let falloutNewVegasAppID = 22380, fallout3AppIDs: Set<Int> = [22300, 22370]   // Fallout 3, its GOTY Edition
+    /// Black Ops II's campaign, Zombies and multiplayer.
+    static let blackOps2AppIDs: Set<Int> = [202970, 212910, 202990]
 
     /// The recommendation for a game, or nil.
     /// - windowsPath: a program ("C:\Games\GoW\GoW.exe"), or a library Steam
@@ -641,6 +658,7 @@ enum GameRecommendations {
             if steamAppID == falloutNewVegasAppID || installFolder == "fallout new vegas" { return falloutNewVegas }
             if steamAppID.map(fallout3AppIDs.contains) == true || installFolder == "fallout 3"
                 || installFolder == "fallout 3 goty" { return fallout3 }
+            if blackOps2AppIDs.contains(steamAppID ?? 0) || installFolder == "call of duty black ops ii" { return blackOps2 }
             return nil
         }
         // A program, wherever it was installed: only the game's own programs, so a
@@ -669,6 +687,8 @@ enum GameRecommendations {
             return falloutNewVegas
         case "fallout3.exe":
             return fallout3
+        case "t6sp.exe", "t6zm.exe", "t6mp.exe":
+            return blackOps2
         default:
             return nil
         }

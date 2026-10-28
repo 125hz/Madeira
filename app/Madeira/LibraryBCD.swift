@@ -71,6 +71,38 @@ enum BCDLaunch {
                             + "older-nvidia=\(olderNvidia ? 1 : 0) "
                             + "game-config=\(profile.hasSettings ? 1 : 0)")
     }
+
+    /// "Pause threads fully" (Game details › Compatibility): MADEIRA_REAL_SUSPEND for
+    /// this session, or nil to leave it unset. Without it a Wine SuspendThread only
+    /// snapshots the target's registers while the thread keeps running (ml730,
+    /// build/wineserver/mach_ios.c). A Unity IL2CPP game's garbage collector suspends
+    /// every thread and scans its stack: with the threads still running it freed
+    /// objects in use, and Megabonk crashed while loading (c0000005 at a scrambled
+    /// address in two of the threads it had suspended). With real suspension it runs.
+    /// The game's own On or Off wins; Automatic follows madeira.cfg's real-suspend
+    /// when that is set, and otherwise turns it on for a Unity IL2CPP game only:
+    /// real suspension can deadlock a game that suspends a thread holding a lock
+    /// Madeira's own code needs, so it stays off for everything else.
+    static func realSuspend(_ entry: LibraryEntry?) -> (value: String, source: String)? {
+        if let entry, entry.desktop != true, let on = LibraryPrefs.realSuspend(entry.windowsPath) {
+            return (on ? "1" : "0", "this game's switch")
+        }
+        if let v = MadeiraConfig.get("real-suspend")?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
+            return (v, "madeira.cfg real-suspend")
+        }
+        if let entry, entry.desktop != true, isUnityIL2CPP(entry) { return ("1", "Unity IL2CPP game (GameAssembly.dll)") }
+        return nil
+    }
+
+    /// A Unity IL2CPP build keeps GameAssembly.dll next to its exe. A Steam entry's
+    /// path is its install folder; another entry's is the exe.
+    static func isUnityIL2CPP(_ entry: LibraryEntry) -> Bool {
+        guard let url = LibraryEntry.hostURL(ofWindowsPath: entry.windowsPath) else { return false }
+        var isDir: ObjCBool = false
+        let fm = FileManager.default
+        let folder = fm.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue ? url : url.deletingLastPathComponent()
+        return fm.fileExists(atPath: folder.appendingPathComponent("GameAssembly.dll").path)
+    }
 }
 
 /// "Older NVIDIA card (Direct3D 9)" (Game details › Compatibility): Direct3D 9

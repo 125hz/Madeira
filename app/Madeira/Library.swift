@@ -768,6 +768,21 @@ final class LibraryModel: ObservableObject {
         let kind = status == 0xC0000005 ? " (memory access violation)" : status == 0xC0000017 ? " (out of memory)" : ""
         return "The game stopped with Windows error 0x\(String(status, radix: 16, uppercase: true))\(kind). Export the diagnostic log to report it."
     }
+    /// A game in a Madeira Dock session asked Steam to start another game (steam://run/<App ID>;
+    /// ntdll refused steam.exe and reported it, WineProcessBridge.m): the next app run starts that
+    /// game (NextSteamApp), since a second session cannot start in this one. Black Ops II's
+    /// campaign does this when the player chooses Zombies.
+    private func steamRunRequest() -> String? {
+        var appID: UInt32 = 0
+        guard !quitRequested, wine_steam_run_request(&appID) != 0 else { return nil }
+        let id = Int(appID)
+        let name = entries.first { $0.steamAppID == id }?.title
+            ?? MadeiraDock.games(drive: MadeiraDock.drive).first { $0.id == id }?.name
+        LogStore.shared.log("[dock-steam-run] the game asked Steam to start app \(id)\(name == nil ? ", which is not installed" : "")")
+        guard let name else { return nil }
+        NextSteamApp.set(id)
+        return "The game asked to start \(name). Madeira runs one game per app session: close Madeira and open it again, and \(name) starts by itself."
+    }
     private var readOnly = false
     private var metadataInFlight = Set<UUID>()
     /// Entries whose scan result waits for the scroll to end (a card that reappears meanwhile does not scan again).
@@ -1415,7 +1430,8 @@ final class LibraryModel: ObservableObject {
         }
     }
     private func finish() {
-        if sawProcess, let report = exitReport() { error = report }
+        if sawProcess, let next = steamRunRequest() { restartNotice = next }
+        else if sawProcess, let report = exitReport() { error = report }
         timer?.invalidate(); timer = nil
         saveCurrentProfile()
         controllerMode = nil
@@ -3271,7 +3287,7 @@ private struct LibraryPlayStyle: ButtonStyle {
 }
 
 struct LibraryDetail: View {
-    @State var entry: LibraryEntry
+    @State internal var entry: LibraryEntry
     var play: (LibraryEntry) -> Void
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var model = LibraryModel.shared
@@ -3298,7 +3314,10 @@ struct LibraryDetail: View {
     /// the game's config lines in its GameProfiles.swift file. This page's
     /// controls read and write them; the entry fields upstream keeps for the
     /// same options (avx, reportNVIDIA, config) are moved into them once.
-    private func reloadBCD() { bcd = BCDGameValues(windowsPath: entry.windowsPath) }
+    private func reloadBCD() {
+        bcd = BCDGameValues(windowsPath: entry.windowsPath)
+        bcd.unityIL2CPP = BCDLaunch.isUnityIL2CPP(entry)
+    }
     private func migrateEntryOptions() {
         let path = entry.windowsPath
         let file = GameProfile(windowsPath: path)
@@ -3589,6 +3608,15 @@ struct LibraryDetail: View {
             Toggle(isOn: Binding(get: { bcd.wineVCRT }, set: { on in bcd.wineVCRT = on; LibraryPrefs.setWineVCRT(on, for: entry.windowsPath) })) {
                 compatLabel("Wine's C++ runtime", "Instead of the game's msvcp/vcruntime")
             }
+            // madeira-bcd: MADEIRA_REAL_SUSPEND for this game (BCDLaunch.realSuspend).
+            Picker(selection: Binding(get: { bcd.realSuspend.map { $0 ? 1 : 2 } ?? 0 },
+                                      set: { v in bcd.realSuspend = v == 0 ? nil : v == 1; LibraryPrefs.setRealSuspend(bcd.realSuspend, for: entry.windowsPath) })) {
+                Text("Automatic").tag(0)
+                Text("On").tag(1)
+                Text("Off").tag(2)
+            } label: {
+                compatLabel("Pause threads fully", "For Unity games that crash while loading, like Megabonk. Can make other games freeze")
+            }
             // Fastsync-only switches: shown for every game, usable only while
             // Settings › Sync engine is Fastsync.
             Group {
@@ -3813,6 +3841,7 @@ struct LibraryDetail: View {
 /// LibraryPrefs' switches and the GameProfiles.swift file's lines.
 struct BCDGameValues {
     var avx = false, nvidia = false, olderNvidia = false, wineVCRT = false
+    var realSuspend: Bool? = nil, unityIL2CPP = false
     var configText = ""
     init() {}
     init(windowsPath: String) {
@@ -3820,6 +3849,7 @@ struct BCDGameValues {
         nvidia = LibraryPrefs.nvidia(windowsPath)
         olderNvidia = LibraryPrefs.olderNvidia(windowsPath)
         wineVCRT = LibraryPrefs.wineVCRT(windowsPath)
+        realSuspend = LibraryPrefs.realSuspend(windowsPath)
         configText = GameProfile(windowsPath: windowsPath).text
     }
 }
@@ -3847,7 +3877,7 @@ struct LibraryGameConfigEditor: View {
 /// Game details › Find on Steam: searches the public store by title; choosing
 /// a result gives the entry that app's name and store artwork.
 struct SteamSearchView: View {
-    @State var query: String
+    @State internal var query: String
     var select: (SteamMatch) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var results: [SteamMatch] = []

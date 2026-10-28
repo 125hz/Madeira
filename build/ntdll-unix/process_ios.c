@@ -1499,6 +1499,65 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
          * "EnterEC wrote it" does NOT name the origin — Core.cpp says so explicitly:
          * EnterEC storing an x64 target in State.rip is its job. The upstream producer
          * still needs finding via x9 at DispatchJump/RetToEntryThunk/ExitToX64. */
+        /* A game in a Madeira Dock session asks Steam to start another game: it
+         * runs steam.exe with steam://run/<App ID> (or steam://rungameid/<App ID>)
+         * and exits. Black Ops II's campaign does this when the player chooses
+         * Zombies (build 30, 2026-10-27). In a Dock session Valve's client runs
+         * inside dockhost.exe, so steam.exe found no client, began a 229 MB
+         * self-update and stopped at a black window. The request goes to the app
+         * instead (wine_steam_run_requested, WineProcessBridge.m), which starts
+         * that game in its next run; steam.exe is not started.
+         * env.MADEIRA_DOCK_STEAM_RUN=0 lets steam.exe start as before. */
+        {
+            extern void wine_steam_run_requested( unsigned int appid ) __attribute__((weak));
+            const char *dock = getenv( "MADEIRA_DOCK_SESSION" ), *sr = getenv( "MADEIRA_DOCK_STEAM_RUN" );
+            const WCHAR *cl = params->CommandLine.Buffer;
+            int cl_len = params->CommandLine.Length / sizeof(WCHAR);
+
+            if (dock && dock[0] == '1' && !(sr && sr[0] == '0' && !sr[1]) && cl &&
+                ios_image_name_is( params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR),
+                                   "steam.exe" ))
+            {
+                static const char * const prefixes[] = { "steam://rungameid/", "steam://run/" };
+                unsigned int appid = 0;
+                unsigned p;
+                int k, j, found = 0;
+
+                for (p = 0; p < 2 && !found; p++)
+                {
+                    int pl = (int)strlen( prefixes[p] );
+                    for (k = 0; k + pl <= cl_len && !found; k++)
+                    {
+                        if (k && cl[k - 1] != ' ' && cl[k - 1] != '\t' && cl[k - 1] != '"') continue;
+                        for (j = 0; j < pl; j++)
+                        {
+                            WCHAR c = cl[k + j];
+                            if (c >= 'A' && c <= 'Z') c += 32;
+                            if (c != (WCHAR)prefixes[p][j]) break;
+                        }
+                        if (j < pl) continue;
+                        appid = 0;
+                        for (j = k + pl; j < cl_len && cl[j] >= '0' && cl[j] <= '9'; j++)
+                        {
+                            unsigned int digit = cl[j] - '0';
+                            if (appid > (UINT32_MAX - digit) / 10) { appid = 0; break; }
+                            appid = appid * 10 + digit;
+                        }
+                        found = appid && (j == cl_len || cl[j] == ' ' || cl[j] == '\t' ||
+                                          cl[j] == '"' || cl[j] == '/');
+                    }
+                }
+                if (found && wine_steam_run_requested)
+                {
+                    dprintf( 2, "[dock-steam-run] %s asks Steam to start app %u: steam.exe not started, "
+                             "the app starts it in its next run (env.MADEIRA_DOCK_STEAM_RUN=0 starts steam.exe)\n",
+                             madeira_debugstr_cmdline_us( &params->CommandLine ), appid );
+                    wine_steam_run_requested( appid );
+                    return STATUS_ACCESS_DENIED;
+                }
+            }
+        }
+
         static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery", "vulkandriverquery",
                                                       "steamsysinfo", "hardwareupdater",
                                                       "unitycrashhandler64" };
