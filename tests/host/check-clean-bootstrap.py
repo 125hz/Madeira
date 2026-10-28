@@ -11,7 +11,8 @@ import tempfile
 root = Path(__file__).resolve().parents[2]
 server = (root / 'build/wineserver/build.sh').read_text()
 fresh_base = '# Full builds must not reuse objects from a different Wine protocol revision.' in server
-selection = server[server.index('PATCHED_FILES=('):server.index('echo "=== Building kill wrapper')]
+before_flags = server.split('mkdir -p "$OBJ_DIR"', 1)[1].split('CC_FLAGS=(', 1)[0]
+selection = before_flags + server[server.index('PATCHED_FILES=('):server.index('echo "=== Building kill wrapper')]
 
 with tempfile.TemporaryDirectory(prefix='madeira-bootstrap-') as t:
     fixture = Path(t)
