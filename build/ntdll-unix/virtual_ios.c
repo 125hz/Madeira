@@ -22201,6 +22201,8 @@ static uint64_t    ios_swap_logical;          /* file offset space: the cap, or 
 static unsigned long long ios_swap_why_bytes[IOS_SW_REASONS];
 static unsigned long long ios_swap_resv_bytes, ios_swap_resv_n, ios_swap_merges, ios_swap_bump_back, ios_swap_free_drop;
 static unsigned long long ios_swap_holes, ios_swap_disk_refused, ios_swap_churn_skips;   /* ml1257 / ml1258 */
+static unsigned long long ios_swap_churn_donor, ios_swap_whole_file;   /* churny blocks in donor RAM; large whole reservations kept off it */
+static int ios_swap_map_mode;   /* (ios_swap_map): 1 = the file only, 2 = donor RAM only */
 #define IOS_SWAP_CHURN_NS (3ull * 1000000000ull)
 /* ml1226: hits = young deaths, backs = backings of the size; see ios_swap_churny */
 static struct { size_t size; unsigned hits; unsigned backs; } ios_swap_churn[64];
@@ -22591,7 +22593,14 @@ static void ios_donor_give( uint64_t off, size_t len )
     ios_donor_bytes -= len;
     ios_donor_free_insert( off, len );
 }
+/* bytes of the pool not handed out (free list and bump room together) */
+static uint64_t ios_donor_room( void )
+{
+    uint64_t total = (uint64_t)__atomic_load_n( &ios_donor_nreg, __ATOMIC_ACQUIRE ) * ios_donor_region;
+    return total > ios_donor_bytes ? total - ios_donor_bytes : 0;
+}
 #else
+static uint64_t ios_donor_room( void ) { return 0; }
 static uint64_t ios_donor_take_upto( size_t want, size_t *got ) { (void)want; *got = 0; return (uint64_t)-1; }
 static int ios_donor_map( char *va, size_t len, int unix_prot, uint64_t off ) { (void)va; (void)len; (void)unix_prot; (void)off; return -1; }
 static void ios_donor_give( uint64_t off, size_t len ) { (void)off; (void)len; }
@@ -22813,6 +22822,67 @@ static int ios_swap_churn_exempt( uintptr_t b, size_t size )
 {
     return ios_swap_x64_idle( b, size ) || ios_swap_wow_churn_exempt( b, size ) || ios_swap_footprint_tight();
 }
+/* (log 99, an 8 GB phone, 2026-10-28): THE POOL WENT TO A BROWSER. A
+ * whole reservation (ml1257) takes the pool by its size, touched or not, and the first
+ * big one took all of it: the 4 GB of [0x7800000000, 0x7900000000) that Social Club's
+ * Chromium helper reserved for PartitionAlloc, of which it touches a few MB. The game
+ * never had a byte of donor RAM; its churny 16 MB blocks stayed in the footprint
+ * (~2 GB of it), and near the limit ios_swap_footprint_tight sent them to the file,
+ * where iOS wrote the hot pages out to flash (the file's disk use 0.86 -> 2.06 GB)
+ * and the game froze for 10-40 s at a time, in logs 96-99 alike. A Chromium browser's
+ * ranges (ios_avail_phys_chromium: SocialClubHelper.exe, steamwebhelper.exe) are
+ * backed by the file only, whose holes cost nothing until a page is written;
+ * MADEIRA_DONOR_BROWSERS=1 gives them donor RAM as before. And, opt-in, a whole
+ * reservation above MADEIRA_DONOR_WHOLE_MAX_MB (default 0 = no limit: a game's own big
+ * heap is hot, log 86 ran 27% faster on donor RAM) goes to the file only too. A 32-bit
+ * program's ranges keep their donor-only rule either way. */
+static int ios_avail_phys_chromium( void );
+static int ios_swap_browser( void )
+{
+    static int give = -1;
+    if (give < 0)
+    {
+        const char *e = getenv( "MADEIRA_DONOR_BROWSERS" );   /* 1: Chromium browsers (Social Club, Steam) take donor RAM like any program */
+        give = e && e[0] == '1';
+        dprintf( 2, "[swap] Chromium browsers' memory %s (MADEIRA_DONOR_BROWSERS)\n",
+                 give ? "takes donor RAM like any program's (MADEIRA_DONOR_BROWSERS=1)" : "goes to the swap file, never donor RAM" );
+    }
+    return !give && ios_avail_phys_chromium();
+}
+static uint64_t ios_donor_whole_max( void )
+{
+    static long long mb = -1;
+    if (mb < 0)
+    {
+        const char *e = getenv( "MADEIRA_DONOR_WHOLE_MAX_MB" );   /* MB above which a whole reservation is backed by the file, never donor RAM (default 0 = no limit) */
+        mb = e && *e ? strtoll( e, NULL, 10 ) : 0;
+        if (mb < 0) mb = 0;
+        if (mb) dprintf( 2, "[swap] a whole reservation above %lld MB is backed by the file only, never donor RAM (MADEIRA_DONOR_WHOLE_MAX_MB)\n", mb );
+    }
+    return mb ? (uint64_t)mb << 20 : ~0ull;
+}
+/* and a churny size (ml1258) that the filter keeps out of the file takes
+ * donor RAM while the pool has room for it, instead of the footprint: hot memory, off
+ * the jetsam limit, never written to flash. Where the pool has none, the block stays
+ * anonymous as before. Only where 64-bit ranges take donor RAM first (ios_swap_map's
+ * rule); MADEIRA_DONOR_CHURN=0 keeps churny sizes anonymous. */
+static int ios_swap_churn_to_donor( const void *base, size_t size )
+{
+    static int on = -1;
+    int x64;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_DONOR_CHURN" );   /* 0: churny sizes stay anonymous even while the donor pool has room */
+        on = !(e && e[0] == '0');
+        dprintf( 2, "[swap] churny sizes %s (MADEIRA_DONOR_CHURN)\n",
+                 on ? "take donor RAM while the pool has room for them" : "stay anonymous (MADEIRA_DONOR_CHURN=0)" );
+    }
+    if (!on || ios_donor_room() < size) return 0;
+    if (ios_wow_window_covering( base, (const char *)base + size )) return 0;   /* a 32-bit program's: exempt, the tier already takes it */
+    if (ios_swap_browser()) return 0;
+    x64 = ios_swap_x64_policy();
+    return x64 == 1 || (x64 == 0 && (ios_swap_x64_title || !ios_swap_wow_in_session()));
+}
 static int ios_swap_why( const void *base, size_t size, unsigned int vprot, struct file_view *view )
 {
     uintptr_t b = (uintptr_t)base;
@@ -22930,17 +23000,27 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
 {
     char *hs = (char *)(((uintptr_t)base + host_page_mask) & ~(uintptr_t)host_page_mask);
     char *he = (char *)(((uintptr_t)base + size) & ~(uintptr_t)host_page_mask);
-    size_t len, done; uint64_t off; void *p; int wow, donor_first, x64;
+    size_t len, done; uint64_t off; void *p; int wow, donor_first, x64, file_only;
     if (he <= hs) return IOS_SW_SMALL;
     if (ios_swap_n >= 16384) { if (ios_swap_v2) ios_swap_refused++; return IOS_SW_REFUSED; }
-    /* ml1257: in broad the cap is the disk the sparse file really occupies */
-    if (ios_swap_broad && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_refused++; return IOS_SW_REFUSED; }
     len = he - hs;
     ios_swap_map_first = ios_swap_n;
+    if (ios_swap_map_mode == 2)   /* a churny size, donor RAM or nothing (no file, so no disk cap) */
+    {
+        done = ios_swap_donor_pieces( hs, len, unix_prot, size );
+        if (!done) return IOS_SW_CHURN;
+        ios_swap_churn_donor += done;
+        len = done; off = ios_swap_ext[ios_swap_n - 1].off;   /* the rest stays anonymous */
+        goto mapped;
+    }
+    /* ml1257: in broad the cap is the disk the sparse file really occupies */
+    if (ios_swap_broad && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_refused++; return IOS_SW_REFUSED; }
     wow = ios_wow_window_covering( hs, he ) != 0;   /* ml2021: a 32-bit program's range */
     if (wow && ios_swap_wow64_policy() == 2) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }
     x64 = ios_swap_x64_policy();
     donor_first = wow || x64 == 1 || (x64 == 0 && (ios_swap_x64_title || !ios_swap_wow_in_session()));
+    file_only = !wow && (ios_swap_map_mode == 1 || ios_swap_browser());   /* a browser's, or an opt-in large whole reservation: the file only */
+    if (file_only) { donor_first = 0; ios_swap_whole_file += len; }
     if (donor_first)   /* ml1150: the donor pool first, while the guard allows; ml2021: in pieces */
     {
         done = ios_swap_donor_pieces( hs, len, unix_prot, size );
@@ -22957,7 +23037,7 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
     off = ios_swap_take( len );
     if (off == (uint64_t)-1)
     {
-        if (!donor_first && (done = ios_swap_donor_pieces( hs, len, unix_prot, size )) != 0)   /* ml2021: the pool behind the file */
+        if (!donor_first && !file_only && (done = ios_swap_donor_pieces( hs, len, unix_prot, size )) != 0)   /* ml2021: the pool behind the file */
         {
             off = ios_swap_ext[ios_swap_n - 1].off;
             if (done == len) goto mapped;
@@ -23144,11 +23224,12 @@ void ios_swap_stats_line( void )
     disk = ios_swap_disk_used();
     dprintf( 2, "[swap] ml1077 stats: %llu MB file-backed now (peak %llu), %u extents, file used %llu of %llu MB, backs %llu releases %llu unbacks %llu refused %llu"
              " | coverage %s: disk %llu MB of %llu cap, reservations %llu, holes %llu, disk-full refusals %llu"
-             " | ml1258 churn: %u sizes, %llu blocks left anonymous\n",
+             " | ml1258 churn: %u sizes, %llu blocks left anonymous"
+             " | %llu MB of churny blocks given donor RAM, %llu MB kept off it (browsers)\n",
              ios_swap_bytes >> 20, ios_swap_peak >> 20, ios_swap_n, (unsigned long long)(ios_swap_bump >> 20),
              (unsigned long long)(ios_swap_logical >> 20), ios_swap_backs, ios_swap_releases, ios_swap_unbacks, ios_swap_refused,
              ios_swap_mode, disk >> 20, (unsigned long long)(ios_swap_cap >> 20), ios_swap_resv_n, ios_swap_holes,
-             ios_swap_disk_refused, ios_swap_nchurny, ios_swap_churn_skips );
+             ios_swap_disk_refused, ios_swap_nchurny, ios_swap_churn_skips, ios_swap_churn_donor >> 20, ios_swap_whole_file >> 20 );
     if (ios_swap_img_backs || ios_swap_img_refused)   /* madeira-bcd swap-images */
         dprintf( 2, "[swap] swap-images: %llu MB of image sections in the file (peak %llu), %llu sections moved, %llu refused\n",
                  ios_swap_img_bytes >> 20, ios_swap_img_peak >> 20, ios_swap_img_backs, ios_swap_img_refused );
@@ -23250,6 +23331,12 @@ static void ios_swap_commit( void *base, size_t size, unsigned int vprot, struct
     if ((ios_swap_wide || ios_swap_broad) && ios_swap_n && ios_swap_overlaps( base, size )) { ios_swap_note( IOS_SW_PRESENT, size ); return; }
     why = ios_swap_why( base, size, vprot, view );
     if (why == IOS_SW_BACKED) why = ios_swap_map( base, size, get_unix_prot( vprot | VPROT_COMMITTED ) );   /* ml1082 */
+    else if (why == IOS_SW_CHURN && ios_swap_churn_to_donor( base, size ))   /* donor RAM, not the footprint */
+    {
+        ios_swap_map_mode = 2;
+        why = ios_swap_map( base, size, get_unix_prot( vprot | VPROT_COMMITTED ) );
+        ios_swap_map_mode = 0;
+    }
     ios_swap_note( why, size );
 }
 /* wide: a fresh WRITABLE reservation, mapped from the file PROT_NONE (what
@@ -23294,7 +23381,9 @@ static int ios_swap_whole_resv( struct file_view *view, unsigned int vprot )
     if (ios_swap_churny( view->size ) && !ios_swap_churn_exempt( b, view->size ))   /* ml1258; ml2021: not beside/inside a 32-bit program */
     { ios_swap_churn_skips++; ios_swap_skip_bytes[IOS_SWK_CHURN] += view->size; return 0; }
     ios_swap_map_tag = " (whole reservation, ml1257)";
+    if (view->size > ios_donor_whole_max()) ios_swap_map_mode = 1;   /* opt-in, the file only */
     why = ios_swap_map( view->base, view->size, get_unix_prot( vprot ) );
+    ios_swap_map_mode = 0;
     ios_swap_map_tag = "";
     if (why == IOS_SW_BACKED)
     {

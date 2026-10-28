@@ -35,7 +35,7 @@ check('ios_donor_reg[n].window = permanent ? (char *)window : NULL;' in add,
       'without them the region keeps no window (NULL)')
 check(add.count('VM_FLAGS_ANYWHERE') == 1, 'no other ANYWHERE mapping at registration')
 
-give = src[src.index('static void ios_donor_give( uint64_t off, size_t len )'):src.index('#else\nstatic uint64_t ios_donor_take_upto( size_t want, size_t *got )')]
+give = src[src.index('static void ios_donor_give( uint64_t off, size_t len )'):src.index('/* bytes of the pool not handed out')]
 check('if (ios_donor_reg[r].window) madvise( ios_donor_reg[r].window + off % ios_donor_region, len, MADV_ZERO );' in give,
       'a region with a window is zeroed through it, as before')
 check('mach_vm_map( mach_task_self(), &tmp, len, 0, VM_FLAGS_ANYWHERE, ios_donor_reg[r].entry, off % ios_donor_region, FALSE,' in give
@@ -66,7 +66,7 @@ check('madeira_cfg_int( "swap-wow64", 0 )' in pol and 'if (policy < 0 || policy 
 smap = src[src.index('static int ios_swap_map( void *base, size_t size, int unix_prot )'):src.index('static void ios_swap_release_range( void *base, size_t size, int copy_back )\n{')]
 check('wow = ios_wow_window_covering( hs, he ) != 0;' in smap, 'the map step asks whether the range lies in a WoW64 guest window')
 check('if (wow && ios_swap_wow64_policy() == 2) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }' in smap
-      and smap.index('ios_swap_wow64_policy() == 2') < smap.index('done = ios_swap_donor_pieces( hs, len, unix_prot, size );'),
+      and smap.index('ios_swap_wow64_policy() == 2') < smap.index('if (donor_first)   /* ml1150'),
       'policy 2 keeps the range in RAM before the donor attempt')
 check('if (wow && ios_swap_wow64_policy() != 1)   /* ml2021: the rest stays RAM, not the file */' in smap
       and smap.index('ios_swap_wow64_policy() != 1') > smap.index('done = ios_swap_donor_pieces( hs, len, unix_prot, size );')
@@ -126,8 +126,32 @@ check('if MadeiraConfig.flag("MADEIRA_DOCK_X64_TITLE"),' in cv
 check('static func largestProgramMachine(in folder: URL, machine: (URL) -> UInt16?, limit: Int = 400) -> UInt16? {' in dgs
       and 'guard name.lowercased().hasSuffix(".exe"), !isRedistributable(name) else { continue }' in dgs,
       'the largest program: the same two-level walk as the 32-bit check, redistributables left out')
-check('if (!donor_first && (done = ios_swap_donor_pieces( hs, len, unix_prot, size )) != 0)' in smap,
-      'with the file first, the pool is the fallback when the file refuses')
+check('if (!donor_first && !file_only && (done = ios_swap_donor_pieces( hs, len, unix_prot, size )) != 0)' in smap,
+      'with the file first, the pool is the fallback when the file refuses (not for a browser\'s range)')
+# Log 99: the whole 4 GB pool went to a Chromium helper's PartitionAlloc reservation, touched or not.
+check('file_only = !wow && (ios_swap_map_mode == 1 || ios_swap_browser());' in smap
+      and 'if (file_only) { donor_first = 0; ios_swap_whole_file += len; }' in smap,
+      'a Chromium browser\'s range (or an opt-in large whole reservation) is backed by the file only; a 32-bit program\'s keeps its rule')
+br = src[src.index('static int ios_swap_browser( void )\n{'):]
+br = br[:br.index('\n}\n')]
+check('getenv( "MADEIRA_DONOR_BROWSERS" )' in br and "give = e && e[0] == '1';" in br and 'return !give && ios_avail_phys_chromium();' in br,
+      'browsers are kept off the pool unless MADEIRA_DONOR_BROWSERS=1')
+check('if (view->size > ios_donor_whole_max()) ios_swap_map_mode = 1;' in src
+      and 'getenv( "MADEIRA_DONOR_WHOLE_MAX_MB" )' in src and ': 0;' in src[src.index('static uint64_t ios_donor_whole_max( void )'):][:600],
+      'MADEIRA_DONOR_WHOLE_MAX_MB: opt-in, off by default (a game\'s big heap is hot)')
+mode2 = smap[smap.index('if (ios_swap_map_mode == 2)'):smap.index('/* ml1257: in broad the cap is the disk')]
+check('done = ios_swap_donor_pieces( hs, len, unix_prot, size );' in mode2 and 'if (!done) return IOS_SW_CHURN;' in mode2,
+      'donor-only mapping: pool pieces or nothing, before the disk cap (no file involved)')
+c2d = src[src.index('static int ios_swap_churn_to_donor( const void *base, size_t size )'):]
+c2d = c2d[:c2d.index('\n}\n')]
+check('getenv( "MADEIRA_DONOR_CHURN" )' in c2d and 'if (!on || ios_donor_room() < size) return 0;' in c2d
+      and 'if (ios_wow_window_covering( base, (const char *)base + size )) return 0;' in c2d and 'if (ios_swap_browser()) return 0;' in c2d,
+      'a churny size takes donor RAM while the pool has room (MADEIRA_DONOR_CHURN=0: anonymous as before)')
+commit = src[src.index('static void ios_swap_commit( void *base, size_t size, unsigned int vprot, struct file_view *view )'):]
+commit = commit[:commit.index('\n}\n')]
+check('else if (why == IOS_SW_CHURN && ios_swap_churn_to_donor( base, size ))' in commit
+      and 'ios_swap_map_mode = 2;' in commit and 'ios_swap_map_mode = 0;' in commit,
+      'a churny commit tries donor RAM, and the mode is reset after the map')
 check(src.count('for (i = ios_swap_map_first; i < ios_swap_n; i++) ios_swap_ext[i].resv = 1;') == 2
       and 'ios_swap_map_first = ios_swap_n;' in smap,
       'a reservation marks every extent its map call created')
@@ -157,6 +181,8 @@ if catalog.exists():
     check('key: "swap-wow64"' in text, 'the config catalog documents swap-wow64')
     check('key: "vram-count-donor"' in text, 'the config catalog documents vram-count-donor')
     check('key: "env.MADEIRA_SWAP_TITLE_CHURN"' in text, 'the config catalog documents env.MADEIRA_SWAP_TITLE_CHURN')
+    for key in ('env.MADEIRA_DONOR_WHOLE_MAX_MB', 'env.MADEIRA_DONOR_CHURN', 'env.MADEIRA_DONOR_BROWSERS'):
+        check('key: "%s"' % key in text, 'the config catalog documents %s' % key)
 
 print(f'check-donor-pool: {"OK" if not failures else f"{failures} FAILED"}')
 sys.exit(1 if failures else 0)

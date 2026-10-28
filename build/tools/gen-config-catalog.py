@@ -785,6 +785,27 @@ OVERLAY = {
                         "MADEIRA_SWAP_CHURN_TIGHT_MB is left before the memory limit. 0: that memory goes to the "
                         "donor pool or the swap file like the rest (slower once the device is out of free RAM). "
                         "Read at session start."},
+    # browsers' memory stays off the donor pool (virtual_ios.c, log 99).
+    "env.MADEIRA_DONOR_BROWSERS": {"category": "Memory & JIT pool",
+                "title": "Browsers take donor RAM",
+                "kind": "bool", "default": "0",
+                "note": "Off by default: memory of the Chromium browsers next to a game (Social Club's "
+                        "SocialClubHelper.exe, Steam's steamwebhelper.exe) is backed by the swap file, never by the "
+                        "donor pool. The pool is handed out by reserved size whether the pages are used or not, and "
+                        "Social Club's 4 GB allocator reservation used to take all of it before the game asked. "
+                        "1: browsers take donor RAM like any program. Read at session start."},
+    "env.MADEIRA_DONOR_WHOLE_MAX_MB": {"category": "Memory & JIT pool",
+                "title": "Largest reservation given donor RAM (MB)",
+                "kind": "int", "default": "0",
+                "note": "0 (default): no limit. N: a reservation larger than N MB is backed by the swap file only, "
+                        "never by the donor pool (a test; a game's own big heap is usually hot and runs faster in "
+                        "donor RAM). Read at session start."},
+    "env.MADEIRA_DONOR_CHURN": {"category": "Memory & JIT pool",
+                "title": "Short-lived memory takes donor RAM",
+                "kind": "bool", "default": "1",
+                "note": "On by default: memory a game frees and allocates again soon takes donor RAM while the "
+                        "pool has room, instead of counting against the app's memory limit. 0: it stays in the "
+                        "app's own memory as before. Read at session start."},
     # madeira-bcd: the wineserver names an opened file with F_GETPATH (build/wineserver/fd_ios.c).
     "env.MADEIRA_SRV_FGETPATH": {"category": "Wine core (ntdll)", "title": "Name opened files with one call (server)",
                 "kind": "bool", "default": "0",
