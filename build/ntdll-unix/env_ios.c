@@ -28,6 +28,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <locale.h>
+#include <limits.h>
 #include <langinfo.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -1511,19 +1512,24 @@ static WCHAR *get_initial_directory(void)
         if (madeira_cwd && *madeira_cwd)
         {
             size_t len = strlen(madeira_cwd);
-            ret = malloc((len + 8) * sizeof(WCHAR));
-            /* Format: \??\<path>[\] */
-            ret[0] = '\\'; ret[1] = '?'; ret[2] = '?'; ret[3] = '\\';
-            for (size_t i = 0; i < len; i++) ret[4 + i] = madeira_cwd[i];
-            ret[4 + len] = 0;
-            /* ensure trailing backslash */
-            if (len && ret[4 + len - 1] != '\\')
+            unsigned int written;
+
+            /* The bridge supplies UTF-8, not bytes in the Windows code page.
+             * Leave room for the NT prefix, an optional separator and NUL. */
+            if (len <= UINT_MAX / sizeof(WCHAR) - 6 &&
+                (ret = malloc((len + 6) * sizeof(WCHAR))))
             {
-                ret[4 + len] = '\\';
-                ret[4 + len + 1] = 0;
+                if (!utf8_mbstowcs(ret + 4, len, &written, madeira_cwd, len))
+                {
+                    ret[0] = '\\'; ret[1] = '?'; ret[2] = '?'; ret[3] = '\\';
+                    if (written && ret[4 + written - 1] != '\\') ret[4 + written++] = '\\';
+                    ret[4 + written] = 0;
+                    os_log(OS_LOG_DEFAULT, "[Wine] get_initial_directory: MADEIRA_INITIAL_CWD override = %s", madeira_cwd);
+                    return ret;
+                }
+                free(ret);
+                ret = NULL;
             }
-            os_log(OS_LOG_DEFAULT, "[Wine] get_initial_directory: MADEIRA_INITIAL_CWD override = %s", madeira_cwd);
-            return ret;
         }
     }
 
