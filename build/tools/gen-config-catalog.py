@@ -466,8 +466,18 @@ OVERLAY = {
     "env.MADEIRA_MOUSE_ROUTING": {"title": "Mouse routing and pointer-lock fixes",
         "note": "Default on. 0 restores the previous desktop cursor routing, mouse button callbacks, surface-touch handling and key-window-only pointer lock. Keyboard input and manual Ctrl+Alt+P remain available. Fully restart Madeira after changing this switch."},
     "donor-pool-mb": {"category": "Memory & JIT pool", "title": "Donor pool size", "kind": "choice",
-                "note": "ml1150: RAM for the swap tier that is not counted against Madeira's limit, donated by the MadeiraMemoryHost extension (512 MB regions, created untouched, handed over, then the extension exits). Needs swap-mb. Taken before the swap file while free RAM stays above MADEIRA_DONOR_POOL_MARGIN_MB and iOS reports no memory pressure. Off by default; read at launch.",
+                "note": "ml1150: RAM for the swap tier that is not counted against Madeira's limit, donated by the MadeiraMemoryHost extension (512 MB regions, created untouched, handed over, then the extension exits). With swap-mb it is the swap tier's first stage, taken before the swap file; without swap-mb it is the only stage (ml2200 donor-only, madeira.cfg donor-only = 0 turns that off) and what it cannot cover stays normal app memory. Taken while free RAM stays above MADEIRA_DONOR_POOL_MARGIN_MB and iOS reports no memory pressure. Off by default; read at launch.",
                 "choices": [("", "Off"), ("2048", "2 GB"), ("4096", "4 GB"), ("6144", "6 GB")]},
+    "donor-only": {"category": "Memory & JIT pool", "title": "Donor pool without a swap file", "kind": "bool", "default": "1",
+                "note": "ml2200: on (the default), donor-pool-mb set and swap-mb unset start the swap tier with the donor pool as its only "
+                        "stage: no swap file is made, and memory the pool cannot cover stays normal app memory (iOS compresses it "
+                        "inside the app's limit). 0: without swap-mb the donor pool is not started, as before. Read at launch."},
+    "env.MADEIRA_WOW_AFFINITY32": {"category": "Exceptions & threads", "title": "32-bit thread group affinity", "kind": "bool", "default": "1",
+                "note": "ml2210: on (default): a 32-bit program's GROUP_AFFINITY thread attribute (12 bytes, a 32-bit mask) is decoded field by field when the thread is created; read as the 16-byte native struct, NtCreateThreadEx failed with c000000d and a 32-bit Chromium's thread pool threw. 0: read as before."},
+    "env.MADEIRA_STEAM_ALLOW_CRASHPAD": {"category": "Steam & Dock", "title": "Steam web helper: allow its crash reporter", "kind": "bool", "default": "0",
+                "note": "ml2210: 1 (the Steam Big Picture list) lets steamwebhelper.exe start exactly one kind of child, --type=crashpad-handler, with its command line unchanged; without it the 32-bit web helper ends itself at start (crash server failed to launch). Every other --type= child stays refused. Off (default): all are refused."},
+    "env.MADEIRA_BIG_PICTURE_PIN": {"category": "Steam & Dock", "title": "Big Picture: keep the installed 32-bit client", "kind": "bool", "default": "1",
+                "note": "ml2210: on (default): once Big Picture's folder holds the 32-bit client's web helper (bin/cef/cef.win7), steam.exe starts with -nobootstrapperupdate -skipinitialbootstrap, so it cannot move itself to the 64-bit client, whose CEF pools do not fit the address space. 0: Steam updates itself at every start, as before."},
     "donor-pool-kind": {"category": "Memory & JIT pool", "title": "Donor pool memory kind", "kind": "choice",
                 "note": "ml1152: how the extension creates each donated region. ledger (the default): a named memory entry tagged to the extension's ledger. purgeable: a purgeable allocation in the extension named by a memory entry (the way MeloNX donates RAM). Everything else in the tier is the same, so the two can be compared.",
                 "choices": [("", "Ledger-tagged entry (default)"), ("purgeable", "Purgeable allocation")]},
@@ -689,6 +699,12 @@ OVERLAY = {
                 "note": "On (default): when player 1's controller reconnects and GameController reports it as a new "
                         "controller before the old one leaves, it is moved from the slot it landed in back to slot 0. "
                         "0: it stays where it landed, as before."},
+    "env.MADEIRA_XINPUT_PROFILE_CHECK": {"category": "Controllers",
+                "title": "Re-read a controller's input profile", "kind": "bool", "default": "1",
+                "note": "ml2190: on (default): every 2 s the app checks each connected controller's extended-gamepad profile and, "
+                        "when GameController has replaced it (a remap or a mode change after the controller joined), reads the "
+                        "live one; the first 8 times the sticks leave rest the raw values are logged ([xinput] ml2190). 0: a "
+                        "slot keeps the profile its controller had when it joined, as before."},
     "env.MADEIRA_XINPUT_ENABLE_FOREGROUND": {"category": "Controllers",
                 "title": "Ignore a stale XInput disable while the game is in front", "kind": "bool", "default": "1",
                 "note": "On (default): when a game has switched XInput off (XInputEnable(FALSE), usually on losing "

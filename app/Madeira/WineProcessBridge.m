@@ -1646,6 +1646,21 @@ static void *wine_process_thread(void *arg) {
              * the mapping survives the screen locking. See virtual_ios.c ml1077. */
             {
                 long capMB = (long)madeira_cfg_int("swap-mb", 0);   /* ml1095: madeira.cfg swap-mb = N */
+                long onlyPoolMB = capMB >= 64 ? 0 : (long)madeira_cfg_int("donor-pool-mb", 0);
+                unsetenv("MADEIRA_SWAP_DONOR_ONLY");
+                if (onlyPoolMB >= 512 && madeira_cfg_int("donor-only", 1)) {   /* madeira.cfg donor-only = 0: donor-pool-mb without swap-mb does nothing, as before ml2200 */
+                    /* ml2200: donor RAM without the swap file. The tier maps only the pool
+                     * (virtual_ios.c ios_swap_init); no file is created. */
+                    unsetenv("MADEIRA_SWAP_FILE");
+                    unsetenv("MADEIRA_SWAP_MB");
+                    setenv("MADEIRA_SWAP_DONOR_ONLY", "1", 1);
+                    char poolKind[32] = "";
+                    madeira_cfg_get("donor-pool-kind", poolKind, sizeof poolKind);
+                    extern long MadeiraDonorPoolStart(long megabytes, int purgeable);
+                    long got = MadeiraDonorPoolStart(onlyPoolMB, strcmp(poolKind, "purgeable") == 0);
+                    LOG("ml2200 donor-only tier: %ld of %ld MB (%s), no swap file", got, onlyPoolMB, poolKind[0] ? poolKind : "ledger");
+                    fprintf(stderr, "[swap] ml2200 app: donor pool %ld of %ld MB without a swap file (swap-mb unset)\n", got, onlyPoolMB);
+                }
                 if (capMB >= 64) {
                     NSString *swapPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"madeira-swap.bin"];
                     [[NSFileManager defaultManager] removeItemAtPath:swapPath error:nil];

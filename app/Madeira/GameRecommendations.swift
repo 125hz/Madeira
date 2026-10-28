@@ -314,8 +314,11 @@ enum GameRecommendations {
     /// `gta5EnhancedSmallRAMLines`. Version 8 also set semaphores on fastsync's cells and
     /// lean diagnostics; with them the game's loading stalled at its first screen and the
     /// launcher sometimes never came up (logs 104-106), so version 9 has version 7's lines.
+    /// Version 10 (log 107, an iPhone 17): the FPS limit is 30, not 40. The menus held 40
+    /// at 2-2.9 W, and after ~330 J of the process's CPU energy iOS clamped the cores to
+    /// 1.31 / 1.70 GHz for the rest of the session, before gameplay started (13-25 FPS).
     static let gta5EnhancedSteam = GameRecommendation(
-        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 9,
+        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 10,
         config: """
         # Madeira's recommended settings for GTA V Enhanced (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -361,7 +364,7 @@ enum GameRecommendations {
         env.MADEIRA_WAIT_CHILDREN = 1
         env.MADEIRA_JIT_DUMP = 0
         """,
-        avx: false, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: true, fpsMode: 4,
+        avx: false, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: true, fpsMode: 3,
         display: "fit", smallRAMConfig: gta5EnhancedSmallRAMLines)
 
     /// GTA V Enhanced on a device with less than 12 GB of RAM (log 97: limit 6136 MB,
@@ -545,31 +548,52 @@ enum GameRecommendations {
     /// Version 5: shared argument-ring chunks and, under 12 GB of RAM, the earlier
     /// video-budget trim, as for the Steam copy. Version 6: that trim later, as for
     /// the Steam copy's version 7. Version 8: the memory guard, as for the Steam copy's
-    /// version 9 (version 7 also had lean diagnostics).
+    /// version 9 (version 7 also had lean diagnostics). Version 9 (2026-10-28, for an
+    /// Epic copy): the Steam copy's version 10 without its Steam and Dock lines: the swap
+    /// file, the pool and image lines, pipeline warm-up, BattlEye off for PlayGTAV.exe,
+    /// the error handler and vc_redist blocked, a 30 FPS limit and the semaphore fast
+    /// path switch. MADEIRA_FASTSYNC_SEM is gone (with it the Steam copy's loading
+    /// stalled at its first screen, logs 104-106).
     static let gta5EnhancedOther = GameRecommendation(
-        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 8,
+        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 9,
         config: """
         # Madeira's recommended settings for GTA V Enhanced outside Steam (Rockstar Games Launcher or another store).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
-        vram-mb = 4096
-        d3d12-core-dll = 1
-        d3d12-typed-uav-load = 1
-        d3d12-tiled-resources = 1
-        d3d12-tile-based = 0
         d3d12-caps-log = 2
+        d3d12-core-dll = 1
         d3d12-msaa8 = 1
+        d3d12-tile-based = 0
+        d3d12-tiled-resources = 1
+        d3d12-typed-uav-load = 1
+        pool-low = 1
+        pool-page-fit = 1
         pool-split = 1
+        vram-mb = 4096
+        swap-mb = 3072
+        pso-warm = 2
         pso-async = 1
         pso-archive = 1
         ring-share = 1
+        env.FEX_VECTORTSOENABLED = 0
+        env.MADEIRA_CHILD_ARGS = PlayGTAV.exe -nobattleye
+        env.MADEIRA_EXECREQ_LEAVE = 1
         env.MADEIRA_KMT_ADAPTER = 1
         env.MADEIRA_LOCK_ORPHAN = stamped
-        env.MADEIRA_PAD_MODE = hid
-        env.SteamDeck = 1
+        env.MADEIRA_PIN_GRAPHICS_DLLS = 1
+        env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+        env.MADEIRA_POOL_LOW_IMAGES = 1
+        env.MADEIRA_POOL_RECYCLE_IMAGES = 1
         env.MADEIRA_SC_PA_POOLS = 2
-        env.MADEIRA_FASTSYNC_SEM = 1
-        env.FEX_VECTORTSOENABLED = 0
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
+        env.MADEIRA_TOUCH_MOUSE = 1
+        env.MADEIRA_WOW_MIN_FREE_GB = 2
+        env.MADEIRA_X64_GRAPHICS_ENTRY = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.WINEDLLOVERRIDES = video64=
         env.MADEIRA_DEVICE_STATS = 1
+        env.MADEIRA_PAD_MODE = hid
+        env.MADEIRA_METAL_HUD_MAIN = 1
+        env.SteamDeck = 1
         env.MADEIRA_EC_HOOK_TRACE = 0
         # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
@@ -577,8 +601,8 @@ enum GameRecommendations {
         env.MADEIRA_WAIT_CHILDREN = 1
         env.MADEIRA_JIT_DUMP = 0
         """,
-        avx: false, nvidia: true, wineVCRT: false, fastSync: true, resolution: "1280x720", display: "fit",
-        smallRAMConfig: gta5EnhancedSmallRAMLines)
+        avx: false, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: true, fpsMode: 3,
+        resolution: "1280x720", display: "fit", smallRAMConfig: gta5EnhancedSmallRAMLines)
 
     /// Ghost of Tsushima (build 336: DualSense input, rumble, triggers and light work).
     /// Build 492 adds Horizon Zero Dawn's proven fix for typed buffer views that
@@ -1117,8 +1141,12 @@ enum GameRecommendations {
     /// each; the second was refused for the default 8 GB of spare address space
     /// (`refused: map too small`), so the margin is the launcher chain's 2 GB and the
     /// session holds every window slot from the start.
+    /// Version 3: the 32-bit web helper's crash reporter may start
+    /// (MADEIRA_STEAM_ALLOW_CRASHPAD; without it the helper ends itself at start), and
+    /// Social Club's shared PartitionAlloc pool layout (MADEIRA_SC_PA_POOLS) is gone:
+    /// its soft address grants can overlap the client's own views.
     static let steamBigPicture = GameRecommendation(
-        id: "steam-big-picture", title: "Steam Big Picture", version: 2,
+        id: "steam-big-picture", title: "Steam Big Picture", version: 3,
         config: """
         # Madeira's recommended settings for Steam Big Picture.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -1129,13 +1157,13 @@ enum GameRecommendations {
         pool-low = 1
         pool-page-fit = 1
         pool-split = 1
-        env.MADEIRA_SC_PA_POOLS = 2
         env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
         env.MADEIRA_POOL_LOW_IMAGES = 1
         env.MADEIRA_POOL_RECYCLE_IMAGES = 1
         env.MADEIRA_X64_IMAGE_NOCOPY = 1
         env.MADEIRA_LOCK_ORPHAN = stamped
         env.MADEIRA_GDI_SHARED_SECTION = 1
+        env.MADEIRA_STEAM_ALLOW_CRASHPAD = 1
         env.MADEIRA_TOUCH_MOUSE = 1
         env.MADEIRA_WOW_MIN_FREE_GB = 2
         env.MADEIRA_WOW_PLACEHOLDERS = 1

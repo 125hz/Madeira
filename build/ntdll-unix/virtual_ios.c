@@ -22566,13 +22566,29 @@ static void ios_swap_config( void )
         ios_swap_resv_max = ios_swap_env_size( "MADEIRA_SWAP_RESERVE_MAX_MB", 256u << 20, 20, 1u << 20, (size_t)1 << 32 );
 }
 
+static int ios_swap_donor_only;   /* ml2200: the tier maps the donor pool only, no file */
 static void ios_swap_init( void )
 {
     static int done;
-    const char *f, *mb;
+    const char *f, *mb, *d;
     if (done) return;
     done = 1;
     f = getenv( "MADEIRA_SWAP_FILE" ); mb = getenv( "MADEIRA_SWAP_MB" );
+    if ((!f || !*f || !mb) && (d = getenv( "MADEIRA_SWAP_DONOR_ONLY" )) && d[0] == '1')
+    {
+        /* ml2200: donor-only (the app sets it for donor-pool-mb without swap-mb). No file:
+         * the cap and the offset space stay 0, so every file take is refused and the tier
+         * maps donated RAM and nothing else; what the pool cannot cover stays anonymous.
+         * /dev/null stands in for the file so the tier's "on" checks hold; nothing is
+         * ever mapped from it or written to it. */
+        ios_swap_fd = open( "/dev/null", O_RDWR | O_CLOEXEC );
+        if (ios_swap_fd < 0) { dprintf( 2, "[swap] ml2200 cannot open /dev/null (errno %d): tier OFF\n", errno ); return; }
+        ios_swap_donor_only = 1;
+        ios_swap_config();
+        ios_swap_cap = ios_swap_logical = 0;
+        dprintf( 2, "[swap] ml2200 donor-only tier ON: the donor pool backs guest memory, no swap file (madeira.cfg donor-only = 0 turns it off)\n" );
+        return;
+    }
     if (!f || !*f || !mb) return;
     ios_swap_cap = (uint64_t)strtoull( mb, NULL, 10 ) << 20;
     if (ios_swap_cap < (64ull << 20)) return;
@@ -23427,7 +23443,7 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
         goto mapped;
     }
     /* ml1257: in broad the cap is the disk the sparse file really occupies */
-    if (ios_swap_broad && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_refused++; return IOS_SW_REFUSED; }
+    if (ios_swap_broad && !ios_swap_donor_only && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_refused++; return IOS_SW_REFUSED; }
     wow = ios_wow_window_covering( hs, he ) != 0;   /* ml2021: a 32-bit program's range */
     if (wow && ios_swap_wow64_policy() == 2) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }
     x64 = ios_swap_x64_policy();

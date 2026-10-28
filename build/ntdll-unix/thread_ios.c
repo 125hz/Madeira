@@ -1863,6 +1863,30 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
  *
  * Update the output attributes.
  */
+/* ml2210: wow64's PS_ATTRIBUTE_GROUP_AFFINITY thunk widens the pointer but keeps the
+ * 32-bit caller's 12-byte GROUP_AFFINITY (a 32-bit mask). Read as the 16-byte native
+ * struct, the group and reserved words were the next fields' bytes, NtCreateThreadEx
+ * failed with c000000d and a 32-bit Chromium's thread pool threw. Each field is
+ * decoded; the usual validation still applies. env.MADEIRA_WOW_AFFINITY32=0: as before. */
+static int ios_wow_affinity32( const PS_ATTRIBUTE *attribute, GROUP_AFFINITY *out )
+{
+    static int on = -1;
+    unsigned int mask;
+    unsigned short tail[4];
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_WOW_AFFINITY32" );
+        on = !(e && e[0] == '0');
+    }
+    if (!on || attribute->Size != 12 || !attribute->ValuePtr) return 0;
+    memcpy( &mask, attribute->ValuePtr, 4 );
+    memcpy( tail, (const char *)attribute->ValuePtr + 4, 8 );
+    out->Mask = mask;
+    out->Group = tail[0];
+    memcpy( out->Reserved, tail + 1, 6 );
+    return 1;
+}
+
 static NTSTATUS update_attr_list( PS_ATTRIBUTE_LIST *attr, HANDLE thread, const CLIENT_ID *id, TEB *teb )
 {
     SIZE_T i, count = (attr->TotalLength - sizeof(attr->TotalLength)) / sizeof(PS_ATTRIBUTE);
@@ -1884,7 +1908,8 @@ static NTSTATUS update_attr_list( PS_ATTRIBUTE_LIST *attr, HANDLE thread, const 
         }
         else if (attr->Attributes[i].Attribute == PS_ATTRIBUTE_GROUP_AFFINITY)
         {
-            GROUP_AFFINITY *aff = attr->Attributes[i].ValuePtr;
+            GROUP_AFFINITY *aff = attr->Attributes[i].ValuePtr, converted;
+            if (get_wow_teb( teb ) && ios_wow_affinity32( &attr->Attributes[i], &converted )) aff = &converted;
             status = NtSetInformationThread( thread, ThreadGroupInformation, aff, sizeof(*aff) );
             if (status) break;
         }

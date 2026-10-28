@@ -1449,6 +1449,25 @@ static int sc_switch_end( const WCHAR *cl, int cl_len, const char *sw )
     return last;
 }
 
+/* ml2210: with env.MADEIRA_STEAM_ALLOW_CRASHPAD=1 (the Big Picture list), a web helper
+ * command line whose one --type= switch is exactly crashpad-handler may start. */
+static int ios_webhelper_crashpad_allowed( const WCHAR *cl, int len )
+{
+    static const char prefix[] = "--type=", type[] = "crashpad-handler";
+    const char *e = getenv( "MADEIRA_STEAM_ALLOW_CRASHPAD" );
+    int found = 0, value = -1, k, j;
+    if (!e || strcmp( e, "1" ) || !cl) return 0;
+    for (k = 0; k + 7 <= len; k++)
+    {
+        if (k && cl[k - 1] != ' ' && cl[k - 1] != '\t' && cl[k - 1] != '"') continue;
+        for (j = 0; j < 7; j++) if (cl[k + j] != (WCHAR)prefix[j]) break;
+        if (j == 7) { found++; value = k + 7; }
+    }
+    if (found != 1 || value + (int)sizeof(type) - 1 > len) return 0;
+    for (j = 0; type[j]; j++) if (cl[value + j] != (WCHAR)type[j]) return 0;
+    return value + j == len || cl[value + j] == ' ' || cl[value + j] == '\t' || cl[value + j] == '"';
+}
+
 /* What kind of Social Club process `image` with command line `cl` is. */
 static int sc_helper_kind( const WCHAR *image, int image_len, const WCHAR *cl, int cl_len )
 {
@@ -2041,6 +2060,16 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                 if (c != (WCHAR)helper[j]) break;
             }
             if (j == hl) is_helper = 1;
+        }
+        if (is_helper && ios_webhelper_crashpad_allowed( params->CommandLine.Buffer,
+                                                         params->CommandLine.Length / sizeof(WCHAR) ))
+        {
+            /* ml2210: a 32-bit web helper (cef.win7) ends itself at start when its crash
+             * reporter cannot launch ("crash server failed to launch, self-terminating").
+             * The handler is a small process in a guest window of its own and never holds
+             * the browser's pools. Only exactly --type=crashpad-handler, command line unchanged. */
+            dprintf(2, "[proc-gate] ml2210 allowing steamwebhelper --type=crashpad-handler (env.MADEIRA_STEAM_ALLOW_CRASHPAD=1)\n");
+            is_helper = 0;
         }
         if (is_helper)
         {

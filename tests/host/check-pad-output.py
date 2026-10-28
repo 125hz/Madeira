@@ -341,6 +341,12 @@ need('last handle closed' in hidpad and 'hidpad_output_log' in hidpad,
      'hidpad_ios.c must log [hidpad-out] and reset rumble/triggers when the game lets go')
 need('case 2:' in driver and 'winios_gamepad_set_vibration( index, motors[0], motors[1] )' in driver,
      'driver_ios.c must store XInput vibration (op 2)')
+# ml2190: a slot re-reads its controller's live extendedGamepad profile (env.MADEIRA_XINPUT_PROFILE_CHECK).
+check_src = swift
+assert 'static let profileCheck: Bool = flag("MADEIRA_XINPUT_PROFILE_CHECK")' in check_src
+assert 'if Self.profileCheck, let i = controllers.firstIndex(where: { $0 === controller }) {' in check_src
+assert 'if profiles[i] !== profile {' in check_src and 'attach(profile, slot: i)' in check_src
+assert 'Timer.scheduledTimer(withTimeInterval: 2, repeats: true)' in check_src
 print('PASS: DualSense output decoder (USB v1/v2 rumble, triggers-only, LEDs, power, Bluetooth 0x31 + CRC), '
       'trigger effects -> GameController modes (Nielk1 encodings), levels and player LEDs, notify transport, '
       'PadOutput/Xcode/bridging/GamepadInput/driver wiring')

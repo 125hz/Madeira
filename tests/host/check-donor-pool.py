@@ -174,12 +174,27 @@ if wm_path.exists():
 else:
     print('SKIP: dxmt submodule not checked out here')
 
+# ml2200: donor-pool-mb without swap-mb maps the donor pool alone, no swap file (madeira.cfg donor-only = 0: off).
+wpb = (ROOT / 'app/Madeira/WineProcessBridge.m').read_text(encoding='utf-8', errors='replace')
+check('long onlyPoolMB = capMB >= 64 ? 0 : (long)madeira_cfg_int("donor-pool-mb", 0);' in wpb
+      and 'if (onlyPoolMB >= 512 && madeira_cfg_int("donor-only", 1)) {' in wpb
+      and 'setenv("MADEIRA_SWAP_DONOR_ONLY", "1", 1);' in wpb,
+      'the app starts the donor pool without swap-mb and asks ntdll for the donor-only tier')
+init = src[src.index('static void ios_swap_init( void )\n{'):]
+init = init[:init.index('\n}\n') + 3]
+check('(d = getenv( "MADEIRA_SWAP_DONOR_ONLY" )) && d[0] == \'1\'' in init
+      and 'ios_swap_cap = ios_swap_logical = 0;' in init and 'ios_swap_donor_only = 1;' in init,
+      'the donor-only tier has no file space: every file take is refused, only donated RAM is mapped')
+check('if (ios_swap_broad && !ios_swap_donor_only && ios_swap_disk_used() >= ios_swap_cap)' in src,
+      'the broad disk-cap check does not refuse the donor-first path in donor-only mode')
+
 catalog = ROOT / 'app/Madeira/ConfigCatalog.generated.swift'
 if catalog.exists():
     text = catalog.read_text(encoding='utf-8')
     check('key: "env.MADEIRA_DONOR_WINDOWS"' in text, 'the config catalog documents env.MADEIRA_DONOR_WINDOWS')
     check('key: "swap-wow64"' in text, 'the config catalog documents swap-wow64')
     check('key: "vram-count-donor"' in text, 'the config catalog documents vram-count-donor')
+    check('key: "donor-only"' in text, 'the config catalog documents donor-only')
     check('key: "env.MADEIRA_SWAP_TITLE_CHURN"' in text, 'the config catalog documents env.MADEIRA_SWAP_TITLE_CHURN')
     for key in ('env.MADEIRA_DONOR_WHOLE_MAX_MB', 'env.MADEIRA_DONOR_CHURN', 'env.MADEIRA_DONOR_BROWSERS'):
         check('key: "%s"' % key in text, 'the config catalog documents %s' % key)

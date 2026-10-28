@@ -242,9 +242,18 @@ final class GamepadInput: @unchecked Sendable {
     /// ml2172: player 1 back to slot 0 after a reconnect GameController reported
     /// as a new controller before the old one left (see refreshControllers).
     static let slot0Reconnect: Bool = flag("MADEIRA_XINPUT_SLOT0_RECONNECT")  // 0: a reconnected player 1 stays in the slot it landed in (slot 0 left empty)
+    /// ml2190: every 2 s (and on each refresh) a controller whose extendedGamepad is no
+    /// longer the profile its slot reads gets the live one; the old object can keep
+    /// reporting buttons with its axes frozen at rest (device log 107: buttons and
+    /// triggers reached the game, the sticks never left zero).
+    static let profileCheck: Bool = flag("MADEIRA_XINPUT_PROFILE_CHECK")  // 0: a slot keeps the profile its controller had when it joined
+    /// ml2190: the first 8 times each slot's sticks leave rest, with GameController's raw values.
+    private static var stickDiagLeft = [8, 8, 8, 8]
+    private static var stickDiagLive = [false, false, false, false]
     private var touchState = TouchGamepadState()
     @MainActor private var observers: [NSObjectProtocol] = []
     @MainActor private var started = false
+    @MainActor private var profileTimer: Timer?
 
     @MainActor func start() {
         guard !started else { return }
@@ -270,6 +279,22 @@ final class GamepadInput: @unchecked Sendable {
         })
         refreshControllers()
         setActive(UIApplication.shared.applicationState == .active)
+        if Self.profileCheck {
+            profileTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshControllers() }
+            }
+        }
+    }
+
+    /// Slot i reads `profile`; its changes sample at once (queue-owned).
+    private func attach(_ profile: GCExtendedGamepad, slot i: Int) {
+        profiles[i]?.valueChangedHandler = nil
+        profiles[i] = profile
+        profile.valueChangedHandler = { [weak self] _, _ in
+            // Explicit queue hop also serializes callbacks already in flight
+            // when a controller is disconnected or the app resigns active.
+            self?.queue.async { [weak self] in self?.sample() }
+        }
     }
 
     @MainActor private func refreshControllers() {
@@ -297,20 +322,22 @@ final class GamepadInput: @unchecked Sendable {
                 fputs("[xinput] ml1920 slot=\(i) disconnected\n", stderr)
             }
             for (controller, profile) in live {
+                if Self.profileCheck, let i = controllers.firstIndex(where: { $0 === controller }) {
+                    if profiles[i] !== profile {
+                        attach(profile, slot: i)
+                        LogStore.shared.log("[xinput] ml2190 slot=\(i) controller has a new input profile: the slot reads the live one")
+                    }
+                    continue
+                }
                 guard !controllers.contains(where: { $0 === controller }),
                       let i = controllers.firstIndex(where: { $0 == nil }) else { continue }
                 controllers[i] = controller
-                profiles[i] = profile
                 joinedAt[i] = now
                 // A pad joining a slot starts still, before sample() publishes it,
                 // rather than replaying the level the slot had before.
                 winios_gamepad_set_vibration(Int32(i), 0, 0)
                 batteryNextRead[i] = 0   // ml2170: the new pad's battery at the next sample
-                profile.valueChangedHandler = { [weak self] _, _ in
-                    // Explicit queue hop also serializes callbacks already in flight
-                    // when a controller is disconnected or the app resigns active.
-                    self?.queue.async { [weak self] in self?.sample() }
-                }
+                attach(profile, slot: i)
                 fputs("[xinput] ml1920 slot=\(i) connected\n", stderr)
             }
             // ml2172: GameController can report a reconnecting pad as a new
@@ -424,6 +451,17 @@ final class GamepadInput: @unchecked Sendable {
                 state.ly = Self.axis(pad.leftThumbstick.yAxis.value)
                 state.rx = Self.axis(pad.rightThumbstick.xAxis.value)
                 state.ry = Self.axis(pad.rightThumbstick.yAxis.value)
+                if Self.stickDiagLeft[i] > 0 {
+                    let moved = abs(Int(state.lx)) > 7849 || abs(Int(state.ly)) > 7849
+                        || abs(Int(state.rx)) > 8689 || abs(Int(state.ry)) > 8689
+                    if moved != Self.stickDiagLive[i] {
+                        Self.stickDiagLive[i] = moved
+                        if moved {
+                            Self.stickDiagLeft[i] -= 1
+                            LogStore.shared.log("[xinput] ml2190 app slot=\(i) sticks: left \(pad.leftThumbstick.xAxis.value),\(pad.leftThumbstick.yAxis.value) right \(pad.rightThumbstick.xAxis.value),\(pad.rightThumbstick.yAxis.value)")
+                        }
+                    }
+                }
                 // The library front end navigates with player 1's pad (Library.swift).
                 // While it owns input (no session, or its menu is open) the game
                 // sees a connected pad at rest.

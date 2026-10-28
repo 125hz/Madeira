@@ -115,6 +115,14 @@ assert 'static var bigPictureEntry: LibraryEntry' in library and 'relativePath: 
     and 'entry.bigPicture = true' in library and 'entry.launchMode = "desktop"' in library, 'the library offers the Big Picture entry (desktop-mode batch)'
 assert 'if bigPicture == true { Self.writeBigPictureBatch() }' in library and '-bigpicture -no-cef-sandbox -cef-disable-gpu' in library, \
     'the batch (services.exe, then steam.exe -bigpicture) is written at every launch'
+# ml2210 (version 3): the 32-bit web helper's crash reporter may start, no Social Club pool layout, and an
+# installed 32-bit client is kept (no bootstrap update) unless env.MADEIRA_BIG_PICTURE_PIN = 0.
+bp = presets['steam-big-picture']
+assert bp['version'] == 3 and 'env.MADEIRA_STEAM_ALLOW_CRASHPAD = 1' in bp['lines'] \
+    and not any(l.startswith('env.MADEIRA_SC_PA_POOLS') for l in bp['lines']), bp
+assert 'MadeiraConfig.flag("MADEIRA_BIG_PICTURE_PIN", fallback: true)' in library \
+    and 'fm.fileExists(atPath: "\\(folder.unix)/bin/cef/cef.win7/steamwebhelper.exe")' in library \
+    and '(pinned ? " -nobootstrapperupdate -skipinitialbootstrap" : "")' in library
 assert 'if LibraryEntry.bigPictureShown, LibraryEntry.steamClientInstalled {' in library and 'Label("Big Picture", systemImage: "gamecontroller")' in library, \
     'with env.MADEIRA_BIG_PICTURE = 1, the Big Picture button sits beside the Desktop button once steam.exe is installed'
 assert 'MadeiraConfig.flag("MADEIRA_BIG_PICTURE", fallback: false)' in library \
@@ -258,8 +266,19 @@ assert 'if size != GameRecommendation.screen720 { entry.resolution = size }\n   
 gta = presets['gta5e-steam']
 assert 'env.MADEIRA_CHILD_ARGS = PlayGTAV.exe -nobattleye' in gta['lines']
 assert 'env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;GTA5_Enhanced.exe' in gta['lines']
-assert 'semaphoreFastPath: true, fpsMode: 4' in gta['switches'] and 'nvidia: true' in gta['switches']
-assert 'env.MADEIRA_FASTSYNC_SEM = 1' in presets['gta5e-other']['lines']
+# Version 10 (log 107): 30 FPS, the menus at 40 spent the power budget before iOS clamped the cores.
+assert 'semaphoreFastPath: true, fpsMode: 3' in gta['switches'] and 'nvidia: true' in gta['switches']
+# Outside Steam version 9 (an Epic copy): the Steam list's lines without its Dock lines, plus SteamDeck and the
+# [ec-hook] reporter off, and its switches with the copy's 1280x720; no fastsync semaphore cells.
+gta_other = presets['gta5e-other']
+dock_lines = {'env.MADEIRA_DOCK_GAME_SCM = 1', 'env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;GTA5_Enhanced.exe'}
+def settings(lines):
+    return {l for l in lines if not l.startswith('#')}
+assert settings(gta_other['lines']) == (settings(gta['lines']) - dock_lines) | {'env.SteamDeck = 1', 'env.MADEIRA_EC_HOOK_TRACE = 0'}, \
+    sorted(settings(gta_other['lines']) ^ settings(gta['lines']))
+assert 'env.MADEIRA_FASTSYNC_SEM = 1' not in gta_other['lines']
+assert gta_other['switches'] == gta['switches'].replace('display: "fit"', 'resolution: "1280x720", display: "fit"'), \
+    gta_other['switches']
 # Version 2 of both GTA lists (2026-10-12): the orphan-lock reaper's stamped mode, as RDR2 and
 # Horizon Zero Dawn have. The default mode released a busy SocialClubHelper.exe lock at Story Mode.
 for ident in ('gta5e-steam', 'gta5e-other', 'rdr2-steam', 'rdr2-other', 'horizon-zero-dawn'):
@@ -271,7 +290,7 @@ for ident in ('gta5e-steam', 'gta5e-other', 'rdr2-steam', 'rdr2-other', 'horizon
 # chunks, and under 12 GB of RAM the video budget's trim starts 3584 MB below the limit.
 # Versions 9 / 8 (logs 103-106): the small-device memory guard; version 8 / 7's semaphore cells and lean
 # diagnostics are gone again (the game's loading stalled with them).
-assert presets['gta5e-steam']['version'] == 9 and presets['gta5e-other']['version'] == 8, \
+assert presets['gta5e-steam']['version'] == 10 and presets['gta5e-other']['version'] == 9, \
     (presets['gta5e-steam']['version'], presets['gta5e-other']['version'])
 for ident in ('gta5e-steam', 'gta5e-other'):
     assert 'pso-async = 1' in presets[ident]['lines'], ident
