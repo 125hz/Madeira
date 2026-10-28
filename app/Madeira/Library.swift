@@ -5255,7 +5255,7 @@ enum OverlayStyle {
     static let layouts: [(id: String, name: String)] = [("grid", "Grid"), ("row", "One row"), ("column", "Column")]
     static let backgrounds: [(id: String, name: String)] = [("glass", "Glass"), ("dark", "Dark"), ("clear", "None")]
     /// The figures the overlay can show, in the order of the menu's switches.
-    static let fields = ["FPS", "Frame time", "1% lows", "Frame graph", "CPU", "GPU", "RAM", "Swap & donor", "Battery", "Thermal"]
+    static let fields = ["FPS", "Frame time", "1% lows", "0.1% lows", "Frame graph", "CPU", "GPU", "RAM", "Swap & donor", "Battery", "Thermal"]
 }
 
 /// Frame times from the present path (madeira_frame_times_us, Winios.m) and the
@@ -5275,6 +5275,22 @@ enum FrameTimes {
         let slow = sorted.suffix(k).reduce(0, +) / Double(k), fast = sorted.prefix(k).reduce(0, +) / Double(k)
         guard slow > 0, fast > 0 else { return nil }
         return (1000 / slow, 1000 / fast)
+    }
+    /// The 0.1% low in frames a second: the slowest 0.1% of frames (at least the
+    /// slowest one), nil without enough frames.
+    static func pointOnePercentLow(_ ms: [Double]) -> Double? {
+        guard ms.count >= 10 else { return nil }
+        let k = max(1, ms.count / 1000), slow = ms.sorted().suffix(k).reduce(0, +) / Double(k)
+        return slow > 0 ? 1000 / slow : nil
+    }
+    /// The frame time to show: the mean of the frames presented in the last
+    /// `windowMs`, or the time since the last present when that is longer (a stall
+    /// still going on). nil when nothing has presented.
+    static func current(windowMs: UInt32) -> Double? {
+        let (ms, since) = read(windowMs: windowMs, max: 512)
+        let mean = ms.isEmpty ? 0 : ms.reduce(0, +) / Double(ms.count)
+        let value = max(mean, since > mean ? since : 0)
+        return value > 0 ? value : nil
     }
 }
 
@@ -5359,6 +5375,9 @@ struct LibraryMetrics: View {
     @State private var tick = 0
     @State private var fps = 0.0
     @State private var onePercent: (low: Double, high: Double)?
+    @State private var pointOneLow: Double?
+    /// Measured from the present path, like the graph (1000 / FPS hid the slow frames).
+    @State private var frameMs: Double?
     @State private var memory = 0
     @State private var battery = -1
     /// iOS lowers clocks from .serious on, so a frame rate that sags after a few
@@ -5403,12 +5422,16 @@ struct LibraryMetrics: View {
             result.append(Cell(id: "fps", label: "FPS", value: String(format: "%.0f", fps), width: 44, tint: speed(fps)))
         }
         if model.overlayFields.contains("Frame time") {
-            result.append(Cell(id: "ms", label: "MS", value: fps > 0 ? String(format: "%.1f", 1000 / fps) : "–", width: 52))
+            result.append(Cell(id: "ms", label: "MS", value: frameMs.map { String(format: $0 >= 100 ? "%.0f" : "%.1f", $0) } ?? "–", width: 52))
         }
         if model.overlayFields.contains("1% lows") {
             result.append(Cell(id: "low", label: "1% LOW", value: onePercent.map { String(format: "%.0f", $0.low) } ?? "–", width: 52,
                                tint: onePercent.flatMap { speed($0.low) }))
             result.append(Cell(id: "high", label: "1% HIGH", value: onePercent.map { String(format: "%.0f", $0.high) } ?? "–", width: 54))
+        }
+        if model.overlayFields.contains("0.1% lows") {
+            result.append(Cell(id: "low01", label: "0.1% LOW", value: pointOneLow.map { String(format: "%.0f", $0) } ?? "–", width: 60,
+                               tint: pointOneLow.flatMap { speed($0) }))
         }
         if model.overlayFields.contains("CPU") {
             result.append(Cell(id: "cpu", label: "CPU", value: cpu.map { String(format: "%.0f%%", $0.total) } ?? "–", width: 50))
@@ -5541,6 +5564,9 @@ struct LibraryMetrics: View {
                 fps = Double(frames) / max(0.001, dt); lastCount = count; lastTime = now
                 // Over the last ten seconds, so a stall stays in the figure for a while.
                 if model.overlayFields.contains("1% lows") { onePercent = FrameTimes.onePercent(FrameTimes.read(windowMs: 10_000).intervals) }
+                // 0.1% needs more frames: thirty seconds (the ring holds 2048).
+                if model.overlayFields.contains("0.1% lows") { pointOneLow = FrameTimes.pointOnePercentLow(FrameTimes.read(windowMs: 30_000).intervals) }
+                if model.overlayFields.contains("Frame time") { frameMs = FrameTimes.current(windowMs: UInt32(max(0.5, refresh) * 1000)) }
                 var info = task_vm_info_data_t(); var size = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
                 let result = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(size)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &size) } }
                 if result == KERN_SUCCESS { memory = Int(info.phys_footprint / 1048576) }
@@ -5573,10 +5599,11 @@ struct LibraryMetrics: View {
     private var parts: [String] {
         var result: [String] = []
         if model.overlayFields.contains("FPS") { result.append(String(format: "%.0f FPS", fps)) }
-        if model.overlayFields.contains("Frame time") { result.append(fps > 0 ? String(format: "%.1f ms avg", 1000 / fps) : "— ms") }
+        if model.overlayFields.contains("Frame time") { result.append(frameMs.map { String(format: "%.1f ms", $0) } ?? "— ms") }
         if model.overlayFields.contains("1% lows") {
             result.append(onePercent.map { String(format: "1%% low %.0f, 1%% high %.0f FPS", $0.low, $0.high) } ?? "1% lows —")
         }
+        if model.overlayFields.contains("0.1% lows") { result.append(pointOneLow.map { String(format: "0.1%% low %.0f FPS", $0) } ?? "0.1% low —") }
         if model.overlayFields.contains("CPU") {
             result.append(cpu.map { String(format: "CPU %.0f%% (top %.0f%%)", $0.total, $0.top) } ?? "CPU —")
         }

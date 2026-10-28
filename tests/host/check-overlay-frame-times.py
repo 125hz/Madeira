@@ -73,7 +73,7 @@ else:
     print('SKIP: dxmt submodule not checked out here')
 
 # --- the overlay ----------------------------------------------------------------------
-check('static let fields = ["FPS", "Frame time", "1% lows", "Frame graph", "CPU", "GPU", "RAM", "Swap & donor", "Battery", "Thermal"]' in lib
+check('static let fields = ["FPS", "Frame time", "1% lows", "0.1% lows", "Frame graph", "CPU", "GPU", "RAM", "Swap & donor", "Battery", "Thermal"]' in lib
       and 'ForEach(OverlayStyle.fields, id: \\.self) { field in' in lib,
       'the menu offers 1% lows and the frame graph among the overlay\'s figures')
 one = lib[lib.index('static func onePercent(_ ms: [Double]) -> (low: Double, high: Double)? {'):lib.index('struct FrameTimeGraph: View {')]
@@ -82,6 +82,13 @@ check('let sorted = ms.sorted(), k = max(1, sorted.count / 100)' in one
       '1% low: the mean of the slowest 1% of frame times as a frame rate; 1% high: the fastest 1%')
 check('FrameTimes.onePercent(FrameTimes.read(windowMs: 10_000).intervals)' in lib,
       'the 1% figures cover the last ten seconds')
+# The MS cell showed 1000 / FPS, which disagreed with the graph (owner, Discord 2026-10-28).
+check('frameMs = FrameTimes.current(windowMs: UInt32(max(0.5, refresh) * 1000))' in lib
+      and 'let value = max(mean, since > mean ? since : 0)' in lib and '1000 / fps' not in lib,
+      'the frame time is the measured mean (or the stall still going on), not 1000 / FPS')
+check('pointOneLow = FrameTimes.pointOnePercentLow(FrameTimes.read(windowMs: 30_000).intervals)' in lib
+      and 'let k = max(1, ms.count / 1000)' in lib,
+      'the 0.1% low covers thirty seconds')
 graph = lib[lib.index('struct FrameTimeGraph: View {'):lib.index('struct LibraryMetrics: View {')]
 check('TimelineView(.periodic(from: .now, by: 0.1))' in graph and 'let pending = since > max(50, median * 2) ? since : 0' in graph,
       'the graph redraws ten times a second and grows a late frame at its right edge')
