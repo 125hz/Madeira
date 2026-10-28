@@ -84,6 +84,54 @@ with tempfile.TemporaryDirectory(prefix='madeira-app-link-') as folder:
     else:
         print('SKIP protection export probe: this PR has no caller')
 
+    message = (root / 'build/win32u-unix/message_ios.c').read_text()
+    if 'NTSTATUS server_send_hardware_message(' in message:
+        env_source = (root / 'build/ntdll-unix/env_ios.c').read_text()
+        heads = ['PEB * WINAPI RtlGetCurrentPeb(void)',
+                 'HANDLE WINAPI PsGetCurrentProcessId(void)',
+                 'HANDLE WINAPI PsGetCurrentThreadId(void)']
+        assert all(head in env_source for head in heads), 'Wine 11 guest-state exports are required'
+        assert '"$OBJ_DIR/alpc.o"' in (root / 'build/ntdll-unix/build.sh').read_text()
+        driver = (root / 'build/win32u-unix/driver_ios.c').read_text()
+        assert not re.search(r'(?<![a-z_])send_hardware_message\s*\(', driver)
+        assert 'server_send_hardware_message(' in driver
+        run_probe('guest-exports.c', '''
+    #include <assert.h>
+    #include <pthread.h>
+    #include <stdint.h>
+    #define WINAPI
+    typedef void *HANDLE;
+    typedef struct { int value; } PEB;
+    typedef struct { PEB *Peb; struct { HANDLE UniqueProcess, UniqueThread; } ClientId; } TEB;
+    static _Thread_local TEB *active_teb;
+    static TEB *NtCurrentTeb(void) { return active_teb; }
+    ''' + '\n'.join(function(env_source, head) for head in heads) + '''
+    static void *check_guest(void *arg)
+    {
+        uintptr_t id = (uintptr_t)arg;
+        PEB peb = {0};
+        TEB first = { &peb, { (void *)(id * 10), (void *)(id * 10 + 1) } };
+        TEB second = { &peb, { (void *)(id * 100), (void *)(id * 100 + 1) } };
+        for (int i = 0; i < 10000; ++i)
+        {
+            active_teb = i & 1 ? &first : &second;
+            assert(RtlGetCurrentPeb() == active_teb->Peb);
+            assert(PsGetCurrentProcessId() == active_teb->ClientId.UniqueProcess);
+            assert(PsGetCurrentThreadId() == active_teb->ClientId.UniqueThread);
+        }
+        return 0;
+    }
+    int main(void)
+    {
+        pthread_t first, second;
+        assert(!pthread_create(&first, 0, check_guest, (void *)1));
+        assert(!pthread_create(&second, 0, check_guest, (void *)2));
+        assert(!pthread_join(first, 0));
+        assert(!pthread_join(second, 0));
+    }
+    ''')
+        print('PASS Wine 11 exports follow guest TEB changes across threads; ALPC/input build inputs are present')
+
     if 'static NSString *madeira_vulkan_library(' in bridge:
         vulkan = '''
     #import <Foundation/Foundation.h>
