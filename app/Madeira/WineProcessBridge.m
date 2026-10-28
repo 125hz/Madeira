@@ -359,12 +359,26 @@ volatile int g_madeira_srv_log_all = 0;      /* env.MADEIRA_SRV_LOG_ALL = 1 */
  * logging. g_launch_exit holds (1 << 32) | status when the program ended with
  * an NTSTATUS error (0xC...), else 0. */
 static uint64_t g_launch_exit = 0;
+/* A game in a Madeira Dock session asked Steam to start another game
+ * (steam://run/<App ID>); ntdll's process gate (build/ntdll-unix/process_ios.c)
+ * refuses steam.exe and reports the App ID here. 0: none since the last reset. */
+static uint32_t g_steam_run_app = 0;
+void wine_steam_run_requested(unsigned int appid) {
+    __atomic_store_n(&g_steam_run_app, appid, __ATOMIC_RELEASE);
+}
+int wine_steam_run_request(uint32_t *appid) {
+    uint32_t value = __atomic_load_n(&g_steam_run_app, __ATOMIC_ACQUIRE);
+    if (!value) return 0;
+    if (appid) *appid = value;
+    return 1;
+}
 void wine_launched_process_did_exit(int status) {
     if ((uint32_t)status >= 0xC0000000u)
         __atomic_store_n(&g_launch_exit, (UINT64_C(1) << 32) | (uint32_t)status, __ATOMIC_RELEASE);
 }
 void wine_exit_status_reset(void) {
     __atomic_store_n(&g_launch_exit, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_steam_run_app, 0, __ATOMIC_RELEASE);
 }
 int wine_crash_exit_status(uint32_t *status) {
     uint64_t value = __atomic_load_n(&g_launch_exit, __ATOMIC_ACQUIRE);

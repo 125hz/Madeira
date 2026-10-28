@@ -47,6 +47,13 @@ OVERLAY = {
                 "kind": "int", "default": "10",
                 "note": "Default 10 ms between pasted characters. Range 5-100 ms; use a longer interval for games "
                         "that miss fast text input. Enforced at delivery as well as queueing. Restart the session after changing it."},
+    "env.MADEIRA_DOCK_STEAM_RUN": {"category": "Steam & Dock", "kind": "bool", "default": "1",
+                "note": "On by default: when a game in a Madeira Dock session asks Steam to start another game "
+                        "(steam.exe with steam://run/<App ID>, as Black Ops II's campaign does for Zombies), "
+                        "steam.exe is not started and Madeira starts that game when it is next opened. 0 lets "
+                        "steam.exe start as before (the full Steam client, which updates itself and stops at a "
+                        "black window in a Dock session).",
+                "sources": ["build/ntdll-unix/process_ios.c"]},
     # The iOS audio driver (build/ntdll-unix/audio_null_ios.c): the two a player may need.
     "env.MADEIRA_AUDIO_LEAD_MS": {"category": "Audio", "title": "Sound buffer",
                 "kind": "choice", "default": "",
