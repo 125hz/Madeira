@@ -310,12 +310,12 @@ enum GameRecommendations {
     /// fell below what the game used (2.6 GB at the end), so on a device with less
     /// than 12 GB of RAM its trim starts earlier (`gta5EnhancedSmallRAMLines`).
     /// Version 7 (log 98): that trim started too early; see `gta5EnhancedSmallRAMLines`.
-    /// Version 8 (log 103, an 8 GB phone): semaphores on fastsync's cells in a Dock
-    /// session too (~14,000 server requests a second were semaphore waits and releases),
-    /// and lean diagnostics: the thread samplers suspended every thread several times
-    /// every 20 s while the CPU was already clamped to 1.31 GHz.
+    /// Version 9 (logs 103-106, an 8 GB phone): the memory guard in
+    /// `gta5EnhancedSmallRAMLines`. Version 8 also set semaphores on fastsync's cells and
+    /// lean diagnostics; with them the game's loading stalled at its first screen and the
+    /// launcher sometimes never came up (logs 104-106), so version 9 has version 7's lines.
     static let gta5EnhancedSteam = GameRecommendation(
-        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 8,
+        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 9,
         config: """
         # Madeira's recommended settings for GTA V Enhanced (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -355,8 +355,6 @@ enum GameRecommendations {
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_PAD_MODE = hid
         env.MADEIRA_METAL_HUD_MAIN = 1
-        env.MADEIRA_FASTSYNC_SEM = 1
-        env.MADEIRA_LEAN_DIAG = 1
         # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
@@ -546,10 +544,10 @@ enum GameRecommendations {
     /// for the Steam copy. Version 4: the pipeline archive, as for the Steam copy.
     /// Version 5: shared argument-ring chunks and, under 12 GB of RAM, the earlier
     /// video-budget trim, as for the Steam copy. Version 6: that trim later, as for
-    /// the Steam copy's version 7. Version 7: lean diagnostics, as for the Steam copy's
-    /// version 8.
+    /// the Steam copy's version 7. Version 8: the memory guard, as for the Steam copy's
+    /// version 9 (version 7 also had lean diagnostics).
     static let gta5EnhancedOther = GameRecommendation(
-        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 7,
+        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 8,
         config: """
         # Madeira's recommended settings for GTA V Enhanced outside Steam (Rockstar Games Launcher or another store).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -573,7 +571,6 @@ enum GameRecommendations {
         env.FEX_VECTORTSOENABLED = 0
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_EC_HOOK_TRACE = 0
-        env.MADEIRA_LEAN_DIAG = 1
         # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2

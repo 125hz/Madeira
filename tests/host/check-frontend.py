@@ -112,7 +112,6 @@ enum ControlAction: Codable, Equatable, Hashable { case none }   // LibraryEntry
 enum GamepadInput { static let keyboardMouseAvailable = true }   // LibraryEntry's per-game DirectInput choice
 struct GestureZone: Codable, Identifiable, Equatable { var id = UUID() }   // LibraryEntry.zones (GestureZones.swift)
 enum LibraryError: LocalizedError { case message(String) }
-enum DockGameSession { static var fastsyncInMadsyncsPlace = false }   // set by the Dock launch (DockGameSession.swift)
 func env(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
 '''
 swift += block(lib, 'enum LaunchArgumentText {') + '\n'
@@ -202,11 +201,6 @@ expect(env("MADEIRA_FASTSYNC") == "0" && env("MADEIRA_FASTSYNC_SEM") == "1", "Fa
 MadeiraConfig.values = ["inproc-sync": "1", "env.MADEIRA_FASTSYNC": "auto"]
 unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM"); game.applyEnvironment()
 expect(env("MADEIRA_FASTSYNC") == nil && env("MADEIRA_FASTSYNC_SEM") == nil, "Madsync on: the game's fastsync switches are not exported")
-DockGameSession.fastsyncInMadsyncsPlace = true; game.applyEnvironment()
-expect(env("MADEIRA_FASTSYNC") == "0" && env("MADEIRA_FASTSYNC_SEM") == "1" && !DockGameSession.fastsyncInMadsyncsPlace,
-       "a Dock session running fastsync in madsync's place: the game's own switches are exported, once")
-unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM"); game.applyEnvironment()
-expect(env("MADEIRA_FASTSYNC") == nil && env("MADEIRA_FASTSYNC_SEM") == nil, "the next launch under madsync exports none")
 MadeiraConfig.values = [:]; game.fastSync = nil; game.semaphoreFastPath = nil
 game.reducedX87 = true; game.applyEnvironment()
 expect(env("FEX_X87REDUCEDPRECISION") == "1", "reduced x87 exported when chosen")
