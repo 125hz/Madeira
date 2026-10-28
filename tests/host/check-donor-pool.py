@@ -97,9 +97,27 @@ check('ios_donor_take(' not in src.replace('ios_donor_take_upto(', ''), 'the who
 pieces = src[src.index('static size_t ios_swap_donor_pieces( char *hs, size_t len, int unix_prot, size_t key )'):src.index('static int ios_swap_map( void *base, size_t size, int unix_prot )')]
 check('while (done < len && ios_swap_n < 16384)' in pieces and 'ios_swap_record( hs + done, got, off | IOS_DONOR_FLAG, key );' in pieces,
       'the map step takes pool pieces until the range is covered or the pool has none, one extent each')
-check("donor_first = wow || x64 == 1 || (x64 == 0 && !ios_swap_wow_in_session());" in smap
+check("donor_first = wow || x64 == 1 || (x64 == 0 && (ios_swap_x64_title || !ios_swap_wow_in_session()));" in smap
       and 'madeira_cfg_int( "swap-x64", 0 )' in src,
       'a 64-bit range goes to the file first while a 32-bit program is in the session (swap-x64 unset), the pool otherwise')
+# Log 94 (2026-10-28): a 32-bit helper in a 64-bit title's folder put the title's heap on the file all session.
+policy = src[src.index('static int ios_swap_x64_policy( void )\n{'):src.index('static unsigned ios_swap_map_first;')]
+check("ios_swap_x64_title = policy == 0 && title && title[0] == '1';" in policy
+      and 'getenv( "MADEIRA_SWAP_X64_TITLE" )' in policy,
+      'MADEIRA_SWAP_X64_TITLE=1 (a 64-bit title beside 32-bit helpers): donor RAM first under swap-x64 unset only')
+idle = src[src.index('static int ios_swap_x64_idle( uintptr_t b, size_t size )'):src.index('static int ios_swap_wow64_policy( void );')]
+check('if (keep || ios_swap_x64_title || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;' in idle
+      and 'ios_swap_x64_policy();' in idle,
+      'such a title is not an idle launcher chain: it keeps the churn filter')
+cv = (ROOT / 'app/Madeira/ContentView.swift').read_text()
+dgs = (ROOT / 'app/Madeira/DockGameSession.swift').read_text()
+check('if MadeiraConfig.flag("MADEIRA_DOCK_X64_TITLE"),' in cv
+      and 'DockGameSession.largestProgramMachine(in: gameFolder, machine: DockInstallers.machine) == 0x8664 {' in cv
+      and 'setenv("MADEIRA_SWAP_X64_TITLE", "1", 1)' in cv and 'unsetenv("MADEIRA_SWAP_X64_TITLE")' in cv,
+      'a Dock start exports it when the game folder\'s largest program is 64-bit (env.MADEIRA_DOCK_X64_TITLE = 0: never)')
+check('static func largestProgramMachine(in folder: URL, machine: (URL) -> UInt16?, limit: Int = 400) -> UInt16? {' in dgs
+      and 'guard name.lowercased().hasSuffix(".exe"), !isRedistributable(name) else { continue }' in dgs,
+      'the largest program: the same two-level walk as the 32-bit check, redistributables left out')
 check('if (!donor_first && (done = ios_swap_donor_pieces( hs, len, unix_prot, size )) != 0)' in smap,
       'with the file first, the pool is the fallback when the file refuses')
 check(src.count('for (i = ios_swap_map_first; i < ios_swap_n; i++) ios_swap_ext[i].resv = 1;') == 2

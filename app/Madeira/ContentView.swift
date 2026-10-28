@@ -3501,6 +3501,16 @@ struct ContentView: View {
             } else {
                 unsetenv("MADEIRA_WOW_HOLD_WINDOWS")
             }
+            // A 64-bit title beside its 32-bit helpers: its memory takes donor RAM first even while
+            // a 32-bit program is in the session (virtual_ios.c ios_swap_x64_policy, swap-x64 unset).
+            // env.MADEIRA_DOCK_X64_TITLE = 0 leaves the swap file first, as before 2026-10-28.
+            if MadeiraConfig.flag("MADEIRA_DOCK_X64_TITLE"),   // 0: a 32-bit helper in the game's folder keeps the 64-bit title's memory on the swap file first
+               DockGameSession.largestProgramMachine(in: gameFolder, machine: DockInstallers.machine) == 0x8664 {
+                setenv("MADEIRA_SWAP_X64_TITLE", "1", 1)
+                logStore.log("[dock-wow] the game's largest program is 64-bit: its memory takes donor RAM first, then the swap file (MADEIRA_SWAP_X64_TITLE=1; env.MADEIRA_DOCK_X64_TITLE = 0 keeps the file first)")
+            } else {
+                unsetenv("MADEIRA_SWAP_X64_TITLE")
+            }
             // Only a start that runs installers, or one that starts the service manager, turns
             // madsync off, for its own session (build/madsync/madsync.c reads
             // MADEIRA_MADSYNC_SESSION once, when the server starts).

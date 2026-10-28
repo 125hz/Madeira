@@ -242,6 +242,40 @@ enum DockGameSession {
         return false
     }
 
+    /// The PE machine of the largest program in the game's folder, by the same walk as
+    /// has32BitProgram (redistributables and installers left out), nil without one. As a rule
+    /// that is the title itself; the 32-bit programs beside a 64-bit one are helpers (a crash
+    /// reporter, a launcher's stub, a COM surrogate it starts). Log 94 (2026-10-28): such a
+    /// helper put the 64-bit title's memory on the swap file for the whole session (swap-x64
+    /// unset: the file first while a 32-bit program is in the session), and the title stalled
+    /// on its page-ins; with donor RAM first (log 86, swap-x64 = 1) it ran 27% faster.
+    static func largestProgramMachine(in folder: URL, machine: (URL) -> UInt16?, limit: Int = 400) -> UInt16? {
+        let fm = FileManager.default
+        var queue: [(URL, Int)] = [(folder, 0)]
+        var seen = 0
+        var largest: (size: Int, url: URL)?
+        while let (dir, depth) = queue.first {
+            queue.removeFirst()
+            guard let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+                                                          options: [.skipsHiddenFiles]) else { continue }
+            for item in items {
+                seen += 1
+                if seen > limit { break }
+                let name = item.lastPathComponent
+                let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+                if values?.isDirectory ?? false {
+                    if depth < 1, !isRedistributable(name) { queue.append((item, depth + 1)) }
+                    continue
+                }
+                guard name.lowercased().hasSuffix(".exe"), !isRedistributable(name) else { continue }
+                let size = values?.fileSize ?? 0
+                if size > (largest?.size ?? -1) { largest = (size, item) }
+            }
+            if seen > limit { break }
+        }
+        return largest.flatMap { machine($0.url) }
+    }
+
     /// Whether this session runs under server sync instead of madsync because it starts the
     /// service manager. `MADEIRA_DOCK_GAME_SCM_SERVER_SYNC=0` keeps madsync.
     static func serverSyncOff(_ decision: Decision, madsyncConfigured: Bool) -> Bool {

@@ -22736,7 +22736,10 @@ static int ios_swap_wow_in_session( void );
  * anonymous that way: the kernel then compressed the resident ones INTO the
  * footprint (compressed 2.8 GB of the 6 GB limit) instead of evicting them from
  * the file. Such a range skips the filter and goes to the file like any other
- * (MADEIRA_SWAP_X64_CHURN=1 keeps the filter for it). */
+ * (MADEIRA_SWAP_X64_CHURN=1 keeps the filter for it). A 64-bit title beside 32-bit
+ * helpers (MADEIRA_SWAP_X64_TITLE, below) is not idle and keeps the filter. */
+static int ios_swap_x64_title;
+static int ios_swap_x64_policy( void );
 static int ios_swap_x64_idle( uintptr_t b, size_t size )
 {
     static int keep = -1;
@@ -22745,7 +22748,8 @@ static int ios_swap_x64_idle( uintptr_t b, size_t size )
         const char *e = getenv( "MADEIRA_SWAP_X64_CHURN" );   /* 1: the churn filter also covers 64-bit ranges beside a 32-bit program */
         keep = e && e[0] == '1';
     }
-    if (keep || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;
+    ios_swap_x64_policy();   /* sets ios_swap_x64_title */
+    if (keep || ios_swap_x64_title || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;
     return ios_wow_window_covering( (const void *)b, (const void *)(b + size) ) == 0;
 }
 static int ios_swap_wow64_policy( void );
@@ -22814,16 +22818,28 @@ static int ios_swap_wow_in_session( void )
  * swap file while a 32-bit program is in the session (its idle pages are then the
  * kernel's to evict, and the pool stays for the 32-bit program), the donor pool
  * otherwise; 1: the donor pool first, always (pre-ml2021); 2: the file first, always.
- * The other stage is the fallback either way. Read once under virtual_mutex. */
+ * The other stage is the fallback either way. Read once under virtual_mutex.
+ *
+ * (log 94, 2026-10-28): under 0, a Dock start whose game folder's largest
+ * program is 64-bit (the title; its 32-bit programs are helpers) exports
+ * MADEIRA_SWAP_X64_TITLE=1, and the donor pool comes first for 64-bit ranges while a
+ * 32-bit program is in the session too. The title's heap had gone to the file for the
+ * whole session because of a 32-bit helper, and its threads stalled on the page-ins
+ * (frames arrived only as the reads landed; 12 of 45 five-second samples under 10 FPS);
+ * log 86, donor RAM first, ran 27% faster on average. The app's
+ * env.MADEIRA_DOCK_X64_TITLE = 0 exports nothing. */
 static int ios_swap_x64_policy( void )
 {
     static int policy = -1;
     if (policy < 0)
     {
+        const char *title = getenv( "MADEIRA_SWAP_X64_TITLE" );   /* 1 (the app): the session's title is 64-bit, its 32-bit programs helpers; donor RAM first beside them */
         policy = (int)madeira_cfg_int( "swap-x64", 0 );   /* 0: file first while a 32-bit program is in the session; 1: donor pool first; 2: file first */
         if (policy < 0 || policy > 2) policy = 0;
+        ios_swap_x64_title = policy == 0 && title && title[0] == '1';
         dprintf( 2, "[swap] ml2021 64-bit programs: %s (madeira.cfg swap-x64 = %d)\n",
                  policy == 1 ? "donor RAM first, then the swap file" : policy == 2 ? "the swap file first, then donor RAM"
+                 : ios_swap_x64_title ? "donor RAM first, then the swap file: the title is 64-bit, its 32-bit programs helpers (MADEIRA_SWAP_X64_TITLE=1)"
                  : "the swap file first while a 32-bit program is in the session, donor RAM first otherwise", policy );
     }
     return policy;
@@ -22877,7 +22893,7 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
     wow = ios_wow_window_covering( hs, he ) != 0;   /* ml2021: a 32-bit program's range */
     if (wow && ios_swap_wow64_policy() == 2) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }
     x64 = ios_swap_x64_policy();
-    donor_first = wow || x64 == 1 || (x64 == 0 && !ios_swap_wow_in_session());
+    donor_first = wow || x64 == 1 || (x64 == 0 && (ios_swap_x64_title || !ios_swap_wow_in_session()));
     if (donor_first)   /* ml1150: the donor pool first, while the guard allows; ml2021: in pieces */
     {
         done = ios_swap_donor_pieces( hs, len, unix_prot, size );
