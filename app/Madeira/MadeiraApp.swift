@@ -17,6 +17,9 @@ struct MadeiraApp: App {
         // ml1172: read the screen on the main thread; library entries, whose
         // default Resolution comes from it, are also made on other threads.
         _ = ResolutionChoices.screen
+        // A sign-in an installer left goes into the Keychain before anything else runs
+        // (SigningRefresh.swift).
+        SigningAccountStore.takeIn()
         // Use one profile before Wine or Steam Cloud reads the prefix.
         ProfileUnification.run()
         // Read the cached library before the first grid page is built.
