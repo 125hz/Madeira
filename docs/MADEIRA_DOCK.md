@@ -43,7 +43,9 @@ them.
   - `app/Madeira/arm64ec-windows/dock-notices.txt` (Dock's licence, the
     exception, the GPL text and the LLVM/MinGW-w64 runtime notices).
 
-  Both are build outputs and are gitignored. `--check` also runs Dock's own
+  Both are build outputs and are gitignored; `tools/build-ipa.sh` (and so the CI
+  IPA) runs the script, since without `dockhost.exe` the app hides Dock and the
+  Steam library. `--check` also runs Dock's own
   unit tests. Without a built `dockhost.exe`, Madeira shows no Dock button.
 
 ## Using it
