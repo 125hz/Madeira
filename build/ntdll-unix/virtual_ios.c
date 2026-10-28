@@ -10666,6 +10666,17 @@ static ULONG_PTR ios_wow_window_covering( const void *start, const void *end )
     return 0;
 }
 
+static int ios_wow_area_by_request(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_WOW_AREA_BY_REQUEST" );
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 /* map_reserved_area_inner: may a request with these limits take space in the
  * reserved area [start, end)? Not when the area is a window or placeholder and
  * the request is not constrained to the caller's own window. */
@@ -10676,6 +10687,18 @@ static int ios_wow_reserved_area_open( const void *start, const void *end, const
     if (!ios_wow_window_keep_enabled()) return 1;
     if (!ios_wow_window_count && !ios_wow_placeholder_count) return 1;
     if (!(wb = ios_wow_window_covering( start, end ))) return 1;
+    /* ml2220: adjacent windows' reserved areas merge (a slot carved from the holdback
+     * at 0x7200000000 joins slot 0's area below it), and the first window found in the
+     * merged area was slot 0's: a process in slot 1 was refused its own window, every
+     * allocation fell to a free-area map over the window's PROT_NONE reservation
+     * (errno 17) and the second 32-bit process of a session failed its TEB
+     * (device logs 108-110). The window that holds the request decides.
+     * env.MADEIRA_WOW_AREA_BY_REQUEST=0: the first window in the area, as before. */
+    if (ios_wow_area_by_request() && hi > lo)
+    {
+        ULONG_PTR own = ios_wow_window_covering( (void *)lo, (void *)(lo + 1) );
+        if (own && own < (ULONG_PTR)end && own + IOS_WOW_WINDOW_SIZE > (ULONG_PTR)start) wb = own;
+    }
     /* A request confined to this window is the window's own: ios_wow_translate_limits
      * puts a 32-bit process's bounds inside its window, and nothing else asks with
      * such bounds. map_view passes its end exclusive (limit_high + 1), which is the

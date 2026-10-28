@@ -472,6 +472,8 @@ OVERLAY = {
                 "note": "ml2200: on (the default), donor-pool-mb set and swap-mb unset start the swap tier with the donor pool as its only "
                         "stage: no swap file is made, and memory the pool cannot cover stays normal app memory (iOS compresses it "
                         "inside the app's limit). 0: without swap-mb the donor pool is not started, as before. Read at launch."},
+    "env.MADEIRA_WOW_AREA_BY_REQUEST": {"category": "Memory & JIT pool", "title": "32-bit windows: judge a merged area by the request", "kind": "bool", "default": "1",
+                "note": "ml2220: on (default): when two adjacent guest windows' reserved areas have merged into one (a slot carved from the holdback beside slot 0), a 32-bit process's allocation is judged by the window that holds its request. Before, the first window in the merged area decided, the second process was refused its own window and failed to create its TEB (every second concurrent 32-bit process of a session). 0: as before."},
     "env.MADEIRA_WOW_AFFINITY32": {"category": "Exceptions & threads", "title": "32-bit thread group affinity", "kind": "bool", "default": "1",
                 "note": "ml2210: on (default): a 32-bit program's GROUP_AFFINITY thread attribute (12 bytes, a 32-bit mask) is decoded field by field when the thread is created; read as the 16-byte native struct, NtCreateThreadEx failed with c000000d and a 32-bit Chromium's thread pool threw. 0: read as before."},
     "env.MADEIRA_STEAM_ALLOW_CRASHPAD": {"category": "Steam & Dock", "title": "Steam web helper: allow its crash reporter", "kind": "bool", "default": "0",

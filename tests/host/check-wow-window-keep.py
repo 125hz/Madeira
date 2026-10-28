@@ -49,6 +49,14 @@ check('return lo >= wb && hi > lo && hi <= wb + IOS_WOW_WINDOW_SIZE + ios_wow_gu
       and 'ios_wow_limits_in_window(' not in op,
       "a reserved area that is a window is open only to a request confined to that window (containment, "
       "not the strict limits test: map_view's end is exclusive and the boot PEB asks for the whole window)")
+# ml2220 (device logs 108-110): adjacent windows' reserved areas merge, so the window holding the request
+# decides, not the first window in the area (env.MADEIRA_WOW_AREA_BY_REQUEST=0 reverts).
+check('ULONG_PTR own = ios_wow_window_covering( (void *)lo, (void *)(lo + 1) );' in op
+      and 'if (own && own < (ULONG_PTR)end && own + IOS_WOW_WINDOW_SIZE > (ULONG_PTR)start) wb = own;' in op
+      and 'if (ios_wow_area_by_request() && hi > lo)' in op,
+      'a merged reserved area is judged by the window that holds the request')
+check('getenv( "MADEIRA_WOW_AREA_BY_REQUEST" )' in body('static int ios_wow_area_by_request('),
+      'env.MADEIRA_WOW_AREA_BY_REQUEST=0 judges by the first window in the area, as before')
 inner = src[src.index('static void *map_reserved_area_inner('):src.index('static NTSTATUS map_fixed_area(')]
 check(inner.count('if (!ios_wow_reserved_area_open( start, end, limit_low, limit_high )) continue;') == 2,
       'both scan directions of map_reserved_area_inner skip a window that is not the caller\'s')
@@ -91,7 +99,7 @@ check("(uintptr_t)base + size > (uintptr_t)image_base + ROUND_SIZE( image_base, 
 catalog = ROOT / 'app/Madeira/ConfigCatalog.generated.swift'
 if catalog.exists():
     text = catalog.read_text(encoding='utf-8')
-    for key in ('MADEIRA_WOW_WINDOW_KEEP', 'MADEIRA_WOW_GUARD_INSIDE', 'MADEIRA_JUMBO_ALIGNED'):
+    for key in ('MADEIRA_WOW_WINDOW_KEEP', 'MADEIRA_WOW_GUARD_INSIDE', 'MADEIRA_JUMBO_ALIGNED', 'MADEIRA_WOW_AREA_BY_REQUEST'):
         check(f'key: "env.{key}"' in text, f'the config catalog documents env.{key}')
 
 print(f'check-wow-window-keep: {"OK" if not failures else f"{failures} FAILED"}')
