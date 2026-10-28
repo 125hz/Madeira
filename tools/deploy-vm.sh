@@ -11,6 +11,13 @@
 #   ./tools/deploy-vm.sh                 # deploy the current build
 #   ./tools/deploy-vm.sh <marker>        # also assert the marker is present
 set -uo pipefail
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    echo "Usage: $0 [marker]"
+    echo "  Deploy updated build payload directly into VM bundle."
+    echo "  VM_HOST overrides default IP (default: 192.168.64.10)."
+    exit 0
+fi
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="$HOME/Library/Developer/Xcode/DerivedData/Madeira-fytoydazgayvqxgeytwxbzkogigx/Build/Products/Debug-iphoneos/Madeira.app"
 # The VM takes a fresh DHCP lease across host restarts, so this default is a

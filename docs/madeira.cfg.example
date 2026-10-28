@@ -54,3 +54,16 @@ env.FEX_EXTENDEDVOLATILEMETADATA = oo2core_5_win64.dll:bink2w64.dll
 # f6-compute-open = 1
 # ml1133: start with ECO on (guest threads at a low QoS class); eco-qos = utility | background | initiated
 # eco = 0
+# Microsoft MFC (mfc140.dll, mfc140u.dll) linked into system32 (on by default; 0 leaves it out)
+# env.MADEIRA_MFC = 0
+
+# Hold the display at its maximum rate (Settings > Display > Hold the display at its maximum rate)
+# env.MADEIRA_PROMOTE = 1
+
+# Touch controller as XInput player 1 (on by default; 0 disables it)
+# env.MADEIRA_TOUCH_XINPUT = 0
+# Touches reach program as a mouse: 1 always, 0 never; default: not while touch controller is shown
+# env.MADEIRA_TOUCH_MOUSE = 1
+
+# MetalFX spatial upscaling factor (Direct3D 11 and 12; choices: 1.5, 2)
+# metalfx-upscale = 1.5

@@ -34,11 +34,38 @@ service = service[:service.index('\n#endif', service.index('static void ios_door
 
 harness = r'''
 #include <pthread.h>
-#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <errno.h>
+#include "madeira_cfg.h"   /* ios_srv_switch: madeira.cfg, then the environment */
+/* A host condition variable models the counted wake; macOS has no sem_timedwait. */
+typedef struct { pthread_mutex_t lock; pthread_cond_t ready; unsigned count; } sem_t;
+static int sem_init(sem_t *s, int shared, unsigned value)
+{
+    (void)shared;
+    s->count = value;
+    pthread_mutex_init(&s->lock, NULL);
+    return pthread_cond_init(&s->ready, NULL);
+}
+static int sem_post(sem_t *s)
+{
+    pthread_mutex_lock(&s->lock);
+    s->count++;
+    pthread_cond_signal(&s->ready);
+    pthread_mutex_unlock(&s->lock);
+    return 0;
+}
+static int sem_timedwait(sem_t *s, const struct timespec *limit)
+{
+    int result = 0;
+    pthread_mutex_lock(&s->lock);
+    while (!s->count && !result) result = pthread_cond_timedwait(&s->ready, &s->lock, limit);
+    if (!result) s->count--;
+    pthread_mutex_unlock(&s->lock);
+    errno = result;
+    return result ? -1 : 0;
+}
 typedef int semaphore_t;
 static sem_t real_sem;
 static semaphore_t ios_srv_wake_sem = 1;
@@ -128,7 +155,7 @@ with tempfile.TemporaryDirectory() as tmp:
     exe = Path(tmp) / 'bell'
     cc = os.environ.get('CC', 'cc')
     subprocess.run([cc, '-O2', '-pthread', '-std=gnu11', '-Wall', '-Werror', '-Wno-unused-function',
-                    str(c), '-o', str(exe)], check=True)
+                    '-I', str(root / 'build'), str(c), '-o', str(exe)], check=True)
     out = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=600)
     print('PASS:', out.stdout.strip())
 

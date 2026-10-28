@@ -36,6 +36,7 @@
 /* The window census struct is shared with Swift through this header;
  * including it here keeps both sides' definitions the same. */
 #include "Winios.h"
+#include "VulkanLayerGeometry.h"
 
 /* csops syscall — CS_DEBUGGED is the flag StikDebug JIT rides on. Declared by
  * hand for the same reason JITAllocator.c does: <sys/codesign.h> is not in the
@@ -1071,7 +1072,8 @@ BOOL winios_pProcessEvents(DWORD mask) {
 static NSMutableDictionary<NSNumber *, CALayer *> *g_layers;
 static NSMutableDictionary<NSNumber *, NSValue *> *g_px_rects;  /* hwnd → last px rect */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_sizes; /* hwnd → surface px size */
-static NSMutableDictionary<NSNumber *, CAMetalLayer *> *g_metal_layers; /* hwnd → DXMT layer */
+static NSMutableDictionary<NSNumber *, CAMetalLayer *> *g_metal_layers; /* hwnd → Metal layer */
+static NSHashTable<CAMetalLayer *> *g_vulkan_layers; /* weak identities; main thread only */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_client_rects;      /* hwnd → client px rect */
 static NSNumber *g_game_input_key;       /* HWND using the fullscreen game layer */
 static BOOL g_game_input_hidden;
@@ -1585,10 +1587,13 @@ static void winios_place_metal_layer(NSNumber *key) {
     if (!wv || !cv) return;
     CGRect w = wv.CGRectValue, c = cv.CGRectValue;
     CGFloat s = g_px_to_pt;
+    BOOL vulkan = [g_vulkan_layers containsObject:ml];
+    if (vulkan) ml.affineTransform = CGAffineTransformIdentity;
     ml.frame = CGRectMake((c.origin.x - w.origin.x) * s,
                           (c.origin.y - w.origin.y) * WINIOS_PX_TO_PT_Y,
                           c.size.width * s, c.size.height * WINIOS_PX_TO_PT_Y);
     winios_desktop_fit(key, ml, c);
+    if (vulkan) madeira_vulkan_layer_geometry(ml, ml.frame, c.size);
 }
 
 /* madeira-bcd: A HIDDEN WINDOW PRESENTS SLOWLY. A desktop window's swapchain
@@ -1807,6 +1812,30 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
             winios_metal_hud_pick();
             winios_swap_layer_note(key, "metal layer created");
         }
+        result = ml;
+    };
+    if ([NSThread isMainThread]) make();
+    else dispatch_sync(dispatch_get_main_queue(), make);
+    return result;
+}
+
+/* Vulkan preserves the Wine client-pixel extent independently of the
+ * compositor's point placement. Do not change the DXMT-only layer path.
+ * Weak layer identities avoid carrying the Vulkan flag across HWND reuse. */
+CAMetalLayer *winios_vulkan_layer_for_hwnd(void *hwnd) {
+    __block CAMetalLayer *result = nil;
+    void (^make)(void) = ^{
+        CAMetalLayer *ml = winios_metal_layer_for_hwnd(hwnd);
+        if (!ml) return;
+        if (!g_vulkan_layers) g_vulkan_layers = [NSHashTable weakObjectsHashTable];
+        [g_vulkan_layers addObject:ml];
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        winios_place_metal_layer(@((uintptr_t)hwnd));
+        [CATransaction commit];
+        fprintf(stderr, "[vk-layer] hwnd=%p client=%.0fx%.0f point-frame=%.1fx%.1f scale=%.1f\n",
+                hwnd, ml.bounds.size.width, ml.bounds.size.height,
+                ml.frame.size.width, ml.frame.size.height, (double)ml.contentsScale);
         result = ml;
     };
     if ([NSThread isMainThread]) make();

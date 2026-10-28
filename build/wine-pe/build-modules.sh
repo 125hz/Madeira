@@ -6,6 +6,9 @@
 #   build/wine-pe/build-modules.sh                  the default list below
 #   build/wine-pe/build-modules.sh kernelbase ...   these modules instead
 #   DEST=/some/dir build/wine-pe/build-modules.sh   install somewhere else
+#   build/wine-pe/build-modules.sh wined3d d3d9-wined3d d3d8 ddraw
+#                    the wined3d route: Wine's d3d9 is installed as
+#                    d3d9-wined3d.dll (DXMT owns d3d9.dll; "d3d9" is refused)
 #
 # A module is named by its directory under wine/dlls; the file is <name>.dll
 # unless the name has its own extension (winecoreaudio.drv). The default list
@@ -63,6 +66,9 @@ esac
 #       the Windows Media Format reader (WMCreateReader, WMCreateSyncReader) and
 #       its winegstreamer frontend; tools/check-wine-media-dlls.py checks both in
 #       the farm after they are built
+#   explorerframe
+#       the prefix registers TaskbarList here; packaging the COM server lets
+#       ordinary ITaskbarList callers activate it (Madeira #450)
 #   netprofm
 #       the Network List Manager, for services a launcher starts in a game
 #       session
@@ -79,18 +85,28 @@ GAME_MODULES="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcrt20 msvcrt40 msvcirt
     xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_8 xaudio2_9
     x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6
     xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4
-    d2d1 wmvcore winegstreamer netprofm"
+    d2d1 wmvcore winegstreamer netprofm explorerframe"
 # shellcheck disable=SC2086 # the list is split on purpose
-[ $# -gt 0 ] || set -- cryptsp d3dx11_43 msvcp110 msvcr110 xaudio2_7 $GAME_MODULES
+#   tbs                     Unreal Engine shipping executables import it statically
+#   wintypes                Unity IL2CPP GameAssembly.dll imports api-ms-win-core-winrt-robuffer-l1-1-0
+#   wmadmod                 XAudio2's xWMA voices decode through the WMA decoder DMO (docs/MEDIA.md)
+#   build/wine-pe/farm-modules.txt   other stock modules the farm ships for programs that import them
+# shellcheck disable=SC2086,SC2046 # the lists are split on purpose
+[ $# -gt 0 ] || set -- cryptsp d3dx11_43 msvcp110 msvcr110 xaudio2_7 tbs wintypes wmadmod $GAME_MODULES \
+    $(grep -v '^#' "$R/build/wine-pe/farm-modules.txt")
 [ -x "$STRIP" ] || { echo "llvm-mingw not found at $TC (docs/BUILDING.md)" >&2; exit 1; }
 
 targets=()
+names=()   # the installed file name of each target
 for m in "$@"; do
     case "$m" in
         ntdll) echo "ntdll: use build/wine-pe/build-ntdll.sh (it also pads the image)" >&2; exit 1 ;;
         # Farm names that are not Wine's here: wine/dlls has these directories too, and
         # building one would replace DXMT's, madeira-d3d12's or FEX's DLL with Wine's.
-        d3d10core|d3d11|dxgi|d3d12|d3d12core|xtajit64) echo "$m: not a Wine module in the farm (DXMT / madeira-d3d12 / FEX)" >&2; exit 1 ;;
+        d3d9|d3d10core|d3d11|dxgi|d3d12|d3d12core|xtajit64) echo "$m: not a Wine module in the farm (DXMT / madeira-d3d12 / FEX; Wine's d3d9 is d3d9-wined3d)" >&2; exit 1 ;;
+        # Wine's d3d9 (on wined3d) ships beside DXMT's d3d9.dll under its own
+        # name; madeira.cfg d3d9 = wined3d links it in for a session.
+        d3d9-wined3d) targets+=("dlls/d3d9/arm64ec-windows/d3d9.dll"); names+=("d3d9-wined3d.dll"); continue ;;
         */*|.*|"") echo "$m: name a module directory under wine/dlls" >&2; exit 1 ;;
     esac
     [ -f "$R/wine/dlls/$m/Makefile.in" ] || { echo "$m: no wine/dlls/$m/Makefile.in" >&2; exit 1; }
@@ -98,6 +114,7 @@ for m in "$@"; do
     f="$(sed -n 's/^MODULE[[:space:]]*=[[:space:]]*//p' "$R/wine/dlls/$m/Makefile.in")"
     [ -n "$f" ] || { echo "$m: no MODULE line in wine/dlls/$m/Makefile.in" >&2; exit 1; }
     targets+=("dlls/$m/arm64ec-windows/$f")
+    names+=("$f")
 done
 
 if [ ! -f "$B/config.status" ]; then
@@ -147,8 +164,9 @@ fi
 make -C "$B" -j"$JOBS" "${targets[@]}"
 
 mkdir -p "$DEST"
-for t in "${targets[@]}"; do
-    out="$DEST/$(basename "$t")"
+for i in "${!targets[@]}"; do
+    t="${targets[$i]}"
+    out="$DEST/${names[$i]}"
     cp "$B/$t" "$out.tmp"
     "$STRIP" --strip-debug "$out.tmp"
     mv "$out.tmp" "$out"

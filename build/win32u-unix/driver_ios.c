@@ -60,6 +60,13 @@ extern UINT winios_pShowWindow( HWND hwnd, INT cmd, RECT *rect, UINT swp ) __att
 extern void winios_pWindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                       const struct window_rects *new_rects, struct window_surface *surface ) __attribute__((weak));
 
+extern UINT winios_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs,
+                               const struct opengl_driver_funcs **driver_funcs );
+/* vulkan_ios.c: VK_KHR_win32_surface on the window's CAMetalLayer. Only reached
+ * once a session loaded a Vulkan library (MADEIRA_VULKAN_LIBRARY). */
+extern UINT madeira_ios_VulkanInit( UINT version, void *vulkan_handle,
+                               const struct vulkan_driver_funcs **driver_funcs );
+
 static struct user_driver_funcs winios_user_driver;
 
 /* Direct mode (no virtual desktop) has no compositor to draw the Windows
@@ -2171,9 +2178,16 @@ static LRESULT nulldrv_WintabProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     return 0;
 }
 
+#ifdef MADEIRA_MOLTENVK
+extern UINT madeira_ios_VulkanInit( UINT version, void *handle, const struct vulkan_driver_funcs **funcs );
+#endif
 static UINT nulldrv_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs )
 {
+#ifdef MADEIRA_MOLTENVK
+    return madeira_ios_VulkanInit( version, vulkan_handle, driver_funcs );
+#else
     return STATUS_NOT_IMPLEMENTED;
+#endif
 }
 
 static UINT nulldrv_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs )
@@ -2336,6 +2350,12 @@ static void load_display_driver(void)
                         "(MADEIRA_GAME_WINDOWS=0 hides them)\n" );
         }
         winios_user_driver.pUpdateDisplayDevices = winios_UpdateDisplayDevices;
+        /* OpenGL ES behind WGL (opengl_ios.c). MADEIRA_NO_GL=1 restores the
+         * GL-absent behaviour (every context creation fails). */
+        if (!getenv( "MADEIRA_NO_GL" )) winios_user_driver.pOpenGLInit = winios_OpenGLInit;
+        /* Vulkan surfaces on Metal (vulkan_ios.c). win32u calls it only after a
+         * Vulkan library was loaded, which needs MADEIRA_VULKAN_LIBRARY. */
+        winios_user_driver.pVulkanInit = madeira_ios_VulkanInit;
         __wine_set_user_driver( &winios_user_driver, WINE_GDI_DRIVER_VERSION );
 #else
         __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );

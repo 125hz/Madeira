@@ -11,6 +11,12 @@ APP_LIB="$REPO_ROOT/app/Madeira/libntdll_unix.a"
 
 mkdir -p "$OBJ_DIR"
 
+# Optional Vulkan route; do not change the normal native build.
+VULKAN_FLAGS=()
+if [ "${MADEIRA_MOLTENVK:-0}" = 1 ]; then
+    VULKAN_FLAGS=(-DMADEIRA_MOLTENVK=1)
+fi
+
 # Detect optional diagnostic fields in the SDK used for this target build.
 # Keep SDK versions without this member buildable; it is not a runtime requirement.
 RUSAGE_PAGE_WAIT_FLAGS=()
@@ -18,6 +24,7 @@ if printf '#include <sys/resource.h>\nvoid probe(struct rusage_info_v6 *r) { (vo
     xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
         -miphoneos-version-min=17.0 -x c -fsyntax-only - >/dev/null 2>&1; then
     RUSAGE_PAGE_WAIT_FLAGS=(-DMADEIRA_HAVE_RUSAGE_PAGE_WAIT_TIME_MACH=1)
+
 fi
 
 SUCCEEDED=0
@@ -33,6 +40,7 @@ compile_one() {
     if xcrun -sdk iphoneos clang \
         -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
         -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
+        "${VULKAN_FLAGS[@]}" \
         -Wno-implicit-function-declaration -Wno-int-conversion \
         -include "$WINE_BUILD/include/config.h" \
         -include "$BUILD_DIR/shims/wine_ios_exit.h" \
@@ -73,6 +81,7 @@ compile_unixlib() {
     if xcrun -sdk iphoneos clang \
         -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
         -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
+        "${VULKAN_FLAGS[@]}" \
         -Wno-implicit-function-declaration -Wno-int-conversion \
         -include "$WINE_BUILD/include/config.h" \
         -include "$BUILD_DIR/shims/wine_ios_exit.h" \
@@ -107,12 +116,34 @@ echo "=== Building crypto/network unixlibs ==="
 compile_one "$CRYPTO_DIR/gnutls_symtab_ios.c" "gnutls_symtab_ios"
 compile_unixlib "$WINE_SRC/dlls/ws2_32/unixlib.c" "ws2_32_unixlib" "ws2_32" \
     -I"$WINE_SRC/dlls/ws2_32"
+# madeira-gnutls-unixlibs: the host configure cannot detect an iOS arm64 static
+# archive, so config.h leaves HAVE_GNUTLS_CIPHER_INIT and SONAME_LIBGNUTLS
+# undefined and all three sources below compile to empty objects. The iOS chain
+# links GnuTLS statically regardless (see ios_gnutls_shim.h), so define them
+# here -- on these three translation units only, because the host build really
+# does not have GnuTLS and config.h should keep saying so.
+#
+# Warns rather than fails when the prefix is absent, so a tree that has never
+# run build/gnutls-ios/build.sh still builds exactly as it does today -- it
+# just keeps getting the empty objects, and now says so instead of leaving it
+# to be discovered by a program whose HTTPS request goes nowhere.
+GNUTLS_DEFS=()
+if [ -f "$GNUTLS_PREFIX/lib/libgnutls.a" ]; then
+    GNUTLS_DEFS=(-DHAVE_GNUTLS_CIPHER_INIT '-DSONAME_LIBGNUTLS="libgnutls.so.30"')
+else
+    echo "WARNING: $GNUTLS_PREFIX/lib/libgnutls.a is missing, so bcrypt," >&2
+    echo "         secur32 and crypt32 compile to empty objects and guest-side" >&2
+    echo "         TLS will not work. Run build/gnutls-ios/build.sh to fix." >&2
+fi
+
 compile_unixlib "$WINE_SRC/dlls/bcrypt/gnutls.c" "bcrypt_unixlib" "bcrypt" \
     -I"$WINE_SRC/dlls/bcrypt" -I"$GNUTLS_PREFIX/include" \
-    -include "$CRYPTO_DIR/ios_gnutls_shim.h"
+    -include "$CRYPTO_DIR/ios_gnutls_shim.h" \
+    "${GNUTLS_DEFS[@]}"
 compile_unixlib "$WINE_SRC/dlls/secur32/schannel_gnutls.c" "secur32_unixlib" "secur32" \
     -I"$WINE_SRC/dlls/secur32" -I"$GNUTLS_PREFIX/include" \
-    -include "$CRYPTO_DIR/ios_gnutls_shim.h"
+    -include "$CRYPTO_DIR/ios_gnutls_shim.h" \
+    "${GNUTLS_DEFS[@]}"
 # iOS-Madeira ml494 (#61 text wall): dwrite had NO unixlib, so every
 # __wine_unix_call from dwrite.dll failed and get_glyph_bbox never ran —
 # every glyph run reported an EMPTY bbox and Chromium drew no text at all.
@@ -124,7 +155,24 @@ compile_unixlib "$BUILD_DIR/dwrite_freetype_ios.c" "dwrite_unixlib" "dwrite" \
     -I"$REPO_ROOT/wine/build-arm64ec/include"
 compile_unixlib "$CRYPTO_DIR/crypt32_unixlib_ios.c" "crypt32_unixlib" "crypt32" \
     -I"$WINE_SRC/dlls/crypt32" -I"$GNUTLS_PREFIX/include" \
-    -include "$CRYPTO_DIR/ios_gnutls_shim.h"
+    -include "$CRYPTO_DIR/ios_gnutls_shim.h" \
+    "${GNUTLS_DEFS[@]}"
+# OpenGL: opengl32's unix side (wrappers + generated thunks). It dispatches to
+# win32u's WGL layer, whose iOS driver is build/win32u-unix/opengl_ios.c.
+compile_unixlib "$WINE_SRC/dlls/opengl32/unix_wgl.c" "opengl32_wgl" "opengl32" \
+    -I"$WINE_SRC/dlls/opengl32"
+compile_unixlib "$WINE_SRC/dlls/opengl32/unix_thunks.c" "opengl32_thunks" "opengl32" \
+    -I"$WINE_SRC/dlls/opengl32"
+# Vulkan: winevulkan's unix side (instance/device wrappers + generated thunks).
+# It dispatches to win32u's Vulkan layer (build/win32u-unix/vulkan_ios.c), which
+# loads the session's Vulkan library (MADEIRA_VULKAN_LIBRARY; off by default).
+# Bound for 64-bit callers only (virtual_ios.c): the wow64 thunks pass 32-bit
+# guest pointers through UlongToPtr, without the window base a 32-bit program
+# here needs (ios_wow_host_ptr), like opengl32's before its regenerated thunks.
+compile_unixlib "$WINE_SRC/dlls/winevulkan/vulkan.c" "winevulkan_vulkan" "winevulkan" \
+    -I"$WINE_SRC/dlls/winevulkan"
+compile_unixlib "$WINE_SRC/dlls/winevulkan/vulkan_thunks.c" "winevulkan_thunks" "winevulkan" \
+    -I"$WINE_SRC/dlls/winevulkan"
 # iOS-Madeira 2026-08-03 (#79 transport): in-process NSI TCP connection
 # tables (nsiproxy.sys is not shipped; PE nsi.dll falls back to this).
 compile_one "$BUILD_DIR/nsi_unixlib_ios.c" "nsi_unixlib_ios"
@@ -240,7 +288,8 @@ ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/nsi_network_ios.o" "$OBJ_DIR/nsi_ndis.o" "$OBJ_DIR/nsi_ip.o" \
     "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
     "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
-    "$OBJ_DIR/dwrite_unixlib.o" "$OBJ_DIR/dnsapi_unixlib.o" \
+    "$OBJ_DIR/dwrite_unixlib.o" "$OBJ_DIR/dnsapi_unixlib.o" "$OBJ_DIR/opengl32_wgl.o" "$OBJ_DIR/opengl32_thunks.o" \
+    "$OBJ_DIR/winevulkan_vulkan.o" "$OBJ_DIR/winevulkan_thunks.o" \
     "$OBJ_DIR/winegstreamer_unixlib.o" "$OBJ_DIR/wg_parser_apple_ios.o" \
     "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
     "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \
