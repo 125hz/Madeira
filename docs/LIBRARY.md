@@ -371,7 +371,9 @@ reaches the device through it; **Get LocalDevVPN** opens the App Store, and
 Madeira checks again with `canOpenURL` whenever it comes back to the front),
 **Set up JIT**, **Sign in to Steam**, **Prepare Madeira Dock**
 (Valve's client components, about 73 MB, only when Dock is available),
-**Add .NET Framework support** (Wine Mono, only when the device has none), done.
+**Add .NET Framework support** (Wine Mono, only when the device has none),
+**Install the Visual C++ runtime** (the DLLs out of Microsoft's installers, only
+while the device lacks the pinned version), done.
 The JIT page offers three ways in, **In-app** (iOS 27 and later),
 **In-app with pairing file** and **StikDebug**, or **I'll do this later**.
 Each way opens numbered steps that tick off as they are done, with **Back to
@@ -387,7 +389,8 @@ that finished it before revisions (`madeiraOnboardingDone`). After an update,
 setup shows only the pages added since the revision the device last saw
 (`Step.introduced`), under **New in Madeira**: revision 3 adds Wine Mono, so an
 install that finished revision 2 sees just that page, and nothing at all when
-it already has Wine Mono. A new install and **Run setup again** show every page.
+it already has Wine Mono; revision 4 adds the Visual C++ runtime the same way.
+A new install and **Run setup again** show every page.
 The JIT page is always available; Steam pages follow their feature
 switches. Setup never opens over a running session.
 
@@ -404,6 +407,39 @@ session links `C:\windows\mono\mono-2.0` to the bundled copy (a development
 build made after `build/wine-mono/fetch.sh`) or, failing that, to the download.
 Settings can remove it again. `tests/host/check-wine-mono.py` runs the installer
 code on the real tarball. Log tag: `[wine-mono]`.
+
+**Visual C++ runtime** (`app/Madeira/VCRedist.swift`, `CabinetReader.c`). Many
+games need Microsoft's Visual C++ 2015-2022 runtime. Builds made with
+`tools/fetch-vcruntime.sh` carry its x64 DLLs in the app bundle and link them
+over Wine's builtins at every session (`WineProcessBridge.m`, 64-bit games only;
+`Documents/vcruntime` is consulted first). Setup's **Install the Visual C++
+runtime** page and **Settings › Visual C++ runtimes** get the runtime onto any
+build, for 64-bit and 32-bit games, without a Windows session: the app downloads
+Microsoft's two installers (`VC_redist.x64.exe` and `VC_redist.x86.exe`, version
+14.44.35211.0, about 38 MB) from their versioned
+`download.visualstudio.microsoft.com` URLs, pinned with their sizes and SHA-256
+sums (`VCRedistPin`; a new runtime version is a new pin), and reads the DLLs out
+of them on the device. Each installer is a WiX Burn bundle: its attached cabinet
+holds the packages, and the packages' own cabinets hold the DLLs as
+`<name>.dll_amd64` / `<name>.dll_x86` entries, all MSZIP, which
+`CabinetReader.c` (a reader written from the Cabinet File Format specification,
+on zlib) unpacks. The 14 names of the bundled set are taken (13 for x86:
+Microsoft ships no 32-bit `vcruntime140_1.dll`); MFC's language DLLs and the
+managed `mfcm140` are not. Every DLL is checked (PE machine, a signature
+directory, the pinned version) and kept byte for byte as Microsoft shipped it,
+under Microsoft's licence terms, in `Documents/vcruntime` (x64) and
+`Documents/vcruntime32` (x86), written to a staging folder and swapped in at once,
+excluded from backups. The bridge links the x64 folder as before, with the two
+exemptions in force (`vcruntime140.dll` and `msvcp140.dll` stay Wine's ARM64EC
+builtins for the SEH and C++ exception paths); `madeira_overlay_vcruntime32`
+links the x86 folder over Wine's i386 builtins in `syswow64`, after the farm links,
+so removing the folder brings the builtins back at the next session. Installed
+means every expected DLL is present in a folder, one version, at least the pinned
+one. Nothing restarts: the next game start uses the files. Install and remove are
+refused while a session runs. `tests/host/check-vcredist.py` compiles the reader
+and the pin, PE and install code, runs the extraction over the real installers
+when they are cached or downloadable, and checks the wiring. Log tags:
+`[vcredist]`, `[WineProc] Symlinked ... MS VC++ x86 runtime DLLs`.
 
 Setup starts no Wine session and allocates no JIT pool. It stores the selected
 JIT method and may store a validated pairing file (paired on the device or
@@ -468,6 +504,8 @@ menu owns input, the game sees a connected pad at rest.
 | `MADEIRA_FRONTEND` | unset | `env.MADEIRA_FRONTEND = 0/1` picks the interface when nothing was chosen in the app |
 | `MADEIRA_FRONTEND_CONTROLLER` | on | no controller navigation |
 | `MADEIRA_ONE_SESSION_PER_RUN` | on | a second session is attempted anyway |
+| `MADEIRA_VCREDIST` | on | setup and Settings do not offer Microsoft's Visual C++ runtime |
+| `MADEIRA_VCREDIST_X86` | on | 32-bit programs keep Wine's own C++ runtime instead of the downloaded Microsoft x86 runtime |
 | `MADEIRA_EXIT_REPORT` | on | no message when a session ends by itself |
 | `MADEIRA_LIBRARY_HIDE_ENDED_DESKTOP` | on | the ended desktop's surface is left as it was |
 | `MADEIRA_BUILD_LABEL` | on | no build label (the `[build]` log line stays) |
@@ -521,6 +559,9 @@ in-game menu options), `tests/host/check-runtime-settings.py`
 pairing import, pages with and without Dock, the done key, the
 `MADEIRA_ONBOARDING` switch, and the wiring (no Wine session, no pool or
 engine switch; JIT, sign-in and Dock through their public pieces).
+`tests/host/check-vcredist.py` covers the Visual C++ runtime: the pins, the
+cabinet reader over the real installers, the PE checks, the staged install and
+the wiring.
 `tests/host/check-steam-games.py` covers the library's Steam section: Dock's
 discovery on a synthetic drive_c laid out as Steam writes it, the merge of
 installed and owned games, the section, status, card pill, search, Play and

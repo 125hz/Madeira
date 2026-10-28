@@ -675,6 +675,32 @@ static BOOL madeira_bundle_has_i386(NSString *bundle)
     return access(ntdll.fileSystemRepresentation, R_OK) == 0;
 }
 
+/* Microsoft's x86 Visual C++ runtime, taken out of Microsoft's installer by the app
+ * (VCRedist.swift) into Documents/vcruntime32: linked over Wine's i386 builtins in
+ * syswow64 for 32-bit programs, as the x86_64-vcruntime overlay below does for 64-bit
+ * ones (that one reads Documents/vcruntime). Runs after the syswow64 farm links, so
+ * removing the folder brings the builtins back at the next session. 32-bit code runs
+ * whole under the emulator, so there is no ARM64EC exemption to keep here.
+ * env.MADEIRA_VCREDIST_X86 = 0 leaves them out. */
+static void madeira_overlay_vcruntime32(NSFileManager *fm, NSString *prefix)
+{
+    const char *e = getenv("MADEIRA_VCREDIST_X86");   /* 0: 32-bit programs keep Wine's own C++ runtime instead of the Microsoft x86 runtime the app downloaded (Documents/vcruntime32) */
+    if (e && e[0] == '0') { dprintf(STDERR_FILENO, "[WineProc] MADEIRA_VCREDIST_X86=0: Microsoft x86 runtime overlay skipped\n"); return; }
+    NSString *source = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
+                        stringByAppendingPathComponent:@"vcruntime32"];
+    NSArray *files = [fm contentsOfDirectoryAtPath:source error:nil];
+    if (!files.count) return;
+    NSString *farmDir = [prefix stringByAppendingPathComponent:@"drive_c/windows/syswow64"];
+    int linked = 0;
+    for (NSString *f in files) {
+        if (![f.pathExtension.lowercaseString isEqualToString:@"dll"]) continue;
+        NSString *dst = [farmDir stringByAppendingPathComponent:f];
+        [fm removeItemAtPath:dst error:nil];
+        if ([fm createSymbolicLinkAtPath:dst withDestinationPath:[source stringByAppendingPathComponent:f] error:nil]) linked++;
+    }
+    dprintf(STDERR_FILENO, "[WineProc] Symlinked %d MS VC++ x86 runtime DLLs over i386 builtins (Documents/vcruntime32; MADEIRA_VCREDIST_X86=0 leaves them out)\n", linked);
+}
+
 /* C:\windows\syswow64: the i386 farm, the Windows name for this pattern. A
  * 32-bit process's system32 is redirected here, and the unix loader's
  * machine -> directory mapping looks here for the 32-bit ntdll, kernel32 and
@@ -1642,6 +1668,16 @@ static void *wine_process_thread(void *arg) {
                         }
                         LOG("ml1077 swap tier armed: %{public}s, %ld MB", swapPath.UTF8String, capMB);
                         fprintf(stderr, "[swap] ml1077 app: backing file %s, cap %ld MB\n", swapPath.UTF8String, capMB);
+                        /* ml1150: donor pool, the tier's first stage (DonorPool.m). donor-pool-kind = ledger (default) |
+                         * purgeable chooses how the extension creates the memory (the A/B of ml1152). */
+                        long poolMB = (long)madeira_cfg_int("donor-pool-mb", 0);   /* madeira.cfg donor-pool-mb = N */
+                        if (poolMB >= 512) {
+                            char poolKind[32] = "";
+                            madeira_cfg_get("donor-pool-kind", poolKind, sizeof poolKind);   /* madeira.cfg donor-pool-kind = ledger | purgeable */
+                            extern long MadeiraDonorPoolStart(long megabytes, int purgeable);
+                            long got = MadeiraDonorPoolStart(poolMB, strcmp(poolKind, "purgeable") == 0);
+                            LOG("ml1150 donor pool: %ld of %ld MB (%s)", got, poolMB, poolKind[0] ? poolKind : "ledger");
+                        }
                     }
                 }
             }
@@ -2054,6 +2090,7 @@ static void *wine_process_thread(void *arg) {
                 madeira_link_syswow64(fm, prefix, bundlePath);
                 madeira_link_syswow64_wbem(fm, prefix, bundlePath);
                 madeira_seed_winsxs_x86(fm, prefix, bundlePath);
+                madeira_overlay_vcruntime32(fm, prefix);   /* VCRedist.swift's Microsoft x86 runtime */
             }
             madeira_link_wine_mono(fm, prefix, bundlePath);
             if (madeira_d3d9_wined3d_wanted())

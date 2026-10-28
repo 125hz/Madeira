@@ -59,8 +59,9 @@ for switch in ('MADEIRA_DOCK_INSTALLERS', 'MADEIRA_INSTALL_DEFAULT_KEY', 'MADEIR
     require(f'flag("{switch}")' in installers, f'switch {switch} is read')
 require('reg.exe' not in installers, 'the batch never writes the registry (no reg.exe in the bundle)')
 require(content.count('setenv("MADEIRA_MADSYNC_SESSION", "0", 1)') == 1 and
-        re.search(r'if DockInstallers\.serverSync \{\n\s*setenv\("MADEIRA_MADSYNC_SESSION", "0", 1\)', content) and
-        'unsetenv("MADEIRA_MADSYNC_SESSION")' in content, 'madsync is turned off only for a Dock start that runs installers')
+        re.search(r'if DockInstallers\.serverSync \|\| scmServerSync \{\n\s*setenv\("MADEIRA_MADSYNC_SESSION", "0", 1\)', content) and
+        'unsetenv("MADEIRA_MADSYNC_SESSION")' in content,
+        'madsync is turned off only for a Dock start that runs installers or starts the service manager')
 for name, text in [('MadeiraDock.swift', dock), ('MadeiraDockView.swift', view)]:
     require('MADEIRA_MADSYNC_SESSION' not in text, f'{name}: does not touch the madsync session switch')
 start = content.index('private func startDock(')
@@ -101,6 +102,9 @@ enum MadeiraConfig {
     nonisolated(unsafe) static var values: [String: String] = [:]
     static func get(_ key: String) -> String? { values[key] }
     static var gameURL: URL? { nil }
+    // DockGameSession.swift (compiled with the production installers for isMicrosoftKey)
+    static func flag(_ name: String, fallback: Bool = true) -> Bool { getenv(name).map { String(cString: $0) != "0" } ?? fallback }
+    static func parse(_ text: String) -> [String: String] { [:] }
 }
 struct LogEntry { enum Level { case info, success, error, debug } }
 @MainActor final class LogStore {
@@ -546,7 +550,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-dock-installers-') as tmp:
     else:
         build = subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-o', str(exe),
                                 str(tmp / 'stubs.swift'), str(tmp / 'checks.swift'), str(app / 'DockInstallers.swift'),
-                                str(app / 'DockReset.swift')])
+                                str(app / 'DockReset.swift'), str(app / 'DockGameSession.swift')])
         require(build.returncode == 0, 'production installer Swift compiles on the host')
     if build is not None and build.returncode == 0:
         run = subprocess.run([str(exe), str(tmp / 'fixture.cmd')], env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0'))

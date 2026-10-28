@@ -33,6 +33,9 @@
 		A1000E03 /* SwiftEpic/EpicAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E03 /* EpicAPI.swift */; };
 		A1000E04 /* SwiftEpic/EpicFormats.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E04 /* EpicFormats.swift */; };
 		A1000E05 /* SwiftEpic/EpicDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E05 /* EpicDownloader.swift */; };
+		A1000715 /* DockGameSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000715 /* DockGameSession.swift */; };
+		A1000712 /* VCRedist.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000712 /* VCRedist.swift */; };
+		A1000713 /* CabinetReader.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000713 /* CabinetReader.c */; };
 		A1000602 /* SteamDownloadBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000602 /* SteamDownloadBackground.swift */; };
 		A1000600 /* SteamInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000600 /* SteamInstall.swift */; };
 		A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000609 /* ContentDecryptor.swift */; };
@@ -183,6 +186,11 @@
 		A1000245 /* TouchGamepad.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000245 /* TouchGamepad.swift */; };
 		A1000F01 /* GestureZones.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000F01 /* GestureZones.swift */; };
 		A1000246 /* TouchControlPresets.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000246 /* TouchControlPresets.swift */; };
+		1686FBF2209ABE0E71A12807 /* MadeiraMemoryHost.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = D80FB04E72418784BED70CF4 /* MadeiraMemoryHost.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		5271C4AE571BDF56B9E51EAA /* DonorPool.m in Sources */ = {isa = PBXBuildFile; fileRef = 2027C80DC6F4BF37B7522656 /* DonorPool.m */; };
+		5A864326ABA078F978B4C2F1 /* MemoryHostTest.m in Sources */ = {isa = PBXBuildFile; fileRef = B31D214EB6F64F7E730134B5 /* MemoryHostTest.m */; };
+		A30972F13DC1D583109676F1 /* MemoryHost.m in Sources */ = {isa = PBXBuildFile; fileRef = 5AD9AA30E0294BF16811DD39 /* MemoryHost.m */; };
+		33A1199863C98CF2679931F9 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6D1BE8A3B1F0B4C1A8E2D9F0 /* Foundation.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -192,6 +200,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = B5000001;
 			remoteInfo = MadeiraJITHelper;
+		};
+		DBC4FD56549A5B791A43BF65 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A6000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0EE299295F380151C9B3BFFA;
+			remoteInfo = MadeiraMemoryHost;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -215,6 +230,17 @@
 				B1000016 /* MadeiraJITHelper.appex in Embed JIT Helper */,
 			);
 			name = "Embed JIT Helper";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		36C67A194E1AE021D3C5121B /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				1686FBF2209ABE0E71A12807 /* MadeiraMemoryHost.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
@@ -246,6 +272,10 @@
 		A2000E03 /* EpicAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftEpic/EpicAPI.swift"; sourceTree = "<group>"; };
 		A2000E04 /* EpicFormats.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftEpic/EpicFormats.swift"; sourceTree = "<group>"; };
 		A2000E05 /* EpicDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftEpic/EpicDownloader.swift"; sourceTree = "<group>"; };
+		A2000715 /* DockGameSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DockGameSession.swift"; sourceTree = "<group>"; };
+		A2000712 /* VCRedist.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "VCRedist.swift"; sourceTree = "<group>"; };
+		A2000713 /* CabinetReader.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = CabinetReader.c; sourceTree = "<group>"; };
+		A2000714 /* CabinetReader.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = CabinetReader.h; sourceTree = "<group>"; };
 		A2000602 /* SteamDownloadBackground.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamDownloadBackground.swift"; sourceTree = "<group>"; };
 		A2000600 /* SteamInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamInstall.swift"; sourceTree = "<group>"; };
 		A2000609 /* ContentDecryptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/ContentDecryptor.swift"; sourceTree = "<group>"; };
@@ -412,6 +442,15 @@
 		A2000245 /* TouchGamepad.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TouchGamepad.swift; sourceTree = "<group>"; };
 		A2000F01 /* GestureZones.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GestureZones.swift; sourceTree = "<group>"; };
 		A2000246 /* TouchControlPresets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TouchControlPresets.swift; sourceTree = "<group>"; };
+		2027C80DC6F4BF37B7522656 /* DonorPool.m */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.objc; path = DonorPool.m; sourceTree = "<group>"; };
+		32607841304656C675DB52CF /* MemoryHostTest.h */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.h; path = MemoryHostTest.h; sourceTree = "<group>"; };
+		36023A5C635793C3C00F4FA5 /* MemoryHostProtocol.h */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.h; path = MemoryHostProtocol.h; sourceTree = "<group>"; };
+		5AD9AA30E0294BF16811DD39 /* MemoryHost.m */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.objc; path = MemoryHost.m; sourceTree = "<group>"; };
+		883B1A630C7C6EA385E785A6 /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		8BEA4CE7E7656C3BED7E18CF /* MemoryHost.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = MemoryHost.entitlements; sourceTree = "<group>"; };
+		B31D214EB6F64F7E730134B5 /* MemoryHostTest.m */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.objc; path = MemoryHostTest.m; sourceTree = "<group>"; };
+		D80FB04E72418784BED70CF4 /* MadeiraMemoryHost.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MadeiraMemoryHost.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		6D1BE8A3B1F0B4C1A8E2D9F0 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -466,12 +505,21 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		70F1ABFC03F0632DCACFB03A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				33A1199863C98CF2679931F9 /* Foundation.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		A4000001 = {
 			isa = PBXGroup;
 			children = (
+				ED6FF0EF22443DC0F369BE29 /* MadeiraMemoryHost */,
 				A4000002 /* Madeira */,
 				B4000001 /* MadeiraJITHelper */,
 				A4000004 /* Libraries */,
@@ -482,6 +530,10 @@
 		A4000002 /* Madeira */ = {
 			isa = PBXGroup;
 			children = (
+				B31D214EB6F64F7E730134B5 /* MemoryHostTest.m */,
+				32607841304656C675DB52CF /* MemoryHostTest.h */,
+				36023A5C635793C3C00F4FA5 /* MemoryHostProtocol.h */,
+				2027C80DC6F4BF37B7522656 /* DonorPool.m */,
 				A2000520 /* MadeiraDock.swift */,
 				A2000521 /* MadeiraDockView.swift */,
 				A2000650 /* DockStartScreen.swift */,
@@ -508,6 +560,10 @@
 				A2000E05 /* EpicDownloader.swift */,
 				A2000E07 /* EpicCloudSaves.swift */,
 				A2000E06 /* EpicCloud.swift */,
+				A2000715 /* DockGameSession.swift */,
+				A2000712 /* VCRedist.swift */,
+				A2000713 /* CabinetReader.c */,
+				A2000714 /* CabinetReader.h */,
 				A2000602 /* SteamDownloadBackground.swift */,
 				A2000600 /* SteamInstall.swift */,
 				A2000609 /* ContentDecryptor.swift */,
@@ -640,6 +696,7 @@
 		A4000003 /* Products */ = {
 			isa = PBXGroup;
 			children = (
+				D80FB04E72418784BED70CF4 /* MadeiraMemoryHost.appex */,
 				A2000009 /* Madeira.app */,
 				B2000022 /* MadeiraJITHelper.appex */,
 			);
@@ -699,9 +756,37 @@
 			path = MadeiraJITHelper;
 			sourceTree = "<group>";
 		};
+		ED6FF0EF22443DC0F369BE29 /* MadeiraMemoryHost */ = {
+			isa = PBXGroup;
+			children = (
+				5AD9AA30E0294BF16811DD39 /* MemoryHost.m */,
+				883B1A630C7C6EA385E785A6 /* Info.plist */,
+				8BEA4CE7E7656C3BED7E18CF /* MemoryHost.entitlements */,
+			);
+			name = MadeiraMemoryHost;
+			path = MadeiraMemoryHost;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		0EE299295F380151C9B3BFFA /* MadeiraMemoryHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = BAC7183CACD9C83247253BD2 /* Build configuration list for PBXNativeTarget "MadeiraMemoryHost" */;
+			buildPhases = (
+				E9FFC225D8891F4775D44C55 /* Sources */,
+				70F1ABFC03F0632DCACFB03A /* Frameworks */,
+				A5811261BF76A95889DF2795 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MadeiraMemoryHost;
+			productName = MadeiraMemoryHost;
+			productReference = D80FB04E72418784BED70CF4 /* MadeiraMemoryHost.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		A5000001 /* Madeira */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = A7000003 /* Build configuration list for PBXNativeTarget "Madeira" */;
@@ -713,10 +798,12 @@
 				B3000003 /* Embed JIT Helper */,
 				B3000007 /* Embed StikJIT */,
 				A30000D1 /* Sign bundled dylibs */,
+				36C67A194E1AE021D3C5121B /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				EBD383F4060AA06F203FA32B /* PBXTargetDependency */,
 				B3000006 /* PBXTargetDependency */,
 			);
 			name = Madeira;
@@ -775,6 +862,7 @@
 			projectRoot = "";
 			targets = (
 				A5000001 /* Madeira */,
+				0EE299295F380151C9B3BFFA /* MadeiraMemoryHost */,
 				B5000001 /* MadeiraJITHelper */,
 			);
 		};
@@ -802,6 +890,13 @@
 				A1000910 /* Assets.xcassets in Resources */,
 				B1000004 /* madeira-jit.js in Resources */,
 				B1000051 /* Madeira JIT.shortcut in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A5811261BF76A95889DF2795 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -860,6 +955,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5A864326ABA078F978B4C2F1 /* MemoryHostTest.m in Sources */,
+				5271C4AE571BDF56B9E51EAA /* DonorPool.m in Sources */,
 				A1000520 /* MadeiraDock.swift in Sources */,
 				A1000521 /* MadeiraDockView.swift in Sources */,
 				A1000650 /* DockStartScreen.swift in Sources */,
@@ -885,6 +982,9 @@
 				A1000E05 /* SwiftEpic/EpicDownloader.swift in Sources */,
 				A1000E07 /* EpicCloudSaves.swift in Sources */,
 				A1000E06 /* EpicCloud.swift in Sources */,
+				A1000715 /* DockGameSession.swift in Sources */,
+				A1000712 /* VCRedist.swift in Sources */,
+				A1000713 /* CabinetReader.c in Sources */,
 				A1000602 /* SteamDownloadBackground.swift in Sources */,
 				A1000600 /* SteamInstall.swift in Sources */,
 				A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */,
@@ -991,6 +1091,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		E9FFC225D8891F4775D44C55 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A30972F13DC1D583109676F1 /* MemoryHost.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -998,6 +1106,12 @@
 			isa = PBXTargetDependency;
 			target = B5000001 /* MadeiraJITHelper */;
 			targetProxy = B3000001 /* PBXContainerItemProxy */;
+		};
+		EBD383F4060AA06F203FA32B /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = MadeiraMemoryHost;
+			target = 0EE299295F380151C9B3BFFA /* MadeiraMemoryHost */;
+			targetProxy = DBC4FD56549A5B791A43BF65 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -1232,6 +1346,53 @@
 			};
 			name = Release;
 		};
+		20DB4D976DC9DB0FDA8A45B1 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_ENTITLEMENTS = MadeiraMemoryHost/MemoryHost.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MadeiraMemoryHost/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER).MemoryHost";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		C5C1E7F676D4547D9175288D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_ENTITLEMENTS = MadeiraMemoryHost/MemoryHost.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MadeiraMemoryHost/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER).MemoryHost";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -1258,6 +1419,15 @@
 			buildConfigurations = (
 				B8000001 /* Debug */,
 				B8000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		BAC7183CACD9C83247253BD2 /* Build configuration list for PBXNativeTarget "MadeiraMemoryHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				20DB4D976DC9DB0FDA8A45B1 /* Debug */,
+				C5C1E7F676D4547D9175288D /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
