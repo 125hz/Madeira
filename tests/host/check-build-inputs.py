@@ -135,6 +135,50 @@ with tempfile.TemporaryDirectory(prefix='madeira-build-inputs-') as folder:
     assert not valid_ipa(), 'a ZIP with the wrong bundle layout must not be reused'
     ipa.write_bytes(b'damaged ZIP')
     assert not valid_ipa(), 'a corrupt completed IPA must not be reused'
+app_workflow = workflow.split('\n  app:\n', 1)[1]
+assert 'fail-on-cache-miss: true' not in app_workflow, 'native cache transfer must allow a rebuild'
+fallback = re.search(r'      - name: Rebuild missing 32-bit DLLs\n'
+                     r"        if: steps.cache-i386.outputs.cache-hit != 'true' && steps.transfer-i386.outcome != 'success'\n"
+                     r'        run: \|\n((?:          .+\n)+)', app_workflow)
+assert fallback, 'a lost i386 cache must rebuild the requested Wine/DXMT pins'
+for component, label, destination in [('llvm', 'LLVM', 'toolchains'),
+                                      ('fex', 'FEX', 'FEX/build-ios'),
+                                      ('i386', 'i386', 'app/Madeira/i386-windows')]:
+    producer = re.split(r'^  [a-z]+:\n', workflow.split(
+        f'      - name: Retain {label} outputs for this run\n', 1)[1], maxsplit=1, flags=re.M)[0]
+    consumer = app_workflow.split(f'      - name: Recover {label} outputs from this run\n', 1)[1].split('      - ', 1)[0]
+    # Same-run artifacts avoid trusting outputs from unrelated PRs.
+    assert f'name: native-{component}-${{{{ steps.sdk.outputs.key }}}}' in producer
+    assert f'name: native-{component}-${{{{ needs.plan.outputs.sdk }}}}' in consumer
+    assert 'actions/download-artifact@v4' in consumer and 'run-id:' not in consumer
+    assert f'path: {destination}\n' in consumer
+    assert 'continue-on-error: true' in producer and 'continue-on-error: true' in consumer
+    assert 'retention-days: 1' in producer and 'overwrite: true' in producer
+assert 'include-hidden-files: true' in workflow.split('Retain LLVM outputs for this run', 1)[1].split('\n  fex:', 1)[0]
+for name in ['build-llvm-ios.sh', 'build-fex-ios.sh']:
+    assert name in (root / 'tools/build-ipa.sh').read_text()
+with tempfile.TemporaryDirectory(prefix='madeira-cache-miss-') as tmp:
+    fixture = Path(tmp)
+    tools = fixture / 'bin'
+    tools.mkdir()
+    trace = fixture / 'called'
+    for name, content in {
+        'brew': '#!/bin/sh\nif [ "$1" = --prefix ]; then echo /fixture; else echo brew >> "$TRACE"; fi\n',
+        'xcodebuild': '#!/bin/sh\necho metal >> "$TRACE"\n',
+        'tools/build/setup-llvm-mingw.sh': '#!/bin/sh\necho mingw >> "$TRACE"\n',
+        'tools/build/build-shader-headers.sh': '#!/bin/sh\necho shaders >> "$TRACE"\n',
+        'build/wine-i386/build.sh': '#!/bin/sh\necho i386 >> "$TRACE"\nexit "${FAIL_I386:-0}"\n',
+    }.items():
+        path = (fixture / name) if '/' in name else (tools / name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        path.chmod(0o755)
+    env = dict(os.environ, TRACE=str(trace), PATH=str(tools) + os.pathsep + os.environ['PATH'])
+    command = ['bash', '-euo', 'pipefail', '-c', textwrap.dedent(fallback[1])]
+    assert subprocess.run(command, cwd=fixture, env=env).returncode == 0
+    assert trace.read_text().splitlines() == ['brew', 'mingw', 'metal', 'shaders', 'i386']
+    assert subprocess.run(command, cwd=fixture, env=dict(env, FAIL_I386='42')).returncode == 42
+print('PASS missing native caches rebuild; i386 bootstrap preserves build failures')
 for p in [root / 'tools/build-ipa.sh', *(root / 'tools/build').glob('*.sh')]:
     assert '$ROOT/scripts/' not in p.read_text(), p
     subprocess.run(['bash', '-n', str(p)], check=True)

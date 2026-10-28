@@ -93,6 +93,20 @@ jobs:
         run: |
           brew install ninja || true
           tools/build/build-llvm-ios.sh
+      - name: Retain LLVM outputs for this run
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-llvm-${{ steps.sdk.outputs.key }}
+          path: |
+            toolchains/llvm-ios-build/.madeira-cache.sha256
+            toolchains/llvm-ios-build/lib/*.a
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-project/llvm/include
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
 
   fex:
     needs: plan
@@ -122,6 +136,17 @@ jobs:
           brew install ninja || true
           git submodule update --init --recursive --depth 1 FEX
           tools/build/build-fex-ios.sh
+      - name: Retain FEX outputs for this run
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-fex-${{ steps.sdk.outputs.key }}
+          path: |
+            FEX/build-ios
+            !FEX/build-ios/**/*.o
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
 
   i386:
     needs: plan
@@ -163,6 +188,15 @@ jobs:
           build/wine-i386/build.sh
       - if: failure()
         run: tail -150 wine/build-i386/madeira-i386-build.log || true
+      - name: Retain i386 outputs for this run
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-i386-${{ steps.sdk.outputs.key }}
+          path: app/Madeira/i386-windows
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
 
   app:
     needs: [plan, llvm, fex, i386]
@@ -178,26 +212,49 @@ jobs:
           submodules: recursive
       - id: sdk
         run: bash tools/build/ci-input-key.sh
-      - uses: actions/cache/restore@v4
+      - id: cache-llvm
+        uses: actions/cache/restore@v4
         with:
           key: plan19-${{ runner.os }}-${{ runner.arch }}-${{ steps.sdk.outputs.key }}-llvm-ios-15.0.7-${{ hashFiles('tools/build/build-llvm-ios.sh') }}
-          fail-on-cache-miss: true
           path: |
             toolchains/llvm-ios-build/.madeira-cache.sha256
             toolchains/llvm-ios-build/lib/*.a
             toolchains/llvm-ios-build/include
             toolchains/llvm-project/llvm/include
-      - uses: actions/cache/restore@v4
+      - id: cache-fex
+        uses: actions/cache/restore@v4
         with:
           key: plan19-${{ steps.sdk.outputs.key }}-${{ needs.fex.outputs.key }}
-          fail-on-cache-miss: true
           path: |
             FEX/build-ios
             !FEX/build-ios/**/*.o
-      - uses: actions/cache/restore@v4
+      - id: cache-i386
+        uses: actions/cache/restore@v4
         with:
           key: plan19-${{ steps.sdk.outputs.key }}-${{ needs.i386.outputs.key }}
-          fail-on-cache-miss: true
+          path: app/Madeira/i386-windows
+      # These artifacts belong to this workflow run and the planned SDK.
+      - name: Recover LLVM outputs from this run
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: native-llvm-${{ needs.plan.outputs.sdk }}
+          path: toolchains
+      - name: Recover FEX outputs from this run
+        if: steps.cache-fex.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: native-fex-${{ needs.plan.outputs.sdk }}
+          path: FEX/build-ios
+      - name: Recover i386 outputs from this run
+        id: transfer-i386
+        if: steps.cache-i386.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: native-i386-${{ needs.plan.outputs.sdk }}
           path: app/Madeira/i386-windows
       # Independent caches retain libraries whose own build inputs have not changed.
       - id: pins
@@ -261,6 +318,15 @@ jobs:
           path: |
             app/Madeira/libdxmt_combined.a
             build/dxmt-ios/shader-headers
+      - name: Rebuild missing 32-bit DLLs
+        if: steps.cache-i386.outputs.cache-hit != 'true' && steps.transfer-i386.outcome != 'success'
+        run: |
+          brew install meson ninja bison
+          export PATH="$(brew --prefix bison)/bin:$PATH"
+          tools/build/setup-llvm-mingw.sh
+          xcodebuild -downloadComponent MetalToolchain
+          tools/build/build-shader-headers.sh
+          build/wine-i386/build.sh
       - name: Build IPA
         run: tools/build-ipa.sh
       - uses: actions/cache/save@v4

@@ -64,6 +64,10 @@ cache keys include the relevant source pins, recipes and build environment.
 Unrelated workflow edits do not invalidate LLVM or FEX. CI accepts a complete
 restored FEX/DXMT output set; LLVM also checks its archive checksum list and
 required headers. Its source-header cache does not need an LLVM Git checkout.
+Each native stage also retains its outputs for one day as an artifact in the
+same workflow run. If its cache is unavailable, the app first downloads that
+stage's artifact for the planned SDK. If both stores are unavailable, it rebuilds
+the missing component. This follows [Iridium's completed-component handoff](https://github.com/intraducine/iridium/blob/901c6ee74817dbcc377c99620108bcec0a72c15b/.github/workflows/build-unsigned-ipa.yml).
 Local source builds keep their normal incremental path.
 
 CI keeps separate caches for LLVM, FEX, the 32-bit Windows DLLs, the MinGW
