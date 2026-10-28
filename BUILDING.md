@@ -50,7 +50,8 @@ An existing archive alone does not skip these local source builds.
 
 GitHub Actions runs once for each PR update, on every push to main, and on manual
 requests. Documentation changes also start a run. A newer run cancels an older
-run for the same PR or branch.
+run for the same PR or branch. Build copies under `codex/pr-build-*` also run on
+push, so a PR head with merge conflicts can still produce an IPA.
 
 CI can reuse a completed IPA when the checked-out Git tree, runner platform,
 Xcode/SDK/compiler identity, runner image and build flags match. The Git tree

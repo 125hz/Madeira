@@ -10,6 +10,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[2]
 server = (root / 'build/wineserver/build.sh').read_text()
+fresh_base = '# Full builds must not reuse objects from a different Wine protocol revision.' in server
 selection = server[server.index('PATCHED_FILES=('):server.index('echo "=== Building kill wrapper')]
 
 with tempfile.TemporaryDirectory(prefix='madeira-bootstrap-') as t:
@@ -33,14 +34,26 @@ ar() { touch "$2"; }
     assert trace.read_text().splitlines() == ['atom', 'new_server_source']
     print('PASS: new upstream sources enter the base; replacement objects stay out')
     trace.unlink()
-    assert run().returncode == 0 and not trace.exists()
-    print('PASS: an existing base does not recompile unchanged sources')
+    assert run().returncode == 0
+    if fresh_base:
+        assert trace.read_text().splitlines() == ['atom', 'new_server_source']
+        trace.unlink()
+        print('PASS: a protocol-sensitive full build recompiles the base')
+    else:
+        assert not trace.exists()
+        print('PASS: an existing base does not recompile unchanged sources')
     (obj / 'libwineserver.a').unlink()
     assert run('request').returncode != 0 and not trace.exists()
     print('PASS: a partial first build refuses an incomplete base')
     app.write_bytes(b'previous base')
-    assert run().returncode == 0 and (obj / 'libwineserver.a').read_bytes() == app.read_bytes()
-    print('PASS: the existing app archive remains a valid incremental source')
+    assert run().returncode == 0
+    if fresh_base:
+        assert trace.read_text().splitlines() == ['atom', 'new_server_source']
+        assert app.read_bytes() == b'previous base'
+        print('PASS: protocol-sensitive builds preserve the old app archive and compile a fresh base')
+    else:
+        assert (obj / 'libwineserver.a').read_bytes() == app.read_bytes()
+        print('PASS: the existing app archive remains a valid incremental source')
     app.unlink(); (obj / 'libwineserver.a').unlink()
     makefile.write_text('SOURCES =\n')
     assert run().returncode != 0 and not (obj / 'libwineserver.a').exists()
@@ -107,5 +120,8 @@ ar() { touch "$2"; }
 for relative in ['build/wineserver/build.sh', 'build/dxmt-ios/build.sh', 'build/fex-ios/build.sh',
                  'build/fex-arm64ec/build.sh', 'build/freetype-ios/build.sh',
                  'build/llvm-ios/build.sh', 'build/wine-macos/configure.sh']:
-    subprocess.run(['bash', '-n', str(root / relative)], check=True)
+    if (root / relative).exists():
+        subprocess.run(['bash', '-n', str(root / relative)], check=True)
+    else:
+        assert relative in ['build/llvm-ios/build.sh', 'build/wine-macos/configure.sh'], relative
 print('PASS: combined build scripts pass Bash syntax checks')
