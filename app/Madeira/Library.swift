@@ -3112,7 +3112,7 @@ struct LibraryView: View {
             if settingsShow("JIT", "StikDebug", "built-in", "pairing", "LocalDevVPN") {
                 JITSettingsSection()
             }
-            if settingsShow("signing", "expires", "refresh", "Apple", "sign-in", "7 days") { SigningSettingsSection() }
+            if SigningRefresh.enabled, settingsShow("signing", "expires", "refresh", "Apple", "sign-in", "7 days") { SigningSettingsSection() }
             if settingsShow("diagnostics", "extended logging", "logging", "log") {
                 Section {
                     Toggle("Extended logging", isOn: $input.diagnostics)
