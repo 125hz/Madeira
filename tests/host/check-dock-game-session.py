@@ -22,6 +22,7 @@ def check(cond, text):
 
 session = (ROOT / 'app/Madeira/DockGameSession.swift').read_text(encoding='utf-8')
 content = (ROOT / 'app/Madeira/ContentView.swift').read_text(encoding='utf-8')
+lib_src = (ROOT / 'app/Madeira/Library.swift').read_text(encoding='utf-8')
 dock = (ROOT / 'app/Madeira/MadeiraDock.swift').read_text(encoding='utf-8')
 docs = (ROOT / 'docs/MADEIRA_DOCK.md').read_text(encoding='utf-8')
 pbx = (ROOT / 'app/Madeira.xcodeproj/project.pbxproj').read_text(encoding='utf-8')
@@ -59,6 +60,12 @@ check(content.count('unsetenv("MADEIRA_MADSYNC_SESSION")') >= 1, 'the variable i
 check(re.search(r'if scmServerSync, !DockInstallers\.serverSync, getenv\("MADEIRA_FASTSYNC"\) == nil,\s*'
                 r'MadeiraConfig\.flag\("MADEIRA_DOCK_GAME_SCM_FASTSYNC"\) \{[^\n]*//[^\n]*\n\s*setenv\("MADEIRA_FASTSYNC", "auto", 1\)', content) is not None,
       'a game session that gives madsync up for the service manager runs fastsync, unless the game set its own value (0 keeps Wine sync)')
+check(re.search(r'DockGameSession\.fastsyncInMadsyncsPlace = false\s*if DockInstallers\.serverSync \|\| scmServerSync \{', content) is not None
+      and re.search(r'setenv\("MADEIRA_FASTSYNC", "auto", 1\)\s*DockGameSession\.fastsyncInMadsyncsPlace = true', content) is not None,
+      'the launch profile is told when fastsync runs in madsync\'s place (cleared for every other Dock session)')
+check('let dockFastsync = DockGameSession.fastsyncInMadsyncsPlace' in lib_src
+      and 'if SyncEngine.current == .fastsync || dockFastsync {' in lib_src,
+      'the game\'s own fastsync switches (fast semaphore waits) apply in that session too')
 check('logStore.log(decision.logLine)' in content or 'logStore.log(scm.logLine)' in content,
       'the decision is logged ([dock-game-scm])')
 allowed = dock[dock.index('static let reportAllowed'):dock.index('static let reportRounds')]

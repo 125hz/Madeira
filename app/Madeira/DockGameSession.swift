@@ -19,6 +19,11 @@ import Foundation
 /// launcher's service would still fail; and (2) export an explicit `0`/`1` to the host and
 /// log why (`[dock-game-scm]`). The host's own count then agrees with the app's.
 enum DockGameSession {
+    /// Set by the Dock launch when its session runs fastsync in madsync's place
+    /// (`MADEIRA_DOCK_GAME_SCM_FASTSYNC`); the launch profile reads it once, so the game's
+    /// own fastsync switches (Game details › Fast semaphore waits) apply as under Fastsync.
+    static var fastsyncInMadsyncsPlace = false
+
     /// `MADEIRA_DOCK_GAME_SCM`: `0` off, `1` on, anything else or unset: decided from the registry.
     enum Mode: String, Equatable { case off, on, auto }
 

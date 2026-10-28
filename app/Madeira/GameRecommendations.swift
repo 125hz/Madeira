@@ -310,8 +310,12 @@ enum GameRecommendations {
     /// fell below what the game used (2.6 GB at the end), so on a device with less
     /// than 12 GB of RAM its trim starts earlier (`gta5EnhancedSmallRAMLines`).
     /// Version 7 (log 98): that trim started too early; see `gta5EnhancedSmallRAMLines`.
+    /// Version 8 (log 103, an 8 GB phone): semaphores on fastsync's cells in a Dock
+    /// session too (~14,000 server requests a second were semaphore waits and releases),
+    /// and lean diagnostics: the thread samplers suspended every thread several times
+    /// every 20 s while the CPU was already clamped to 1.31 GHz.
     static let gta5EnhancedSteam = GameRecommendation(
-        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 7,
+        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 8,
         config: """
         # Madeira's recommended settings for GTA V Enhanced (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -351,6 +355,8 @@ enum GameRecommendations {
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_PAD_MODE = hid
         env.MADEIRA_METAL_HUD_MAIN = 1
+        env.MADEIRA_FASTSYNC_SEM = 1
+        env.MADEIRA_LEAN_DIAG = 1
         # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
@@ -369,8 +375,12 @@ enum GameRecommendations {
     /// textures, then stopped streaming (no disk reads, one thread yielding ~34k/s)
     /// and froze for tens of seconds at a time. From 2560 below the limit the budget
     /// stays above 2 GB up to a 5.5 GB footprint and reaches what Metal holds only
-    /// near the kill line.
-    static let gta5EnhancedSmallRAMLines = "vram-trim-mb = 2560"
+    /// near the kill line. Log 103: the phone itself ran out of RAM (host free ~100 MB
+    /// for minutes, 6 GB of the app compressed, the donor pool at 3.6 GB) and the
+    /// session was killed under critical pressure. With donor-pool-guard = 1 a
+    /// critical-pressure notification sends the 64-bit title's new memory to the swap
+    /// file, which the kernel can page out, instead of more donated RAM.
+    static let gta5EnhancedSmallRAMLines = "vram-trim-mb = 2560\ndonor-pool-guard = 1"
 
     /// GTA V Legacy from Steam (App ID 271590, DirectX 11 through DXMT): the
     /// Enhanced list without its D3D12 lines and its DualSense mode (Legacy takes
@@ -536,9 +546,10 @@ enum GameRecommendations {
     /// for the Steam copy. Version 4: the pipeline archive, as for the Steam copy.
     /// Version 5: shared argument-ring chunks and, under 12 GB of RAM, the earlier
     /// video-budget trim, as for the Steam copy. Version 6: that trim later, as for
-    /// the Steam copy's version 7.
+    /// the Steam copy's version 7. Version 7: lean diagnostics, as for the Steam copy's
+    /// version 8.
     static let gta5EnhancedOther = GameRecommendation(
-        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 6,
+        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 7,
         config: """
         # Madeira's recommended settings for GTA V Enhanced outside Steam (Rockstar Games Launcher or another store).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -562,6 +573,7 @@ enum GameRecommendations {
         env.FEX_VECTORTSOENABLED = 0
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_LEAN_DIAG = 1
         # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2

@@ -269,17 +269,23 @@ for ident in ('gta5e-steam', 'gta5e-other', 'rdr2-steam', 'rdr2-other', 'horizon
 # Version 5 / 4: compiled pipelines kept in archives of our own (pso-archive).
 # Version 6 / 5 (log 97, an 8 GB phone killed at its limit with Metal at 2.1 GB): shared argument-ring
 # chunks, and under 12 GB of RAM the video budget's trim starts 3584 MB below the limit.
-assert presets['gta5e-steam']['version'] == 7 and presets['gta5e-other']['version'] == 6, \
+# Versions 8 / 7 (log 103): lean diagnostics, and the Steam copy's semaphores on fastsync's cells in a
+# Dock session too.
+assert presets['gta5e-steam']['version'] == 8 and presets['gta5e-other']['version'] == 7, \
     (presets['gta5e-steam']['version'], presets['gta5e-other']['version'])
+assert 'env.MADEIRA_FASTSYNC_SEM = 1' in gta['lines']
 for ident in ('gta5e-steam', 'gta5e-other'):
     assert 'pso-async = 1' in presets[ident]['lines'], ident
     assert 'pso-archive = 1' in presets[ident]['lines'], ident
     assert 'ring-share = 1' in presets[ident]['lines'], ident
+    assert 'env.MADEIRA_LEAN_DIAG = 1' in presets[ident]['lines'], ident
     assert 'smallRAMConfig: gta5EnhancedSmallRAMLines' in presets[ident]['switches'], ident
-    assert not any(l.startswith('vram-trim-mb') for l in presets[ident]['lines']), ident   # small devices only
+    assert not any(l.startswith('vram-trim-mb') or l.startswith('donor-pool-guard')
+                   for l in presets[ident]['lines']), ident   # small devices only
 # Versions 7/6 (log 98): from 3584 the budget fell below the Metal usage the game could not shed and it
-# stopped streaming; the trim starts 2560 MB below the limit.
-assert 'static let gta5EnhancedSmallRAMLines = "vram-trim-mb = 2560"' in lists_src
+# stopped streaming; the trim starts 2560 MB below the limit. Versions 8/7 (log 103, the phone out of
+# RAM): critical pressure sends the 64-bit title's new memory to the swap file, not more donated RAM.
+assert 'static let gta5EnhancedSmallRAMLines = "vram-trim-mb = 2560\\ndonor-pool-guard = 1"' in lists_src
 for ident in ('rdr2-steam', 'rdr2-other', 'gta5e-steam'):
     assert 'env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist' in presets[ident]['lines'], ident
 assert 'resolution: "1280x720"' in presets['ghost-of-tsushima']['switches'] and 'avx: true' in presets['ghost-of-tsushima']['switches']

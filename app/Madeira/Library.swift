@@ -673,9 +673,13 @@ struct LibraryEntry: Codable, Identifiable {
             unsetenv("DXMT_WSI_MONITOR_IDENTITY")
             unsetenv("DXMT_WSI_MODE_TABLE")
         }
-        // Fastsync's per-game switches, only when Settings chose Fastsync; with Madsync
-        // (the default) or Wine's standard sync nothing is exported here.
-        if SyncEngine.current == .fastsync {
+        // Fastsync's per-game switches, only when Settings chose Fastsync or a Dock session
+        // runs it in madsync's place; with Madsync (the default) or Wine's standard sync
+        // nothing is exported here. Device log 2026-10-28: the Dock session's fastsync left
+        // semaphores with the server (~14,000 requests a second) with the game's switch on.
+        let dockFastsync = DockGameSession.fastsyncInMadsyncsPlace
+        DockGameSession.fastsyncInMadsyncsPlace = false
+        if SyncEngine.current == .fastsync || dockFastsync {
             let mode = MadeiraConfig.get("env.MADEIRA_FASTSYNC") ?? "auto"
             setenv("MADEIRA_FASTSYNC", fastSync == false ? "0" : mode, 1)
             // Only a game's own choice; otherwise madeira.cfg's env.MADEIRA_FASTSYNC_SEM applies.

@@ -3574,6 +3574,7 @@ struct ContentView: View {
             // Only a start that runs installers, or one that starts the service manager, turns
             // madsync off, for its own session (build/madsync/madsync.c reads
             // MADEIRA_MADSYNC_SESSION once, when the server starts).
+            DockGameSession.fastsyncInMadsyncsPlace = false
             if DockInstallers.serverSync || scmServerSync {
                 setenv("MADEIRA_MADSYNC_SESSION", "0", 1)
                 logStore.log(DockInstallers.serverSync
@@ -3586,6 +3587,7 @@ struct ContentView: View {
                 if scmServerSync, !DockInstallers.serverSync, getenv("MADEIRA_FASTSYNC") == nil,
                    MadeiraConfig.flag("MADEIRA_DOCK_GAME_SCM_FASTSYNC") {   // 0: such a session runs Wine's standard sync, as before 2026-10-28
                     setenv("MADEIRA_FASTSYNC", "auto", 1)
+                    DockGameSession.fastsyncInMadsyncsPlace = true   // the launch profile then applies the game's fastsync switches
                     logStore.log("[dock-game-scm] fastsync for this session in madsync's place (MADEIRA_FASTSYNC=auto; env.MADEIRA_DOCK_GAME_SCM_FASTSYNC = 0 keeps Wine's standard sync)")
                 }
             } else {
