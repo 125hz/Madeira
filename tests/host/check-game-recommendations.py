@@ -115,8 +115,11 @@ assert 'static var bigPictureEntry: LibraryEntry' in library and 'relativePath: 
     and 'entry.bigPicture = true' in library and 'entry.launchMode = "desktop"' in library, 'the library offers the Big Picture entry (desktop-mode batch)'
 assert 'if bigPicture == true { Self.writeBigPictureBatch() }' in library and '-bigpicture -no-cef-sandbox -cef-disable-gpu' in library, \
     'the batch (services.exe, then steam.exe -bigpicture) is written at every launch'
-assert 'if LibraryEntry.steamClientInstalled {' in library and 'Label("Big Picture", systemImage: "gamecontroller")' in library, \
-    'the Big Picture button sits beside the Desktop button once steam.exe is installed'
+assert 'if LibraryEntry.bigPictureShown, LibraryEntry.steamClientInstalled {' in library and 'Label("Big Picture", systemImage: "gamecontroller")' in library, \
+    'with env.MADEIRA_BIG_PICTURE = 1, the Big Picture button sits beside the Desktop button once steam.exe is installed'
+assert 'MadeiraConfig.flag("MADEIRA_BIG_PICTURE", fallback: false)' in library \
+    and library.count('$0.desktop != true && $0.listedInLibrary') == 2 and 'entry.desktop != true && entry.listedInLibrary' in library, \
+    'Big Picture is off by default: no button and no Big Picture card in the library'
 
 # madeira-bcd's defaults where upstream's differ: every game madeira-bcd ran had them,
 # so every game's own list ends with them. The standard list reaches every other game

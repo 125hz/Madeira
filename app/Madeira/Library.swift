@@ -531,6 +531,11 @@ struct LibraryEntry: Codable, Identifiable {
         let prefix = documents.appendingPathComponent("wine").path
         return ("C:\\Program Files\\Steam Big Picture", "\(prefix)/drive_c/Program Files/Steam Big Picture")
     }
+    /// Off by default: no Big Picture button beside Desktop and no Big Picture card in the
+    /// library. env.MADEIRA_BIG_PICTURE = 1 brings both back.
+    static var bigPictureShown: Bool { MadeiraConfig.flag("MADEIRA_BIG_PICTURE", fallback: false) }   // 1: the library offers Valve's client in Big Picture beside Desktop
+    /// Whether the library lists this entry: a Big Picture entry only while Big Picture is shown.
+    var listedInLibrary: Bool { bigPicture != true || Self.bigPictureShown }
     /// The button is offered when Big Picture's folder has a client, or the Dock's steam.exe
     /// can seed one.
     static var steamClientInstalled: Bool {
@@ -2814,7 +2819,7 @@ struct LibraryGroupedGames<LocalCell: View>: View {
         var result = Sources()
         let query = search.trimmingCharacters(in: .whitespaces)
         var steamEntries: [Int: (position: Int, entry: LibraryEntry)] = [:]
-        for (position, entry) in library.entries.enumerated() where entry.desktop != true {
+        for (position, entry) in library.entries.enumerated() where entry.desktop != true && entry.listedInLibrary {
             if let appID = entry.steamAppID { steamEntries[appID] = (position, entry) }
             else if query.isEmpty || entry.title.localizedCaseInsensitiveContains(query) {
                 result.entries[entry.id] = entry
@@ -2956,7 +2961,7 @@ struct LibraryView: View {
     @ObservedObject private var steamLibrary = SteamOwnedLibrary.shared
     private var entries: [LibraryEntry] {
         // Steam games are listed in their own section (SteamGames.swift).
-        let visible = model.entries.filter { $0.desktop != true && $0.steamAppID == nil && $0.epicAppName == nil && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
+        let visible = model.entries.filter { $0.desktop != true && $0.listedInLibrary && $0.steamAppID == nil && $0.epicAppName == nil && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
         if sort == "added" { return visible.reversed() }
         return visible.sorted {
             if sort == "played", $0.lastPlayed != $1.lastPlayed { return ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
@@ -3252,7 +3257,7 @@ struct LibraryView: View {
                         SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
                                           part: steamFirst ? .notInstalled : .all, open: { selected = $0 })
                     }
-                } else if model.entries.filter({ $0.desktop != true && $0.steamAppID == nil && $0.epicAppName == nil }).isEmpty {
+                } else if model.entries.filter({ $0.desktop != true && $0.listedInLibrary && $0.steamAppID == nil && $0.epicAppName == nil }).isEmpty {
                     ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
                 } else {
                     cells(entries, width: viewport.size.width)
@@ -3322,7 +3327,7 @@ struct LibraryView: View {
                 .id(LibraryEntry.desktopID)
                 .overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == LibraryEntry.desktopID && controller.connected ? Color.cyan : .clear, lineWidth: 3))
             // ml2021: Valve's client in Big Picture, beside the Desktop, once Steam is installed in the prefix.
-            if LibraryEntry.steamClientInstalled {
+            if LibraryEntry.bigPictureShown, LibraryEntry.steamClientInstalled {
                 Button { selected = model.entries.first(where: { $0.bigPicture == true }) ?? .bigPictureEntry } label: {
                     if liquidMetal.on {
                         let light = colorScheme == .light

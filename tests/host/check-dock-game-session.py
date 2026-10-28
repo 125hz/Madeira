@@ -56,6 +56,9 @@ check('DockGameSession.isMicrosoftKey(' in installers and 'thirdPartyInstalls = 
 check(re.search(r'if DockInstallers\.serverSync \|\| \w+ \{\s*setenv\("MADEIRA_MADSYNC_SESSION", "0", 1\)', content) is not None,
       'MADEIRA_MADSYNC_SESSION=0 is set for the installers case or the service-manager case, never otherwise')
 check(content.count('unsetenv("MADEIRA_MADSYNC_SESSION")') >= 1, 'the variable is cleared for every other session')
+check(re.search(r'if scmServerSync, !DockInstallers\.serverSync, getenv\("MADEIRA_FASTSYNC"\) == nil,\s*'
+                r'MadeiraConfig\.flag\("MADEIRA_DOCK_GAME_SCM_FASTSYNC"\) \{[^\n]*//[^\n]*\n\s*setenv\("MADEIRA_FASTSYNC", "auto", 1\)', content) is not None,
+      'a game session that gives madsync up for the service manager runs fastsync, unless the game set its own value (0 keeps Wine sync)')
 check('logStore.log(decision.logLine)' in content or 'logStore.log(scm.logLine)' in content,
       'the decision is logged ([dock-game-scm])')
 allowed = dock[dock.index('static let reportAllowed'):dock.index('static let reportRounds')]
@@ -73,7 +76,7 @@ check(re.search(r'getenv\("MADEIRA_DOCK_GAME_SCM"\)[^\n]*//', session) is not No
 catalog = ROOT / 'app/Madeira/ConfigCatalog.generated.swift'
 if catalog.exists():
     text = catalog.read_text(encoding='utf-8')
-    for key in ['env.MADEIRA_DOCK_GAME_SCM', 'env.MADEIRA_DOCK_GAME_SCM_SERVER_SYNC', 'env.MADEIRA_WOW_HOLD_WINDOWS',
+    for key in ['env.MADEIRA_DOCK_GAME_SCM', 'env.MADEIRA_DOCK_GAME_SCM_FASTSYNC', 'env.MADEIRA_DOCK_GAME_SCM_SERVER_SYNC', 'env.MADEIRA_WOW_HOLD_WINDOWS',
                 'env.MADEIRA_WOW_PRESSURE_RELEASE_MB']:
         check(f'key: "{key}"' in text, f'the config catalog documents {key}')
 host_launch = ROOT / 'madeira-dock/src/launch.c'
