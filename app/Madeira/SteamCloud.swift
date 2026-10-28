@@ -235,9 +235,12 @@ struct SteamCloudAudit: Equatable, Sendable {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         var hasher = Insecure.SHA1()
-        while true {
-            guard let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty else { break }
-            hasher.update(data: chunk)
+        do {
+            while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+                hasher.update(data: chunk)
+            }
+        } catch {
+            return nil  // A partial digest is not a checksum of this save.
         }
         return Data(hasher.finalize())
     }
@@ -658,6 +661,8 @@ struct SteamCloudPlan: Equatable, Sendable {
             case .same:
                 plan.settled[entry.key] = hex(entry.cloudSHA)
             case .differ:
+                // Without a complete local checksum neither side can be chosen automatically.
+                guard !entry.localSHA.isEmpty else { plan.conflicts.append(entry); continue }
                 // A save that was missing here and is back is a new file, not a
                 // change of the synced one: never copied over the cloud's unasked.
                 let cloud = hex(entry.cloudSHA), local = hex(entry.localSHA)

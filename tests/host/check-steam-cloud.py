@@ -131,6 +131,11 @@ check(only(plan(e(.differ, cloud: 1, local: 9), SteamCloudPlan.missingMark + hex
       "a save that reappears after it went missing: a choice, never uploaded unasked")
 check(only(plan(e(.differ, cloud: 2, local: 9), SteamCloudPlan.missingMark + hex(1))) == "ask", "  also when the cloud moved on")
 
+// No complete local hash is not evidence of a local edit. Do not transfer automatically.
+check(only(plan(e(.differ, cloud: 1), hex(1))) == "ask", "unreadable local save with unchanged cloud: no automatic upload")
+check(only(plan(e(.differ, cloud: 2), hex(1))) == "ask", "unreadable local save with changed cloud: no automatic download")
+check(only(plan(e(.localOnly), nil)) == "nothing", "unreadable local-only save: no upload")
+
 // The user chose to leave it missing.
 let deleted = SteamCloudPlan.deletedMark + hex(1)
 check(only(plan(e(.cloudOnly, cloud: 1), deleted)) == "nothing", "left missing by choice: not asked again")
@@ -161,14 +166,46 @@ let listed = SteamCloudFile(prefix: "%GameInstall%savedata/\(steamID)/", name: "
                             timestamp: 1, size: UInt64(bytes.count), persistState: 0)
 let both = SteamCloudAudit.run(listing: SteamCloudListing(files: [listed]), saveFiles: ufs, paths: paths)
 check(both.entries.count == 1 && both.entries[0].kind == .same, "  and once the cloud lists it under that name, the two are the same file")
+// Directory/missing inputs must not become digests; the empty regular file is distinct.
+check(SteamCloudAudit.sha1(of: saves) == nil, "directory input returns no digest")
+check(SteamCloudAudit.sha1(of: saves.appendingPathComponent("absent")) == nil, "open error returns no digest")
+let empty = saves.appendingPathComponent("empty.sav")
+try! Data().write(to: empty)
+check(SteamCloudAudit.sha1(of: empty) == Data(Insecure.SHA1.hash(data: Data())), "empty regular file still has its valid SHA-1")
+let largeBytes = Data((0..<(2 * 1024 * 1024 + 37)).map { UInt8(truncatingIfNeeded: $0) })
+let large = saves.appendingPathComponent("large.sav")
+try! largeBytes.write(to: large)
+check(SteamCloudAudit.sha1(of: large) == Data(Insecure.SHA1.hash(data: largeBytes)), "multi-chunk file hash includes the final short read")
 try? FileManager.default.removeItem(at: tmp)
 
 exit(failed == 0 ? 0 : 1)
 '''
 
+# Inject a read error after one successful chunk into a second copy of the
+# production hash routine. Normal filesystem checks above use Foundation.FileHandle.
+hash_code = compare[compare.index('    static func sha1('):compare.index('    private static func attributes(')]
+fault_probe = r'''
+final class FaultHandle {
+    static var reads = 0
+    init(forReadingFrom url: URL) throws {}
+    func close() throws {}
+    func read(upToCount count: Int) throws -> Data? {
+        Self.reads += 1
+        if Self.reads == 1 { return Data("partial save bytes".utf8) }
+        throw CocoaError(.fileReadUnknown)
+    }
+}
+enum ReadFailureProbe {
+''' + hash_code.replace('FileHandle(forReadingFrom:', 'FaultHandle(forReadingFrom:') + r'''
+}
+'''
+main = main.replace('exit(failed == 0 ? 0 : 1)', '''check(ReadFailureProbe.sha1(of: saves) == nil && FaultHandle.reads == 2,
+      "read failure after a successful chunk discards the partial digest")
+exit(failed == 0 ? 0 : 1)''')
+
 with tempfile.TemporaryDirectory() as tmp:
     src = Path(tmp) / 'main.swift'
-    src.write_text('import Foundation\nimport CryptoKit\n' + compare + '\n' + plan + '\n' + main.replace('import Foundation\n', '', 1))
+    src.write_text('import Foundation\nimport CryptoKit\n' + compare + '\n' + plan + '\n' + fault_probe + '\n' + main.replace('import Foundation\n', '', 1))
     out = Path(tmp) / 'cloud'
     build = subprocess.run([SWIFTC, '-O', str(src), '-o', str(out)], capture_output=True, text=True)
     if build.returncode != 0:
