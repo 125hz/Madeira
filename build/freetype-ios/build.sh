@@ -18,6 +18,7 @@ if [ ! -f "$SRC/CMakeLists.txt" ]; then
     git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git "$SRC"
 fi
 
+
 cmake -S "$SRC" -B "$BUILD_DIR/build" -G "Unix Makefiles" \
   -DCMAKE_SYSTEM_NAME=iOS \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \

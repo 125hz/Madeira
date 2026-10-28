@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A1000E07 /* EpicCloudSaves.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E07 /* EpicCloudSaves.swift */; };
+		A1000E06 /* EpicCloud.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E06 /* EpicCloud.swift */; };
 		A1000520 /* MadeiraDock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000520 /* MadeiraDock.swift */; };
 		A1000521 /* MadeiraDockView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000521 /* MadeiraDockView.swift */; };
 		A1000650 /* DockStartScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000650 /* DockStartScreen.swift */; };
@@ -26,6 +28,11 @@
 		A1000921 /* ExternalStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000921 /* ExternalStorage.swift */; };
 		A1000710 /* SavesAndShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000710 /* SavesAndShortcuts.swift */; };
 		A1000711 /* WineMono.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000711 /* WineMono.swift */; };
+		A1000E01 /* EpicLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E01 /* EpicLibrary.swift */; };
+		A1000E02 /* EpicGames.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E02 /* EpicGames.swift */; };
+		A1000E03 /* SwiftEpic/EpicAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E03 /* EpicAPI.swift */; };
+		A1000E04 /* SwiftEpic/EpicFormats.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E04 /* EpicFormats.swift */; };
+		A1000E05 /* SwiftEpic/EpicDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000E05 /* EpicDownloader.swift */; };
 		A1000602 /* SteamDownloadBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000602 /* SteamDownloadBackground.swift */; };
 		A1000600 /* SteamInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000600 /* SteamInstall.swift */; };
 		A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000609 /* ContentDecryptor.swift */; };
@@ -211,6 +218,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A2000E07 /* EpicCloudSaves.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftEpic/EpicCloudSaves.swift"; sourceTree = "<group>"; };
+		A2000E06 /* EpicCloud.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "EpicCloud.swift"; sourceTree = "<group>"; };
 		A2000520 /* MadeiraDock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MadeiraDock.swift"; sourceTree = "<group>"; };
 		A2000521 /* MadeiraDockView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MadeiraDockView.swift"; sourceTree = "<group>"; };
 		A2000650 /* DockStartScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DockStartScreen.swift"; sourceTree = "<group>"; };
@@ -230,6 +239,11 @@
 		A2000921 /* ExternalStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ExternalStorage.swift"; sourceTree = "<group>"; };
 		A2000710 /* SavesAndShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SavesAndShortcuts.swift"; sourceTree = "<group>"; };
 		A2000711 /* WineMono.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "WineMono.swift"; sourceTree = "<group>"; };
+		A2000E01 /* EpicLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "EpicLibrary.swift"; sourceTree = "<group>"; };
+		A2000E02 /* EpicGames.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "EpicGames.swift"; sourceTree = "<group>"; };
+		A2000E03 /* EpicAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftEpic/EpicAPI.swift"; sourceTree = "<group>"; };
+		A2000E04 /* EpicFormats.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftEpic/EpicFormats.swift"; sourceTree = "<group>"; };
+		A2000E05 /* EpicDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftEpic/EpicDownloader.swift"; sourceTree = "<group>"; };
 		A2000602 /* SteamDownloadBackground.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamDownloadBackground.swift"; sourceTree = "<group>"; };
 		A2000600 /* SteamInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamInstall.swift"; sourceTree = "<group>"; };
 		A2000609 /* ContentDecryptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/ContentDecryptor.swift"; sourceTree = "<group>"; };
@@ -483,6 +497,13 @@
 				A2000921 /* ExternalStorage.swift */,
 				A2000710 /* SavesAndShortcuts.swift */,
 				A2000711 /* WineMono.swift */,
+				A2000E01 /* EpicLibrary.swift */,
+				A2000E02 /* EpicGames.swift */,
+				A2000E03 /* EpicAPI.swift */,
+				A2000E04 /* EpicFormats.swift */,
+				A2000E05 /* EpicDownloader.swift */,
+				A2000E07 /* EpicCloudSaves.swift */,
+				A2000E06 /* EpicCloud.swift */,
 				A2000602 /* SteamDownloadBackground.swift */,
 				A2000600 /* SteamInstall.swift */,
 				A2000609 /* ContentDecryptor.swift */,
@@ -851,6 +872,13 @@
 				A1000921 /* ExternalStorage.swift in Sources */,
 				A1000710 /* SavesAndShortcuts.swift in Sources */,
 				A1000711 /* WineMono.swift in Sources */,
+				A1000E01 /* EpicLibrary.swift in Sources */,
+				A1000E02 /* EpicGames.swift in Sources */,
+				A1000E03 /* SwiftEpic/EpicAPI.swift in Sources */,
+				A1000E04 /* SwiftEpic/EpicFormats.swift in Sources */,
+				A1000E05 /* SwiftEpic/EpicDownloader.swift in Sources */,
+				A1000E07 /* EpicCloudSaves.swift in Sources */,
+				A1000E06 /* EpicCloud.swift in Sources */,
 				A1000602 /* SteamDownloadBackground.swift in Sources */,
 				A1000600 /* SteamInstall.swift in Sources */,
 				A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */,

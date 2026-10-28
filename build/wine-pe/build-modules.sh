@@ -21,6 +21,8 @@
 #                                  delay-loads SystemFunction032 from it
 #   xaudio2_7                      the prefix registers CLSID_XAudio2 (2.7) at
 #                                  system32\xaudio2_7.dll
+#   faultrep                       Rocket League stopped at load with c0000135
+#                                  without it (RocketLeague.exe imports it)
 # and GAME_MODULES below: builtins games or their installers import that the
 # farm does not have (without one the loader stops with STATUS_DLL_NOT_FOUND
 # before the program runs). Every module built here links its delay imports
@@ -47,6 +49,7 @@ STRIP="$TC/arm64ec-w64-mingw32-strip"
 case "${1:-}" in
     -h|--help) sed -n '2,/^set -eu/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
 esac
+[ $# -gt 0 ] || set -- cryptsp d3dx11_43 faultrep msvcp110 msvcr110 xaudio2_7
 # Builtins for games and their installers (the madeira-bcd fork has shipped
 # them, built from this submodule the same way, since 2026-09-26):
 #   msvcr70-msvcr100, msvcrt20, msvcrt40, msvcirt, msvcp60-msvcp100, msvcp120

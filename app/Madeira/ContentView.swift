@@ -2190,6 +2190,7 @@ struct ContentView: View {
         .sheet(item: $devSheet) { sheet in
             switch sheet {
             case .steamSignIn: SteamSignInView()
+            case .epicSignIn: EpicSignInView()
             case .dock: MadeiraDockView { startDock($0, compactPool: $1) }
             case .allSettings: AllSettingsView()
             }
@@ -2598,9 +2599,29 @@ struct ContentView: View {
     }
 
     /// The rest of Play, with JIT on: checks the entry's launch profile and starts it.
-    private func startLibraryEntry(_ entry: LibraryEntry) {
+    /// An Epic game first gets Epic's sign-in arguments with a fresh one-use code
+    /// (EpicLibrary.launchArguments), for this launch only.
+    private func startLibraryEntry(_ entry: LibraryEntry, epicReady: Bool = false) {
+        guard !EpicCloud.shared.isBusy else {
+            library.error = "Wait for Epic Cloud save sync to finish before starting a game."
+            return
+        }
+        if let app = entry.epicAppName, !epicReady {
+            Task { @MainActor in
+                do {
+                    let arguments = try await EpicLibrary.shared.launchArguments(appName: app)
+                    LibraryEntry.setTransientArguments(arguments, for: entry.id)
+                    startLibraryEntry(entry, epicReady: true)
+                } catch {
+                    LogStore.shared.log("[epic-launch] app=\(app) not started: no sign-in arguments", level: .error)
+                    library.error = "This Epic game could not get its sign-in from Epic: \(error.localizedDescription)"
+                }
+            }
+            return
+        }
         do { if entry.desktop != true { _ = try LibraryModel.executable(entry.launchRelativePath) }; try entry.validate() }
         catch {
+            LibraryEntry.setTransientArguments(nil, for: entry.id)
             library.error = error.localizedDescription
             logStore.log("[launch-preflight] profile validation failed: \(error.localizedDescription)", level: .error)
             return
@@ -2608,6 +2629,7 @@ struct ContentView: View {
         // launchArguments carries the whole ml1163 command (explorer's /desktop=, the quoted
         // program, its arguments); validate() and the bridge's tokenizer take 4 KB.
         guard entry.launchWindowsPath.utf8.count < 1024, entry.launchArguments.utf8.count < 4096 else {
+            LibraryEntry.setTransientArguments(nil, for: entry.id)
             library.error = "The executable path or launch arguments are too long."; return
         }
         entry.configureLaunch()
@@ -2666,6 +2688,7 @@ struct ContentView: View {
         // Steam downloads wait for the session, and the app's own Steam connection closes
         // before Valve's client signs in with the same account (SteamOwnedLibrary).
         SteamOwnedLibrary.shared.sessionChanged(active: true)
+        EpicLibrary.shared.sessionChanged(active: true)
         /* ml1095: one config file. Written once from any legacy madeira-*.txt. */
         MadeiraConfig.migrateLegacy { self.logStore.log($0) }
         MadeiraConfig.deleteLegacyFiles { self.logStore.log($0) }   /* ml1096: the old files go once the cfg exists */
