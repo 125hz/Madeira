@@ -755,13 +755,37 @@ extern void ios_jit_anon_alias_note_write( unsigned long long addr );
 
 #define IOS_REPLY_PAGE 0x1000   /* guest page: pool ranges and anonymous-RWX aliases are multiples of it */
 
+static BOOL ios_reply_host_writable( uintptr_t addr, size_t size );
+
+/* ml2230 (device log 111): a page the JIT pool gave up (a poisoned range whose non-executable pages were dropped,
+ * no freelist entry and no mapping left) is a hole inside the pool's address range, and the kernel puts other
+ * mappings there: a child process's first thread got its pthread stack in one, and its first server reply into a
+ * stack buffer went to the RW alias of that hole, which is not mapped (rpcss.exe died at boot, the Steam client's
+ * COM call waited for it forever). A pool RX page is never writable at its own address, so a page that is writable
+ * there is stored directly. env.MADEIRA_REPLY_OWN_WRITABLE=0: the pool's address range alone decides, as before. */
+static int ios_reply_own_writable( void )
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_REPLY_OWN_WRITABLE" );   /* 0: a reply into the JIT pool's address range always goes through its RW alias, as before */
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 /* The RW alias of a guest address that is a JIT-pool RX view (not writable at its own address), or 0. */
 static uintptr_t ios_reply_rw_alias( uintptr_t addr )
 {
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
     size_t size = ios_jit_pool_size_global;
 
-    if (rx && rw && size && addr >= rx && addr - rx < size) return rw + (addr - rx);
+    if (rx && rw && size && addr >= rx && addr - rx < size)
+    {
+        uintptr_t page = addr & ~(uintptr_t)(IOS_REPLY_PAGE - 1);
+        if (ios_reply_own_writable() && ios_reply_host_writable( page, IOS_REPLY_PAGE )) return 0;   /* ml2230 */
+        return rw + (addr - rx);
+    }
     return ios_jit_anon_alias_lookup( addr );
 }
 

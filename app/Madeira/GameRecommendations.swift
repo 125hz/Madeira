@@ -1145,8 +1145,13 @@ enum GameRecommendations {
     /// (MADEIRA_STEAM_ALLOW_CRASHPAD; without it the helper ends itself at start), and
     /// Social Club's shared PartitionAlloc pool layout (MADEIRA_SC_PA_POOLS) is gone:
     /// its soft address grants can overlap the client's own views.
+    /// Version 4 (logs 111-112, Big Picture loaded): the UI's JavaScript ran interpreted
+    /// (V8 --jitless, ml476's choice for the old client, whose stalls also had the
+    /// debugger overhead in them) and its renderer thread took most of a core on every
+    /// screen change; V8 compiles again (MADEIRA_JITLESS = 0, set 1 to compare), and CEF's
+    /// verbose file log is off (MADEIRA_CEF_VERBOSE = 0).
     static let steamBigPicture = GameRecommendation(
-        id: "steam-big-picture", title: "Steam Big Picture", version: 3,
+        id: "steam-big-picture", title: "Steam Big Picture", version: 4,
         config: """
         # Madeira's recommended settings for Steam Big Picture.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -1164,6 +1169,8 @@ enum GameRecommendations {
         env.MADEIRA_LOCK_ORPHAN = stamped
         env.MADEIRA_GDI_SHARED_SECTION = 1
         env.MADEIRA_STEAM_ALLOW_CRASHPAD = 1
+        env.MADEIRA_JITLESS = 0
+        env.MADEIRA_CEF_VERBOSE = 0
         env.MADEIRA_TOUCH_MOUSE = 1
         env.MADEIRA_WOW_MIN_FREE_GB = 2
         env.MADEIRA_WOW_PLACEHOLDERS = 1

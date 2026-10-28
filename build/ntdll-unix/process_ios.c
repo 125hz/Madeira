@@ -2290,16 +2290,27 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                  * Interpreted V8 costs 5-20x on all of Steam's UI JavaScript, so
                  * this is the largest single startup lever we have.
                  * MADEIRA_JITLESS=0 turns it off; default stays ON (unchanged). */
+                /* ml2230 (device logs 111-112, Big Picture): CEF's verbose file log (--v=1) writes a line for most
+                 * of what the UI does, from the threads that draw it. env.MADEIRA_CEF_VERBOSE=0 leaves Steam's own
+                 * logging level (WARNING); default 1 keeps the verbose log, as before. */
                 static const char sp_jitless[] = " --single-process --enable-logging=file --v=1 --log-severity=verbose"
                                                  " --no-proxy-server --winhttp-proxy-resolver --js-flags=--jitless";
                 static const char sp_jit[]     = " --single-process --enable-logging=file --v=1 --log-severity=verbose"
                                                  " --no-proxy-server --winhttp-proxy-resolver";
+                static const char sp_quiet_jitless[] = " --single-process --no-proxy-server --winhttp-proxy-resolver"
+                                                       " --js-flags=--jitless";
+                static const char sp_quiet_jit[]     = " --single-process --no-proxy-server --winhttp-proxy-resolver";
                 const char *jl = getenv( "MADEIRA_JITLESS" );
+                const char *cv = getenv( "MADEIRA_CEF_VERBOSE" );   /* 0: Steam's web helper keeps its own log level, no verbose CEF file log */
                 int jitless_on = !(jl && jl[0] == '0');
-                const char *sp = jitless_on ? sp_jitless : sp_jit;
+                int verbose_on = !(cv && cv[0] == '0');
+                const char *sp = verbose_on ? (jitless_on ? sp_jitless : sp_jit)
+                                            : (jitless_on ? sp_quiet_jitless : sp_quiet_jit);
                 dprintf(2, "[proc-gate] V8 %s (MADEIRA_JITLESS=%s) rev=ml526\n",
                         jitless_on ? "JITLESS (interpreted)" : "JIT ENABLED — #82 retest",
                         jl ? jl : "unset");
+                if (!verbose_on)
+                    dprintf(2, "[proc-gate] ml2230 CEF verbose log off (env.MADEIRA_CEF_VERBOSE=0)\n");
                 static const char dfs[] = "--disable-features=";
                 /* ml426 (#70): + segmentation-platform features. Four CreateBrowser
                  * runs died C00000FD in the CreateResponse→BrowserReady gap, and

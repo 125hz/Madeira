@@ -113,13 +113,25 @@ assert titles_src.count('SteamTitle(') == len(MERGED)
 assert 'if last == "big-picture.bat" { return steamBigPicture }' in lists_src
 assert 'static var bigPictureEntry: LibraryEntry' in library and 'relativePath: "big-picture.bat"' in library \
     and 'entry.bigPicture = true' in library and 'entry.launchMode = "desktop"' in library, 'the library offers the Big Picture entry (desktop-mode batch)'
-assert 'if bigPicture == true { Self.writeBigPictureBatch() }' in library and '-bigpicture -no-cef-sandbox -cef-disable-gpu' in library, \
-    'the batch (services.exe, then steam.exe -bigpicture) is written at every launch'
+assert 'if bigPicture == true { Self.writeBigPictureBatch() }' in library \
+    and '-bigpicture -no-cef-sandbox" + (gpu ? "" : " -cef-disable-gpu") + " -console -nocrashmonitor"' in library \
+    and 'MadeiraConfig.flag("MADEIRA_BIG_PICTURE_GPU", fallback: false)' in library, \
+    'the batch (services.exe, then steam.exe -bigpicture) is written at every launch; software drawing unless env.MADEIRA_BIG_PICTURE_GPU = 1'
 # ml2210 (version 3): the 32-bit web helper's crash reporter may start, no Social Club pool layout, and an
 # installed 32-bit client is kept (no bootstrap update) unless env.MADEIRA_BIG_PICTURE_PIN = 0.
+# ml2230 (version 4, logs 111-112): V8 compiles (MADEIRA_JITLESS = 0) and CEF's verbose log is off.
 bp = presets['steam-big-picture']
-assert bp['version'] == 3 and 'env.MADEIRA_STEAM_ALLOW_CRASHPAD = 1' in bp['lines'] \
+assert bp['version'] == 4 and 'env.MADEIRA_STEAM_ALLOW_CRASHPAD = 1' in bp['lines'] \
+    and 'env.MADEIRA_JITLESS = 0' in bp['lines'] and 'env.MADEIRA_CEF_VERBOSE = 0' in bp['lines'] \
     and not any(l.startswith('env.MADEIRA_SC_PA_POOLS') for l in bp['lines']), bp
+# ml2230: Big Picture's libraryfolders.vdf (config/ and steamapps/) gets Madeira's Steam library and the drives'
+# libraries beside its own entries, before each start (env.MADEIRA_BIG_PICTURE_LIBRARIES = 0 leaves them alone).
+assert 'listMadeiraLibraries(in: folder)' in library \
+    and 'MadeiraConfig.flag("MADEIRA_BIG_PICTURE_LIBRARIES", fallback: true)' in library \
+    and 'let libraries = [own, SteamRuntimeFiles.relativeRoot]' in library \
+    and 'for sub in ["config", "steamapps"]' in library \
+    and 'try ExternalSteamLibraries.add(paths: libraries, to: existing)' in library, \
+    'Big Picture lists the games Madeira installed'
 assert 'MadeiraConfig.flag("MADEIRA_BIG_PICTURE_PIN", fallback: true)' in library \
     and 'fm.fileExists(atPath: "\\(folder.unix)/bin/cef/cef.win7/steamwebhelper.exe")' in library \
     and '(pinned ? " -nobootstrapperupdate -skipinitialbootstrap" : "")' in library
