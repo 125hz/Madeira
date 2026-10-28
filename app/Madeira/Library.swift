@@ -190,8 +190,8 @@ struct LibraryEntry: Codable, Identifiable {
     var display: String?
     /// FPS limit: 1 = 60, 3 = 30, 4 = 40, 0 = display maximum, 2 = uncapped (madeira_set_vsync_locked).
     var fpsMode = 1
-    /// FEX's X87ReducedPrecision for this game. Off by default, as in FEX; only
-    /// an explicit choice exports FEX_X87REDUCEDPRECISION=1.
+    /// FEX's X87ReducedPrecision for this game. Export both states explicitly:
+    /// FEX defaults to reduced precision when no override is set.
     var reducedX87 = false
     var liveLogs = false
     var performance = false
@@ -462,15 +462,9 @@ struct LibraryEntry: Codable, Identifiable {
               launchWindowsPath.utf8.count < 1024, (steamWorkingWindowsPath?.utf8.count ?? 0) < 512 else {
             throw LibraryError.message("The saved launch profile contains invalid display or argument values.")
         }
-        var quoted = false, inToken = false, tokens = 0
-        for character in launchArguments {
-            if character == "\"" { quoted.toggle() }
-            if !quoted && (character == " " || character == "\t") { inToken = false }
-            else if !inToken { tokens += 1; inToken = true }
+        guard LaunchArgumentText.valid(launchArguments) else {
+            throw LibraryError.message("Use balanced double quotes, no control characters, and at most 64 launch arguments in 4 KB.")
         }
-        // WineProcessBridge takes at most 64 arguments in 4 KB.
-        guard launchArguments.utf8.count < 4096 else { throw LibraryError.message("The complete launch command is too long.") }
-        guard !quoted, tokens <= 64 else { throw LibraryError.message("Use balanced double quotes and at most 64 launch arguments in total.") }
         // build/madeira_cfg.h reads at most 64 KB of a file.
         guard (config?.utf8.count ?? 0) < 60_000, config?.contains("\0") != true else {
             throw LibraryError.message("This game's config is too long.")
@@ -507,8 +501,7 @@ struct LibraryEntry: Codable, Identifiable {
     /// Runs on the launch worker, before the JIT pool is taken.
     func applyEnvironment() {
         configureLaunch()
-        // Unset unless chosen: FEX's own default then applies, as for any other launch.
-        if reducedX87 { setenv("FEX_X87REDUCEDPRECISION", "1", 1) } else { unsetenv("FEX_X87REDUCEDPRECISION") }
+        setenv("FEX_X87REDUCEDPRECISION", reducedX87 ? "1" : "0", 1)
         // Exported only when chosen: unset keeps the engine's own default (and any
         // madeira.cfg setting), as before these choices existed.
         // Unset otherwise, so a previous game's choice (a launch that died before the
@@ -585,8 +578,10 @@ struct LibraryEntry: Codable, Identifiable {
         }
         let command = desktop == true ? (exe: "explorer.exe", args: launchArguments) : launchCommand
         setenv("MADEIRA_EXE", command.exe, 1)
-        setenv("MADEIRA_ARGS", command.args, 1)
-        if desktop == true || runsInDesktop { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
+        setenv("MADEIRA_ARGS", LaunchArgumentText.plain(command.args), 1)
+        // Export both choices: unsetting Directly lets a global env.MADEIRA_DESKTOP=1
+        // turn the desktop back on when the bridge applies madeira.cfg.
+        setenv("MADEIRA_DESKTOP", desktop == true || runsInDesktop ? "1" : "0", 1)
         if startsSteamGameDirectly, let steamAppID {
             // The game's own Steam identity (SteamAppId, SteamGameId, SteamAppPath = its install
             // folder) instead of the bridge's fixed one.
@@ -729,6 +724,17 @@ final class LibraryModel: ObservableObject {
     }
     @Published var error: String? { didSet { if error != nil { preparing = nil } } }
     @Published var sessionMessage = ""
+    private var smallPoolNoted = false
+    /// Quit game was asked for and the program is still running after `forceCloseAfter`
+    /// seconds: a frozen program never handles Alt+F4, so the menu offers to close Madeira.
+    @Published var forceCloseOffered = false
+    static let forceCloseAfter: TimeInterval = 10
+    /// A Dock session whose game ended: Madeira Dock shut Valve's client down, and
+    /// explorer's desktop is asked to close so the session returns to the library.
+    /// Close Madeira is offered if the session is still up `forceCloseAfter` seconds later.
+    @Published var dockGameEnded = false
+    private var dockGameEndedAt: Date?
+    private var quitRequestedAt: Date?
     @Published var launching = false
     @Published var overlayFields = ["FPS", "Frame time", "RAM", "Battery"]
     private var launchPresent: UInt64 = 0
@@ -756,6 +762,21 @@ final class LibraryModel: ObservableObject {
         LogStore.shared.log("[exit-report] status=0x\(String(status, radix: 16))")
         let kind = status == 0xC0000005 ? " (memory access violation)" : status == 0xC0000017 ? " (out of memory)" : ""
         return "The game stopped with Windows error 0x\(String(status, radix: 16, uppercase: true))\(kind). Export the diagnostic log to report it."
+    }
+    /// A game in a Madeira Dock session asked Steam to start another game (steam://run/<App ID>;
+    /// ntdll refused steam.exe and reported it, WineProcessBridge.m): the next app run starts that
+    /// game (NextSteamApp), since a second session cannot start in this one. Black Ops II's
+    /// campaign does this when the player chooses Zombies.
+    private func steamRunRequest() -> String? {
+        var appID: UInt32 = 0
+        guard !quitRequested, wine_steam_run_request(&appID) != 0 else { return nil }
+        let id = Int(appID)
+        let name = entries.first { $0.steamAppID == id }?.title
+            ?? MadeiraDock.games(drive: MadeiraDock.drive).first { $0.id == id }?.name
+        LogStore.shared.log("[dock-steam-run] the game asked Steam to start app \(id)\(name == nil ? ", which is not installed" : "")")
+        guard let name else { return nil }
+        NextSteamApp.set(id)
+        return "The game asked to start \(name). Madeira runs one game per app session: close Madeira and open it again, and \(name) starts by itself."
     }
     private var readOnly = false
     private var metadataInFlight = Set<UUID>()
@@ -1215,7 +1236,9 @@ final class LibraryModel: ObservableObject {
     /// `dock`: the game a Madeira Dock start launches (DockStartScreen).
     func begin(_ entry: LibraryEntry, remember: Bool = true, dock: DockGame? = nil) {
         wine_exit_status_reset()
+        JITPoolMeter.reset(); smallPoolNoted = false
         quitRequested = false
+ quitRequestedAt = nil; forceCloseOffered = false; dockGameEnded = false; dockGameEndedAt = nil
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
         Self.sessionsThisRun += 1
         launchPresent = madeira_get_present_count(); launchStarted = Date(); launchSlow = false; launchLogs = entry.liveLogs
@@ -1279,10 +1302,38 @@ final class LibraryModel: ObservableObject {
                 showGameView(reason: "surface")
             } else if Date().timeIntervalSince(launchStarted) > 30 { launchSlow = true }
         }
+        // iPadOS gave the JIT pool less room than asked at launch: say so once the game is up.
+        if !smallPoolNoted, !launching, current != nil, JITPoolMeter.current.shrunk {
+            smallPoolNoted = true
+            let words = "JIT memory is small this time (\(JITPoolMeter.current.sizeMB.map { "\($0) MB" } ?? "smaller than usual")). " +
+                "Big games may stop loading; closing and reopening Madeira can give more."
+            sessionMessage = words
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
+                if self?.sessionMessage == words { self?.sessionMessage = "" }
+            }
+        }
         if wine_process_is_running() != 0 {
             sawProcess = true
             if sessionMessage == "Starting…" { sessionMessage = "" }
         } else if sawProcess && wineserver_is_running() == 0 { finish() }
+        if current != nil, !forceCloseOffered, let asked = quitRequestedAt,
+           Date().timeIntervalSince(asked) > Self.forceCloseAfter {
+            forceCloseOffered = true
+            sessionMessage = "The game did not close. Open the menu to force-close Madeira."
+            fputs("[frontend] still running \(Int(Self.forceCloseAfter)) s after the close request; force close offered\n", stderr)
+        }
+        if current != nil, dockGameEndedAt == nil, !launching, DockStartScreen.shared.active,
+           MainActor.assumeIsolated({ MadeiraDock.pollReport().result }) == 0 {
+            dockGameEndedAt = Date()
+            sessionMessage = "The game has closed. Returning to the library…"
+            winios_close_desktop()
+            fputs("[frontend] the Dock game ended and Steam shut down; closing the desktop\n", stderr)
+        }
+        if current != nil, !dockGameEnded, let ended = dockGameEndedAt, Date().timeIntervalSince(ended) > Self.forceCloseAfter {
+            dockGameEnded = true; forceCloseOffered = true; menu = true
+            sessionMessage = "The game has closed."
+            fputs("[frontend] the desktop is still up \(Int(Self.forceCloseAfter)) s after the Dock game ended; Close Madeira offered\n", stderr)
+        }
         // The first frame gives Aspect and Fill height the drawable's shape.
         if current != nil, !laidOutAfterFirstPresent, madeira_get_present_count() != MetalBackedView.presentCountAtLaunch {
             laidOutAfterFirstPresent = true
@@ -1352,6 +1403,7 @@ final class LibraryModel: ObservableObject {
     func requestQuit() {
         LibraryKeyboard.hide()
         quitRequested = true
+        if quitRequestedAt == nil { quitRequestedAt = Date() }
         // Ask the application to close (Alt+F4) through the normal input queue,
         // so it can save; the surface stays up until the native session ends.
         winios_post_key(0x12, 1); winios_post_key(0x73, 1)
@@ -1382,7 +1434,8 @@ final class LibraryModel: ObservableObject {
         }
     }
     private func finish() {
-        if sawProcess, let report = exitReport() { error = report }
+        if sawProcess, let next = steamRunRequest() { restartNotice = next }
+        else if sawProcess, let report = exitReport() { error = report }
         timer?.invalidate(); timer = nil
         saveCurrentProfile()
         controllerMode = nil
@@ -1394,6 +1447,7 @@ final class LibraryModel: ObservableObject {
         GestureZonesModel.shared.selected = nil; GestureZonesModel.shared.zones = savedZones
         if ControlPresetsModel.enabled { controls.layoutID = savedLayout }
         current = nil; activeEntry = nil; menu = false; sessionMessage = ""
+        quitRequestedAt = nil; forceCloseOffered = false; dockGameEnded = false; dockGameEndedAt = nil
         displayMode = .fit
         LogStore.shared.setDisplayActive(true)
         launching = false; launchLogs = false; LibraryKeyboard.hide()
@@ -1403,6 +1457,7 @@ final class LibraryModel: ObservableObject {
         ProMotionIntent.shared.setActive(false)
         ThermalPacing.shared.end()
         fputs("[frontend] returned to library\n", stderr)
+        LogSummary.writeLater(from: LogStore.shared.logURL, source: "madeira-log.txt (this session)")
     }
 }
 
@@ -3238,7 +3293,7 @@ private struct LibraryPlayStyle: ButtonStyle {
 }
 
 struct LibraryDetail: View {
-    @State var entry: LibraryEntry
+    @State internal var entry: LibraryEntry
     var play: (LibraryEntry) -> Void
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var model = LibraryModel.shared
@@ -3265,7 +3320,10 @@ struct LibraryDetail: View {
     /// the game's config lines in its GameProfiles.swift file. This page's
     /// controls read and write them; the entry fields upstream keeps for the
     /// same options (avx, reportNVIDIA, config) are moved into them once.
-    private func reloadBCD() { bcd = BCDGameValues(windowsPath: entry.windowsPath) }
+    private func reloadBCD() {
+        bcd = BCDGameValues(windowsPath: entry.windowsPath)
+        bcd.unityIL2CPP = BCDLaunch.isUnityIL2CPP(entry)
+    }
     private func migrateEntryOptions() {
         let path = entry.windowsPath
         let file = GameProfile(windowsPath: path)
@@ -3340,7 +3398,7 @@ struct LibraryDetail: View {
     }
     /// The pages the details page links to (iOS Settings style), each with its own Form.
     enum Page: Hashable {
-        case display, controls, launch, compatibility, steam, cloud, library, advanced
+        case display, controls, launch, compatibility, steam, cloud, library, iniFiles, advanced
         var title: String {
             switch self {
             case .display: return "Display"
@@ -3350,6 +3408,7 @@ struct LibraryDetail: View {
             case .steam: return "Steam"
             case .cloud: return "Steam Cloud"
             case .library: return "Library details"
+            case .iniFiles: return "Settings files"
             case .advanced: return "Advanced"
             }
         }
@@ -3362,6 +3421,7 @@ struct LibraryDetail: View {
             case .steam: return "shippingbox"
             case .cloud: return "icloud"
             case .library: return "info.circle"
+            case .iniFiles: return "doc.text"
             case .advanced: return "wrench.and.screwdriver"
             }
         }
@@ -3370,10 +3430,10 @@ struct LibraryDetail: View {
     /// The rows of the details page, in groups. The Desktop entry has no launch options
     /// or library details; a Steam game has its Steam pages.
     private var pageGroups: [[Page]] {
-        let launch = entry.usesLaunchOptions || (entry.desktop != true && entry.steamAppID == nil)
+        let launch = entry.usesLaunchOptions || entry.desktop != true
         let steam: [Page] = entry.steamAppID == nil ? [] : (SteamOwnedLibrary.cloudEnabled ? [.steam, .cloud] : [.steam])
         let tuning: [Page] = launch ? [.display, .controls, .launch, .compatibility] : [.display, .controls, .compatibility]
-        let more: [Page] = entry.desktop == true ? [.advanced] : [.library, .advanced]
+        let more: [Page] = entry.desktop == true ? [.advanced] : [.library, .iniFiles, .advanced]
         return [tuning, steam, more].filter { !$0.isEmpty }
     }
     /// The value a page's row shows, when one setting sums it up.
@@ -3384,6 +3444,9 @@ struct LibraryDetail: View {
         case .launch: return entry.usesLaunchOptions ? (entry.runsInDesktop ? "Wine desktop" : "Directly") : nil
         case .steam: return entry.startsSteamGameDirectly ? "The game" : "Madeira Dock"
         case .advanced: return Self.configSummary(bcd.configText)   // madeira-bcd: the game's own config file
+        case .iniFiles:
+            let count = GameIniFiles.files(entry.windowsPath).count
+            return count == 0 ? nil : count == 1 ? "1 file" : "\(count) files"
         default: return nil
         }
     }
@@ -3398,6 +3461,7 @@ struct LibraryDetail: View {
             case .steam: steamPage
             case .cloud: if let appID = entry.steamAppID { SteamCloudSection(appID: appID) }
             case .library: libraryPage
+            case .iniFiles: GameIniFilesSection(windowsPath: entry.windowsPath, gameFolder: iniGameFolder)
             case .advanced: advancedPage
             }
         }
@@ -3505,18 +3569,18 @@ struct LibraryDetail: View {
             }
         }
         // A Steam game starts with Steam's own launch option through Madeira Dock.
-        if entry.desktop != true && entry.steamAppID == nil {
+        if entry.desktop != true {
             Section {
-                TextField("Launch arguments", text: $entry.arguments, axis: .vertical)
+                TextField("Launch arguments", text: $entry.arguments.plainLaunchArguments, axis: .vertical)
                     .font(.body.monospaced()).lineLimit(1...4)
-                    .autocorrectionDisabled().textInputAutocapitalization(.never)
+                    .autocorrectionDisabled().textInputAutocapitalization(.never).smartPunctuationOff()
                 LaunchFlagChips(arguments: $entry.arguments)
                 // What the next start runs (ml1163: in the Wine desktop, a batch file or
                 // the services batch, what starts the program).
                 Text(entry.commandPreview)
                     .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
             } header: { Text("Launch arguments") } footer: {
-                Text("Passed on every start. Above: the full command.")
+                Text(entry.steamAppID == nil ? "Passed on every start. Above: the full command." : "Steam adds these to the selected launch option on every start.")
             }
         }
     }
@@ -3541,8 +3605,20 @@ struct LibraryDetail: View {
             Toggle(isOn: Binding(get: { bcd.nvidia }, set: { on in bcd.nvidia = on; LibraryPrefs.setNvidia(on, for: entry.windowsPath) })) {
                 compatLabel("Report an NVIDIA GPU", "For \"no graphics card\" errors")
             }
+            Toggle(isOn: Binding(get: { bcd.olderNvidia }, set: { on in bcd.olderNvidia = on; LibraryPrefs.setOlderNvidia(on, for: entry.windowsPath) })) {
+                compatLabel("Older NVIDIA card (Direct3D 9)", "For older games that crash with this GPU, like Fallout 3 and New Vegas")
+            }
             Toggle(isOn: Binding(get: { bcd.wineVCRT }, set: { on in bcd.wineVCRT = on; LibraryPrefs.setWineVCRT(on, for: entry.windowsPath) })) {
                 compatLabel("Wine's C++ runtime", "Instead of the game's msvcp/vcruntime")
+            }
+            // madeira-bcd: MADEIRA_REAL_SUSPEND for this game (BCDLaunch.realSuspend).
+            Picker(selection: Binding(get: { bcd.realSuspend.map { $0 ? 1 : 2 } ?? 0 },
+                                      set: { v in bcd.realSuspend = v == 0 ? nil : v == 1; LibraryPrefs.setRealSuspend(bcd.realSuspend, for: entry.windowsPath) })) {
+                Text("Automatic").tag(0)
+                Text("On").tag(1)
+                Text("Off").tag(2)
+            } label: {
+                compatLabel("Pause threads fully", "For Unity games that crash while loading, like Megabonk. Can make other games freeze")
             }
             // Fastsync-only switches: shown for every game, usable only while
             // Settings › Sync engine is Fastsync.
@@ -3608,6 +3684,13 @@ struct LibraryDetail: View {
             Section { Button("Remove from library", role: .destructive) { remove = true } }
         }
         if let error { Section { Text(error).foregroundStyle(.red) } }
+    }
+
+    /// The game's folder under drive_c, where Settings files looks for .ini files.
+    private var iniGameFolder: String {
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: LibraryModel.drive.appendingPathComponent(entry.relativePath).path, isDirectory: &isDirectory)
+        return GameIniFiles.gameFolder(relativePath: entry.relativePath, isDirectory: exists && isDirectory.boolValue)
     }
 
     @ViewBuilder private var advancedPage: some View {
@@ -3698,6 +3781,10 @@ struct LibraryDetail: View {
                 }
                 // madeira-bcd: always last, for every entry, the Desktop too (GameRecommendationsApply.swift).
                 Section {
+                    Button("Copy Settings", systemImage: "doc.on.doc") {
+                        let configText = entry.config ?? ""
+                        UIPasteboard.general.string = configText.isEmpty ? "# Default configuration" : configText
+                    }
                     Button("Reset to Recommended", systemImage: "arrow.counterclockwise") { confirmReset = true }
                         .confirmationDialog(GameRecommendations.question(recommended, desktop: entry.desktop == true),
                                             isPresented: $confirmReset, titleVisibility: .visible) {
@@ -3758,13 +3845,16 @@ struct LibraryDetail: View {
 /// madeira-bcd: a game's own options as the fork stores them (LibraryDetail):
 /// LibraryPrefs' switches and the GameProfiles.swift file's lines.
 struct BCDGameValues {
-    var avx = false, nvidia = false, wineVCRT = false
+    var avx = false, nvidia = false, olderNvidia = false, wineVCRT = false
+    var realSuspend: Bool? = nil, unityIL2CPP = false
     var configText = ""
     init() {}
     init(windowsPath: String) {
         avx = LibraryPrefs.avx(windowsPath)
         nvidia = LibraryPrefs.nvidia(windowsPath)
+        olderNvidia = LibraryPrefs.olderNvidia(windowsPath)
         wineVCRT = LibraryPrefs.wineVCRT(windowsPath)
+        realSuspend = LibraryPrefs.realSuspend(windowsPath)
         configText = GameProfile(windowsPath: windowsPath).text
     }
 }
@@ -3792,7 +3882,7 @@ struct LibraryGameConfigEditor: View {
 /// Game details › Find on Steam: searches the public store by title; choosing
 /// a result gives the entry that app's name and store artwork.
 struct SteamSearchView: View {
-    @State var query: String
+    @State internal var query: String
     var select: (SteamMatch) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var results: [SteamMatch] = []
@@ -4810,7 +4900,7 @@ struct LibraryHUD: View {
                 Divider()
                 Toggle("Performance overlay", isOn: $model.performance)
                 if model.performance {
-                    ForEach(["FPS", "Frame time", "CPU", "GPU", "RAM", "Battery", "Thermal"], id: \.self) { field in
+                    ForEach(["FPS", "Frame time", "CPU", "GPU", "RAM", "JIT memory", "Battery", "Thermal"], id: \.self) { field in
                         Toggle(field, isOn: Binding(get: { model.overlayFields.contains(field) }, set: { on in
                             model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
                         })).font(.subheadline)
@@ -4851,6 +4941,25 @@ struct LibraryHUD: View {
                     Label("Quit game", systemImage: "stop.circle").foregroundStyle(.red)
                 }.tint(.red)
                 Text("Closes the running session. Unsaved progress will be lost.").font(.caption).foregroundStyle(.secondary)
+                if model.dockGameEnded {
+                    Button {
+                        LogStore.shared.log("[frontend] closing Madeira after the Dock game ended")
+                        exit(0)
+                    } label: {
+                        Label("Close Madeira", systemImage: "checkmark.circle")
+                    }
+                    Text("The game and Steam have closed, and Steam has saved. Madeira runs one game each time it is opened: open it again to play.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if model.forceCloseOffered {
+                    Button(role: .destructive) {
+                        LogStore.shared.log("[frontend] force close: the program ignored the close request; closing Madeira", level: .error)
+                        exit(0)
+                    } label: {
+                        Label("Force close Madeira", systemImage: "xmark.octagon").foregroundStyle(.red)
+                    }.tint(.red)
+                    Text("The game did not respond to Quit game. This closes Madeira at once: unsaved progress, and settings the game changed in this session, are lost.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(22)
                 .foregroundStyle(.primary)
         }
@@ -4946,6 +5055,8 @@ struct LibraryMetrics: View {
             else { result.append(String(format: "GPU %.0f%%", gpu)) }
         }
         if model.overlayFields.contains("RAM") { result.append("\(memory) MB") }
+        // The memory games' code runs from; "FULL" once a DLL did not fit (JITPoolMeter).
+        if model.overlayFields.contains("JIT memory") { result.append(JITPoolMeter.text(JITPoolMeter.current) ?? "JIT —") }
         if model.overlayFields.contains("Battery"), battery >= 0 { result.append("\(battery)%") }
         if model.overlayFields.contains("Thermal") {
             switch thermal {
@@ -5421,5 +5532,80 @@ private struct LaunchFloodShape: Shape {
             if !model.startingScreen && model.current == nil && model.startingJIT == nil && t > 2.5 { retract(); return }
             if t > 4 { handOff(to: .zero, style: CoverStyle(corner: 14, shadowOpacity: 0, shadowRadius: 0, shadowOffset: .zero), landed: {}); return }
         }
+    }
+}
+
+// MARK: - Launch arguments are command lines, not prose
+
+/// iOS Smart Punctuation turns `--` into an em dash and straight quotes into
+/// curly ones, which breaks flags such as `--rendering-driver opengl3` and
+/// quoted paths.
+enum LaunchArgumentText {
+    static func valid(_ text: String) -> Bool {
+        guard text.utf8.count < 4096 else { return false }
+        var quoted = false, inToken = false, tokens = 0, slashes = 0
+        for byte in text.utf8 {
+            if (byte < 32 && byte != 9) || byte == 127 { return false }
+            if byte == 34 && slashes % 2 == 0 { quoted.toggle() }
+            if !quoted && (byte == 32 || byte == 9) { inToken = false }
+            else if !inToken { tokens += 1; inToken = true }
+            slashes = byte == 92 ? slashes + 1 : 0
+        }
+        return !quoted && tokens <= 64
+    }
+
+    static func plain(_ s: String) -> String {
+        var out = s
+        for (from, to) in [("\u{2014}", "--"), ("\u{2013}", "--"), ("\u{2212}", "-"),
+                           ("\u{201C}", "\""), ("\u{201D}", "\""), ("\u{201E}", "\""),
+                           ("\u{2018}", "'"), ("\u{2019}", "'")] {
+            out = out.replacingOccurrences(of: from, with: to)
+        }
+        return out
+    }
+}
+
+extension Binding where Value == String {
+    var plainLaunchArguments: Binding<String> {
+        Binding(get: { LaunchArgumentText.plain(wrappedValue) },
+                set: { wrappedValue = LaunchArgumentText.plain($0) })
+    }
+}
+
+/// Finds the UIKit text view behind a SwiftUI TextField and turns off smart
+/// dashes and quotes on it (SwiftUI has no modifier for these traits).
+private struct SmartPunctuationOff: UIViewRepresentable {
+    final class Probe: UIView {
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            DispatchQueue.main.async { [weak self] in self?.apply() }
+        }
+        func apply() {
+            var node: UIView? = superview
+            for _ in 0..<4 {
+                guard let n = node else { break }
+                if Self.disable(in: n) { return }
+                node = n.superview
+            }
+        }
+        static func disable(in view: UIView) -> Bool {
+            if let t = view as? UITextView {
+                t.smartDashesType = .no; t.smartQuotesType = .no; t.smartInsertDeleteType = .no
+                return true
+            }
+            if let t = view as? UITextField {
+                t.smartDashesType = .no; t.smartQuotesType = .no; t.smartInsertDeleteType = .no
+                return true
+            }
+            return view.subviews.contains { disable(in: $0) }
+        }
+    }
+    func makeUIView(context: Context) -> Probe { let p = Probe(); p.isUserInteractionEnabled = false; return p }
+    func updateUIView(_ uiView: Probe, context: Context) { DispatchQueue.main.async { uiView.apply() } }
+}
+
+extension View {
+    func smartPunctuationOff() -> some View {
+        background(SmartPunctuationOff().frame(width: 0, height: 0))
     }
 }

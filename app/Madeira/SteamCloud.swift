@@ -103,9 +103,13 @@ struct SteamCloudPaths: Sendable {
     var externalLibraryID: String? = nil
 
     /// The Windows user folder games write to. A prefix can hold several
-    /// folders under users (the template's, earlier builds'); Wine names the
-    /// live one after $USER, else the passwd name, so those are tried first,
-    /// then the most recently changed. nil when the prefix has none yet.
+    /// folders under users (the template's, earlier builds'). Games find theirs
+    /// through the profile the registry names (ProfileList's
+    /// ProfileImagePath, from which Wine sets %USERPROFILE%): the prefix
+    /// template names C:\users\mythic, while the unix user is "mobile", and
+    /// syncing the $USER folder left a game's saves where it never looked. So
+    /// the registry's profile first, then $USER, then the passwd name, then the
+    /// most recently changed. nil when the prefix has none yet.
     static func userFolder(drive: URL) -> (url: URL, candidates: Int, how: String)? {
         let users = drive.appendingPathComponent("users", isDirectory: true)
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: users.path) else { return nil }
@@ -114,6 +118,7 @@ struct SteamCloudPaths: Sendable {
             guard let name, let match = own.first(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) else { return nil }
             return users.appendingPathComponent(match, isDirectory: true)
         }
+        if let url = find(profileName(prefix: drive.deletingLastPathComponent())) { return (url, own.count, "profile") }
         if let url = find(getenv("USER").map { String(cString: $0) }) { return (url, own.count, "env") }
         if let entry = getpwuid(getuid()), let url = find(String(cString: entry.pointee.pw_name)) { return (url, own.count, "passwd") }
         func changed(_ name: String) -> Date {
@@ -122,6 +127,32 @@ struct SteamCloudPaths: Sendable {
         }
         guard let newest = own.max(by: { changed($0) < changed($1) }) else { return nil }
         return (users.appendingPathComponent(newest, isDirectory: true), own.count, "newest")
+    }
+
+    /// The folder name under C:\users of the interactive user's profile in the
+    /// prefix's system.reg (ProfileList\S-1-5-21-...\ProfileImagePath), or nil.
+    static func profileName(prefix: URL) -> String? {
+        let url = prefix.appendingPathComponent("system.reg")
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size <= 64 << 20,
+              let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else { return nil }
+        var inUserProfile = false
+        for line in text.split(whereSeparator: \.isNewline) {
+            if line.hasPrefix("[") {
+                inUserProfile = line.lowercased().contains(#"\\profilelist\\s-1-5-21-"#)
+                continue
+            }
+            guard inUserProfile, line.hasPrefix(#""ProfileImagePath"="#) else { continue }
+            // "C:\\users\\name" or str(2):"%SystemDrive%\\users\\name"
+            guard let open = line.firstIndex(of: "\""),
+                  let value = line[line.index(after: open)...].split(separator: "=", maxSplits: 1).last else { continue }
+            let path = value.trimmingCharacters(in: CharacterSet(charactersIn: "\" ")).replacingOccurrences(of: #"\\"#, with: #"\"#)
+            let parts = path.split(separator: "\\")
+            guard let index = parts.lastIndex(where: { $0.caseInsensitiveCompare("users") == .orderedSame }),
+                  index + 1 < parts.count else { continue }
+            let name = String(parts[index + 1])
+            return name.isEmpty || name.contains("/") || name == "." || name == ".." ? nil : name
+        }
+        return nil
     }
 
     /// The local folder a Steam root name stands for on Windows, or nil for a
@@ -213,6 +244,165 @@ struct SteamCloudPaths: Sendable {
         guard path.hasPrefix(root.path + "/") else { throw ExternalStorageError.unsafePath }
         return try ExternalStoragePath.native(String(path.dropFirst(root.path.count + 1)), root: root)
     }
+}
+
+// MARK: - One Windows profile per prefix
+
+/// madeira-bcd: the prefix template names its Windows profile C:\users\mythic
+/// (ProfileList's ProfileImagePath, Volatile Environment, shell folders), but
+/// Wine names the account after the unix user, "mobile" on a device. A game
+/// started with the session's environment then writes under mythic, while a
+/// game Valve's client starts in a Madeira Dock session gets an environment
+/// block built from the account name (userenv: profiles folder + "mobile") and
+/// writes under mobile: The Adventures of Elliot kept its saves under mobile
+/// while Steam Cloud put the cloud's saves under mythic. The profile is now the
+/// unix user's everywhere: the registry's paths are rewritten to it and the
+/// template profile's files are copied into it, once, before Wine starts (run
+/// from MadeiraApp.init; the wineserver rewrites the .reg files from memory, so
+/// it must not be running).
+///
+/// A file present in both folders keeps the newer copy; the other is copied to
+/// Files › Madeira › Profile Merge Backups. After such a collision the Steam
+/// Cloud record is dropped, so a save that now differs from the cloud is shown
+/// as a choice instead of being uploaded or downloaded unasked.
+enum ProfileUnification {
+    private static var ran = false
+
+    static func run() {
+        guard !ran else { return }
+        ran = true
+        let fm = FileManager.default
+        let prefix = MadeiraDock.prefix
+        let users = prefix.appendingPathComponent("drive_c/users", isDirectory: true)
+        guard let user = unixUser(), let old = SteamCloudPaths.profileName(prefix: prefix),
+              old.caseInsensitiveCompare(user) != .orderedSame else { return }
+
+        let source = users.appendingPathComponent(old, isDirectory: true)
+        let target = users.appendingPathComponent(user, isDirectory: true)
+        var moved = 0, collisions = 0
+        let backup = prefix.deletingLastPathComponent()
+            .appendingPathComponent("Profile Merge Backups/\(UUID().uuidString)", isDirectory: true)
+        do {
+            // Invalidate the old sync record before any save can change.
+            let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Madeira/steam-cloud-sync.json")
+            if fm.fileExists(atPath: support.path) { try fm.removeItem(at: support) }
+            if fm.fileExists(atPath: source.path) {
+                let sourceType = try fm.attributesOfItem(atPath: source.path)[.type] as? FileAttributeType
+                let targetType = (try? fm.attributesOfItem(atPath: target.path)[.type]) as? FileAttributeType
+                guard sourceType == .typeDirectory, targetType == nil || targetType == .typeDirectory
+                else { throw CocoaError(.fileWriteInvalidFileName) }
+                try fm.createDirectory(at: target, withIntermediateDirectories: true)
+                try merge(source, into: target, backup: backup, depth: 24, moved: &moved, collisions: &collisions)
+            }
+        } catch {
+            LogStore.shared.log("[profile] could not copy the profile; old files and registry paths are kept: \(error)", level: .error)
+            return
+        }
+        // Keep the old profile as a recovery copy, including after a partial registry write.
+        var rewritten = 0
+        for name in ["system.reg", "user.reg", "userdef.reg"] {
+            let url = prefix.appendingPathComponent(name)
+            guard fm.fileExists(atPath: url.path) else { continue }
+            guard let hits = rewrite(url, from: old, to: user) else {
+                LogStore.shared.log("[profile] could not rewrite \(name); both profile copies are kept", level: .error)
+                return
+            }
+            rewritten += hits
+        }
+        if collisions > 0 {
+            let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Madeira/steam-cloud-sync.json")
+            try? fm.removeItem(at: support)
+        }
+        LogStore.shared.log("[profile] one Windows profile: \(rewritten) registry path(s) now name the unix user's folder; "
+            + "\(moved) item(s) copied from the template profile, \(collisions) collision(s) kept newer"
+            + (collisions > 0 ? " (older copies in Files › Madeira › Profile Merge Backups; Steam Cloud record reset)" : ""),
+            level: .success)
+    }
+
+    /// The account name Wine uses (ntdll's set_home_dir): $USER, else the passwd name.
+    private static func unixUser() -> String? {
+        var name = getenv("USER").map { String(cString: $0) } ?? ""
+        if name.isEmpty, let entry = getpwuid(getuid()) { name = String(cString: entry.pointee.pw_name) }
+        if let slash = name.lastIndex(where: { $0 == "/" || $0 == "\\" }) { name = String(name[name.index(after: slash)...]) }
+        return name.isEmpty || name == "." || name == ".." ? nil : name
+    }
+
+    /// `users\\<old>` followed by `\\` or `"` becomes `users\\<new>` (.reg text,
+    /// backslashes doubled), without regard to case. Written via a temporary file;
+    /// nil when the file cannot be read or written.
+    private static func rewrite(_ url: URL, from old: String, to new: String) -> Int? {
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size <= 64 << 20,
+              let read = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        // Volatile Environment's USERNAME names the profile's user too.
+        let text = read.replacingOccurrences(of: #""USERNAME"=""# + old + "\"",
+                                             with: #""USERNAME"=""# + new + "\"", options: .caseInsensitive)
+        let needle = #"users\\"# + old
+        var out = "", hits = 0
+        var rest = text[...]
+        while let range = rest.range(of: needle, options: .caseInsensitive) {
+            let after = rest[range.upperBound...]
+            out += rest[..<range.lowerBound]
+            if after.hasPrefix(#"\\"#) || after.hasPrefix("\"") {
+                out += #"users\\"# + new
+                hits += 1
+            } else {
+                out += rest[range]
+            }
+            rest = after
+        }
+        guard hits > 0 || text != read else { return 0 }
+        out += rest
+        do { try out.write(to: url, atomically: true, encoding: .utf8) } catch { return nil }
+        return hits
+    }
+
+    /// Copies saves before changing registry paths. The old profile stays as a recovery copy.
+    private static func merge(_ source: URL, into target: URL, backup: URL, depth: Int,
+                              moved: inout Int, collisions: inout Int) throws {
+        let fm = FileManager.default
+        guard depth > 0 else { throw CocoaError(.fileReadTooLarge) }
+        for name in try fm.contentsOfDirectory(atPath: source.path) {
+            let from = source.appendingPathComponent(name), to = target.appendingPathComponent(name)
+            let fromType = try fm.attributesOfItem(atPath: from.path)[.type] as? FileAttributeType
+            let toType = (try? fm.attributesOfItem(atPath: to.path)[.type]) as? FileAttributeType
+            guard let toType else {
+                try fm.copyItem(at: from, to: to)
+                moved += 1
+                continue
+            }
+            if fromType == .typeDirectory && toType == .typeDirectory {
+                try merge(from, into: to, backup: backup.appendingPathComponent(name, isDirectory: true), depth: depth - 1,
+                          moved: &moved, collisions: &collisions)
+                continue
+            }
+            // Do not follow Windows junctions or symbolic links into another tree.
+            guard fromType != .typeSymbolicLink && toType != .typeSymbolicLink else {
+                throw CocoaError(.fileWriteInvalidFileName)
+            }
+            collisions += 1
+            func date(_ url: URL) throws -> Date {
+                try url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .distantPast
+            }
+            try fm.createDirectory(at: backup, withIntermediateDirectories: true)
+            let saved = backup.appendingPathComponent(name)
+            if try date(from) > date(to) {
+                try fm.copyItem(at: to, to: saved)
+                try fm.removeItem(at: to)
+                do { try fm.copyItem(at: from, to: to) }
+                catch {
+                    if fm.fileExists(atPath: to.path) { try? fm.removeItem(at: to) }
+                    try fm.copyItem(at: saved, to: to)
+                    throw error
+                }
+                moved += 1
+            } else {
+                try fm.copyItem(at: from, to: saved)
+            }
+        }
+    }
+
 }
 
 // MARK: - Comparison

@@ -139,7 +139,7 @@ extension GameRecommendations {
     }
 
     /// The config file, and on first sight or a reset the switches LibraryPrefs keeps for
-    /// the game's path: AVX, NVIDIA and Wine's C++ runtime.
+    /// the game's path: AVX, NVIDIA, the older NVIDIA card and Wine's C++ runtime.
     @discardableResult
     private static func put(_ rec: GameRecommendation, to windowsPath: String, _ kind: Write, title: String,
                             switches: Bool = true) -> Bool {
@@ -152,6 +152,7 @@ extension GameRecommendations {
         if kind != .updated && switches {
             if let on = rec.avx { LibraryPrefs.setAVX(on, for: windowsPath) }
             if let on = rec.nvidia { LibraryPrefs.setNvidia(on, for: windowsPath) }
+            if let on = rec.olderNvidia { LibraryPrefs.setOlderNvidia(on, for: windowsPath) }
             if let on = rec.wineVCRT { LibraryPrefs.setWineVCRT(on, for: windowsPath) }
         }
         setMark(stamp(rec), windowsPath)

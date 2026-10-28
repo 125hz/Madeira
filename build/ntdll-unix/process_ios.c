@@ -77,6 +77,8 @@
 #include "wine/condrv.h"
 #include "wine/server.h"
 #include "wine/debug.h"
+#define MADEIRA_REDACT_WINE
+#include "../madeira_redact.h"   /* command lines are logged with credential-like values redacted */
 
 WINE_DEFAULT_DEBUG_CHANNEL(process);
 
@@ -427,6 +429,7 @@ struct ios_child_args {
     int slot;   /* ios_child_slots index, -1 = none */
 };
 
+
 /* Pseudo-process children that are still running. A launcher stub that
  * starts the game and exits at once (GTA V Enhanced: PlayGTAV.exe starts
  * GTA5_Enhanced.exe and exits ~1 s later) ended the whole session: the main
@@ -655,7 +658,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     if (winedebug) putenv( winedebug );
 
     ERR("spawn_process: creating child thread for %s (fd=%d, unixdir=%d, dup_unixdir=%d)\n",
-        debugstr_us(&params->CommandLine), socketfd, unixdir, args->unixdir);
+        madeira_debugstr_cmdline_us(&params->CommandLine), socketfd, unixdir, args->unixdir);
 
     ret = pthread_create( &child_thread, NULL, ios_child_thread_entry, args );
     if (ret) {
@@ -1425,10 +1428,10 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     if (!process_attr) process_attr = &empty_attr;
 
     TRACE( "%s image %s cmdline %s parent %p machine %x\n", debugstr_us( &path ),
-           debugstr_us( &params->ImagePathName ), debugstr_us( &params->CommandLine ), parent, machine );
+           debugstr_us( &params->ImagePathName ), madeira_debugstr_cmdline_us( &params->CommandLine ), parent, machine );
 #ifdef WINE_IOS
     ERR("NtCreateUserProcess: image=%s cmdline=%s\n",
-        debugstr_us( &params->ImagePathName ), debugstr_us( &params->CommandLine ));
+        debugstr_us( &params->ImagePathName ), madeira_debugstr_cmdline_us( &params->CommandLine ));
 
     /* TEMP HACK (Steam S3 2026-07-10, task #29): refuse to spawn Steam's
      * minidump reporter. The reporter child hits the deep guest-exception-
@@ -1496,17 +1499,117 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
          * "EnterEC wrote it" does NOT name the origin — Core.cpp says so explicitly:
          * EnterEC storing an x64 target in State.rip is its job. The upstream producer
          * still needs finding via x9 at DispatchJump/RetToEntryThunk/ExitToX64. */
+        /* A game in a Madeira Dock session asks Steam to start another game: it
+         * runs steam.exe with steam://run/<App ID> (or steam://rungameid/<App ID>)
+         * and exits. Black Ops II's campaign does this when the player chooses
+         * Zombies (build 30, 2026-10-27). In a Dock session Valve's client runs
+         * inside dockhost.exe, so steam.exe found no client, began a 229 MB
+         * self-update and stopped at a black window. The request goes to the app
+         * instead (wine_steam_run_requested, WineProcessBridge.m), which starts
+         * that game in its next run; steam.exe is not started.
+         * env.MADEIRA_DOCK_STEAM_RUN=0 lets steam.exe start as before. */
+        {
+            extern void wine_steam_run_requested( unsigned int appid ) __attribute__((weak));
+            const char *dock = getenv( "MADEIRA_DOCK_SESSION" ), *sr = getenv( "MADEIRA_DOCK_STEAM_RUN" );
+            const WCHAR *cl = params->CommandLine.Buffer;
+            int cl_len = params->CommandLine.Length / sizeof(WCHAR);
+
+            if (dock && dock[0] == '1' && !(sr && sr[0] == '0' && !sr[1]) && cl &&
+                ios_image_name_is( params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR),
+                                   "steam.exe" ))
+            {
+                static const char * const prefixes[] = { "steam://rungameid/", "steam://run/" };
+                unsigned int appid = 0;
+                unsigned p;
+                int k, j, found = 0;
+
+                for (p = 0; p < 2 && !found; p++)
+                {
+                    int pl = (int)strlen( prefixes[p] );
+                    for (k = 0; k + pl <= cl_len && !found; k++)
+                    {
+                        if (k && cl[k - 1] != ' ' && cl[k - 1] != '\t' && cl[k - 1] != '"') continue;
+                        for (j = 0; j < pl; j++)
+                        {
+                            WCHAR c = cl[k + j];
+                            if (c >= 'A' && c <= 'Z') c += 32;
+                            if (c != (WCHAR)prefixes[p][j]) break;
+                        }
+                        if (j < pl) continue;
+                        appid = 0;
+                        for (j = k + pl; j < cl_len && cl[j] >= '0' && cl[j] <= '9'; j++)
+                        {
+                            unsigned int digit = cl[j] - '0';
+                            if (appid > (UINT32_MAX - digit) / 10) { appid = 0; break; }
+                            appid = appid * 10 + digit;
+                        }
+                        found = appid && (j == cl_len || cl[j] == ' ' || cl[j] == '\t' ||
+                                          cl[j] == '"' || cl[j] == '/');
+                    }
+                }
+                if (found && wine_steam_run_requested)
+                {
+                    dprintf( 2, "[dock-steam-run] %s asks Steam to start app %u: steam.exe not started, "
+                             "the app starts it in its next run (env.MADEIRA_DOCK_STEAM_RUN=0 starts steam.exe)\n",
+                             madeira_debugstr_cmdline_us( &params->CommandLine ), appid );
+                    wine_steam_run_requested( appid );
+                    return STATUS_ACCESS_DENIED;
+                }
+            }
+        }
+
         static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery", "vulkandriverquery",
                                                       "steamsysinfo", "hardwareupdater",
                                                       "unitycrashhandler64" };
         const WCHAR *ip = params->ImagePathName.Buffer;
         int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
         unsigned b;
+        /* ml1357: the full Windows Steam client (steam.exe, started by the in-session
+         * launcher or a library entry) runs its own crash reporter, hardware survey and
+         * GPU probes. These names were refused because, before ml937, a helper's crash or
+         * self-terminate took the whole app down; now each ends only its own
+         * pseudo-process. When the PARENT is steam.exe they may start (Dock sessions
+         * host Valve's client in dockhost.exe, so their spawns keep the gate).
+         * hardwareupdater (pool churn) and the web helper's --type= children (a second
+         * CEF instance, see below) stay refused. env.MADEIRA_PROC_GATE_STEAM=0 refuses
+         * them all as before. */
+        int full_client_parent = 0;
+        {
+            const char *g = getenv( "MADEIRA_PROC_GATE_STEAM" );
+            const RTL_USER_PROCESS_PARAMETERS *cur = NtCurrentTeb()->Peb->ProcessParameters;
+            if (!(g && g[0] == '0') && cur && cur->ImagePathName.Buffer &&
+                ios_image_name_is( cur->ImagePathName.Buffer, cur->ImagePathName.Length / sizeof(WCHAR),
+                                   "steam.exe" ))
+                full_client_parent = 1;
+        }
 
         for (b = 0; b < sizeof(blocked_names)/sizeof(blocked_names[0]); b++)
         {
             const char *blocked = blocked_names[b];
             int bl = (int)strlen( blocked ), k, j;
+
+            if (full_client_parent && b < 4)
+            {
+                /* the first four names: steamerrorreporter, gldriverquery,
+                 * vulkandriverquery, steamsysinfo (keep that order above) */
+                int hit = 0;
+                for (k = 0; k + bl <= ip_len && !hit; k++)
+                {
+                    for (j = 0; j < bl; j++)
+                    {
+                        WCHAR c = ip[k + j];
+                        if (c >= 'A' && c <= 'Z') c += 32;
+                        if (c != (WCHAR)blocked[j]) break;
+                    }
+                    if (j == bl) hit = 1;
+                }
+                if (hit)
+                    dprintf( 2, "[proc-gate] ml1357 allowing %s: started by the full Steam client "
+                             "(steam.exe), whose own helpers run in this session "
+                             "(env.MADEIRA_PROC_GATE_STEAM=0 refuses them as before)\n",
+                             debugstr_us( &params->ImagePathName ) );
+                continue;
+            }
 
             for (k = 0; k + bl <= ip_len; k++)
             {
@@ -1574,6 +1677,46 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                 "its threads have no CPU area for the emulator loaded into it; env.MADEIRA_EC_CONHOST=1 "
                 "starts it)\n", debugstr_us( &params->ImagePathName ));
         return STATUS_ACCESS_DENIED;
+    }
+
+    /* madeira-conhost-headless: a pipe cannot be a --unix console's tty (the server
+     * calls tcgetattr on it); --headless takes the same standard handles and needs no
+     * terminal device. env.MADEIRA_CONHOST_HEADLESS = 1. */
+    {
+        const char *hl = getenv( "MADEIRA_CONHOST_HEADLESS" );
+        const WCHAR *cl = params->CommandLine.Buffer;
+        int cl_len = params->CommandLine.Length / sizeof(WCHAR), k, at = -1;
+        static const char from[] = "--unix", to[] = "--headless";
+
+        if (hl && hl[0] == '1' && cl &&
+            ios_image_name_is( params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR),
+                               "conhost.exe" ))
+        {
+            for (k = 0; k + (int)sizeof(from) - 1 <= cl_len && at < 0; k++)
+            {
+                int j;
+                for (j = 0; j < (int)sizeof(from) - 1; j++) if (cl[k + j] != (WCHAR)from[j]) break;
+                if (j == (int)sizeof(from) - 1) at = k;
+            }
+            if (at >= 0)
+            {
+                int add = (int)sizeof(to) - (int)sizeof(from), o = 0;
+                WCHAR *nbuf = malloc( (cl_len + add + 1) * sizeof(WCHAR) );   /* leaks once per console, as the other rewrites */
+
+                if (nbuf)
+                {
+                    for (k = 0; k < at; k++) nbuf[o++] = cl[k];
+                    for (k = 0; k < (int)sizeof(to) - 1; k++) nbuf[o++] = (WCHAR)to[k];
+                    for (k = at + (int)sizeof(from) - 1; k < cl_len; k++) nbuf[o++] = cl[k];
+                    nbuf[o] = 0;
+                    params->CommandLine.Buffer = nbuf;
+                    params->CommandLine.Length = o * sizeof(WCHAR);
+                    params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+                    dprintf( 2, "[console] conhost --unix -> --headless (a pipe is not a terminal device; "
+                                "MADEIRA_CONHOST_HEADLESS)\n" );
+                }
+            }
+        }
     }
 
     /* ml526: stamp every accepted spawn on the startup timeline. This is the
@@ -1907,10 +2050,20 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                      * every injected-arg experiment from now on is proven by
                      * this line, not by binary greps or Valve's log. */
                     {
+                        /* The tail of the redacted line: a value cut by the
+                         * tail's start could no longer be recognised. */
+                        size_t cap = 2 * (size_t)o + 64, sn = 0;
+                        unsigned short *shown = malloc( cap * sizeof(*shown) );
                         char tail[136];
-                        int tstart = o > 128 ? o - 128 : 0, ti;
-                        for (ti = 0; ti + tstart < o && ti < 135; ti++)
-                            tail[ti] = (char)nbuf[tstart + ti];
+                        int tstart, ti = 0;
+                        if (shown)
+                        {
+                            sn = madeira_redact_line_w( (const unsigned short *)nbuf, (size_t)o, shown, cap );
+                            tstart = sn > 128 ? (int)sn - 128 : 0;
+                            for (; ti + tstart < (int)sn && ti < 135; ti++)
+                                tail[ti] = (char)shown[tstart + ti];
+                            free( shown );
+                        }
                         tail[ti] = 0;
                         dprintf(2, "[proc-gate] cmdline-tail(ml428): ...%s\n", tail);
                     }
@@ -4027,7 +4180,11 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
                              MEM_EXECUTE_OPTION_DISABLE_THUNK_EMULATION |
                              MEM_EXECUTE_OPTION_PERMANENT;
         else
-            *(ULONG *)info = execute_flags;
+        {
+            /* ml1354: a 32-bit pseudo-process's own flags (virtual_ios.c ios_dep_per_process) */
+            extern ULONG ios_wow_exec_flags_current( ULONG fallback );
+            *(ULONG *)info = ios_wow_exec_flags_current( execute_flags );
+        }
         break;
 
     case ProcessPriorityClass:
@@ -4313,9 +4470,16 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
 
     case ProcessExecuteFlags:
         if ((is_win64 && !is_wow64()) || size != sizeof(ULONG)) return STATUS_INVALID_PARAMETER;
-        if (execute_flags & MEM_EXECUTE_OPTION_PERMANENT) return STATUS_ACCESS_DENIED;
-        else
         {
+            /* ml1354: DEP is per process. The flags were one session-wide value, so a
+             * 32-bit browser making DEP permanent for itself also locked every later
+             * 32-bit process out of turning it off. */
+            extern ULONG ios_wow_exec_flags_current( ULONG fallback );
+            if (ios_wow_exec_flags_current( execute_flags ) & MEM_EXECUTE_OPTION_PERMANENT)
+                return STATUS_ACCESS_DENIED;
+        }
+        {
+            extern int ios_wow_exec_flags_store_current( ULONG flags );
             BOOL enable;
             switch (*(ULONG *)info & (MEM_EXECUTE_OPTION_ENABLE|MEM_EXECUTE_OPTION_DISABLE))
             {
@@ -4328,7 +4492,8 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
             default:
                 return STATUS_INVALID_PARAMETER;
             }
-            execute_flags = *(ULONG *)info;
+            /* the session-wide value stays for processes without a guest window */
+            if (!ios_wow_exec_flags_store_current( *(ULONG *)info )) execute_flags = *(ULONG *)info;
             virtual_set_force_exec( enable );
         }
         break;

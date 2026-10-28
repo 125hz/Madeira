@@ -5,7 +5,7 @@ Four parts:
   1. The pure section of app/Madeira/HardwareInput.swift (key map, mouse button
      edges, held-set diffing, motion carry, wheel notches, the AssistiveTouch
      classifier, the desktop cursor clamp, the right-stick velocity, the
-     view-to-screen mapping, focus gating of held keys, click focus, the
+     focus gating of held keys, click focus, the
      pointer route and the automatic pointer lock) is compiled with swiftc and
      exercised.
   2. Every HID keyboard usage is taken through the production chain
@@ -74,6 +74,103 @@ assert(MouseButton.right.event(down: true) == (0x0008, 0) && MouseButton.right.e
 assert(MouseButton.middle.event(down: true) == (0x0020, 0) && MouseButton.middle.event(down: false) == (0x0040, 0))
 assert(MouseButton.x1.event(down: true) == (0x0080, 1) && MouseButton.x1.event(down: false) == (0x0100, 1))
 assert(MouseButton.x2.event(down: true) == (0x0080, 2) && MouseButton.x2.event(down: false) == (0x0100, 2))
+
+// A movement-only raw stream must leave fallback clicks available. Sources
+// are selected per button, so a raw left hold can coexist with fallback right.
+assert(MouseButtonSources.merge(current: [], fallback: [.left, .right], rawSeen: [], focused: true) == [.left, .right])
+assert(MouseButtonSources.merge(current: [.left], fallback: [.right], rawSeen: [.left], focused: true) == [.left, .right])
+assert(MouseButtonSources.merge(current: [.left, .right], fallback: [], rawSeen: [.left], focused: true) == [.left])
+assert(MouseButtonSources.merge(current: [], fallback: [.left], rawSeen: [.left], focused: true).isEmpty)
+assert(MouseButtonSources.merge(current: [.left], fallback: [.right], rawSeen: [.left], focused: false).isEmpty)
+var mouseEdges = HeldEdges<MouseButton>()
+let fallbackPress = MouseButtonSources.merge(current: [], fallback: [.right], rawSeen: [], focused: true)
+assert(mouseEdges.update(fallbackPress).down == [.right])
+assert(mouseEdges.update(fallbackPress).down.isEmpty)
+assert(mouseEdges.update(MouseButtonSources.merge(current: fallbackPress, fallback: [], rawSeen: [], focused: true)).up == [.right])
+
+// Raw callbacks plus polling: one down per physical press, a missed up is
+// recovered from zero state, and a stationary hold has no expiry.
+var raw = RawMouseButtons<Int>()
+raw.attach(1, held: [])
+assert(raw.update(1, button: .left, down: true).down == [.left])
+for _ in 0..<1000 {
+    let same = raw.sample(1, held: [.left])
+    assert(same.up.isEmpty && same.down.isEmpty)
+}
+assert(raw.update(1, button: .left, down: true).down.isEmpty)
+assert(raw.sample(1, held: []).up == [.left])
+assert(raw.update(1, button: .left, down: false).up.isEmpty)
+assert(raw.sample(1, held: [.right]).down == [.right])
+assert(raw.update(1, button: .right, down: false).up == [.right])
+// A held button at attach is not a fresh click. Two mice can hold one button;
+// releasing/disconnecting one must not release the other.
+raw.attach(2, held: [.left])
+assert(raw.sample(2, held: [.left]).down.isEmpty)
+assert(raw.sample(2, held: []).up.isEmpty)
+assert(raw.update(2, button: .left, down: true).down == [.left])
+assert(raw.update(1, button: .left, down: true).down.isEmpty)
+assert(raw.detach(2).up.isEmpty)
+assert(raw.detach(1).up == [.left])
+assert(raw.update(1, button: .left, down: true).down.isEmpty)
+// Focus loss releases the program; sampling a still-held physical button
+// after focus returns must not manufacture another press.
+raw.attach(1, held: [])
+let beforeBlur = raw.update(1, button: .left, down: true)
+var program = HeldEdges<MouseButton>()
+assert(program.update(Set(beforeBlur.down)).down == [.left])
+assert(program.update([]).up == [.left])
+assert(raw.sample(1, held: [.left]).down.isEmpty)
+assert(raw.sample(1, held: []).up == [.left])
+assert(raw.update(1, button: .left, down: true).down == [.left])
+
+// Values changed while the app was inactive are seeded rather than replayed.
+assert(raw.resume(1, held: [.left, .right]).up == [.left])
+assert(raw.sample(1, held: [.left, .right]).down.isEmpty)
+assert(raw.sample(1, held: []).up.isEmpty)
+assert(raw.update(1, button: .right, down: true).down == [.right])
+
+// A direct touch admitted before a raw mouse report must still deliver its
+// release; a consumed synthetic touch stays consumed after mouse activity ends.
+var touchSequence = TouchSequenceFilter<Int>()
+assert(!touchSequence.consume(1, beginning: true, ending: false, ignoreAtBegin: false))
+assert(!touchSequence.consume(1, beginning: false, ending: true, ignoreAtBegin: true))
+assert(touchSequence.consume(2, beginning: true, ending: false, ignoreAtBegin: true))
+assert(touchSequence.consume(2, beginning: false, ending: false, ignoreAtBegin: false))
+assert(touchSequence.consume(2, beginning: false, ending: true, ignoreAtBegin: false))
+assert(!touchSequence.consume(2, beginning: true, ending: false, ignoreAtBegin: false))
+assert(!touchSequence.consume(2, beginning: false, ending: true, ignoreAtBegin: false))
+// Mixed finger/synthetic callbacks forwarded whole must release both presses.
+assert(touchSequence.consume(3, beginning: true, ending: false, ignoreAtBegin: true))
+assert(!touchSequence.consume(4, beginning: true, ending: false, ignoreAtBegin: false))
+touchSequence.admit([3, 4])
+assert(!touchSequence.consume(3, beginning: false, ending: true, ignoreAtBegin: true))
+assert(!touchSequence.consume(4, beginning: false, ending: true, ignoreAtBegin: false))
+
+// The observed compatibility-click stream: MOVE|ABSOLUTE|LEFTDOWN at a
+// noncentral point, repeated absolute drag positions, then LEFTUP|ABSOLUTE.
+// With raw mouse-look active, only positionless down/up must reach Windows.
+let clickPoint: (Int32, Int32) = (673, 412)
+let surfaceDown = SurfacePointerEvent.map(x: clickPoint.0, y: clickPoint.1,
+                                         flags: 0x8003, data: 0, hardwareRelative: true)!
+assert(surfaceDown == SurfacePointerEvent(x: 0, y: 0, flags: 0x2, data: 0))
+for x in 0..<1024 {
+    assert(SurfacePointerEvent.map(x: Int32(x), y: 420, flags: 0x8001, data: 0,
+                                   hardwareRelative: true) == nil)
+}
+assert(SurfacePointerEvent.map(x: 595, y: 420, flags: 0x8004, data: 0, hardwareRelative: true)
+       == SurfacePointerEvent(x: 0, y: 0, flags: 0x4, data: 0))
+// Surface relative deltas must not double-count the raw stream either.
+assert(SurfacePointerEvent.map(x: -3, y: 2, flags: 0x1, data: 0, hardwareRelative: true) == nil)
+for flags in [UInt32(0x8), 0x10, 0x20, 0x40, 0x80, 0x100, 0x800, 0x1000] {
+    assert(SurfacePointerEvent.map(x: 100, y: 200, flags: flags | 0x8000, data: 2, hardwareRelative: true)
+           == SurfacePointerEvent(x: 0, y: 0, flags: flags, data: 2))
+}
+// Visible-cursor menus and sessions without a raw mouse retain exact packets,
+// including wheel sign/data and finger relative motion.
+for flags in [UInt32(0x1), 0x8001, 0x8003, 0x8004, 0x8008, 0x8010, 0x800] {
+    assert(SurfacePointerEvent.map(x: 628, y: 446, flags: flags, data: 0xffffff88, hardwareRelative: false)
+           == SurfacePointerEvent(x: 628, y: 446, flags: flags, data: 0xffffff88))
+}
 
 // Held-set diffing: declared sets converge, ups before downs, no duplicates.
 var keys = HeldEdges<Int32>()
@@ -159,25 +256,7 @@ let stalled = StickVelocity.frame(x: 1, y: 0, gain: 1, dt: 5)
 assert(abs(stalled.dx - 24.0) < 1e-9)                       // dt clamped to 1/15 s
 assert(StickVelocity.frame(x: .nan, y: 0, gain: 1, dt: 0.016) == (0, 0))
 
-// View to screen: the same aspect fit as MetalBackedView.gameRect/mapTouch.
-func mapTouch(_ x: Double, _ y: Double, _ bw: Double, _ bh: Double) -> (Int32, Int32) {
-    let scale = min(bw / 1024, bh / 768), w = 1024 * scale, h = 768 * scale
-    let rx = (bw - w) / 2, ry = (bh - h) / 2
-    return (Int32(min(max((x - rx) * 1024 / w, 0), 1023)), Int32(min(max((y - ry) * 768 / h, 0), 767)))
-}
-for (bw, bh) in [(1024.0, 768.0), (834.0, 1194.0), (1366.0, 1024.0), (393.0, 852.0), (852.0, 393.0)] {
-    for (px, py) in [(0.0, 0.0), (bw / 2, bh / 2), (bw - 0.5, bh - 0.5), (bw * 0.3, bh * 0.7), (-5.0, bh + 9)] {
-        let s = ScreenMap.toScreen(x: px, y: py, viewW: bw, viewH: bh, screenW: 1024, screenH: 768)
-        let m = mapTouch(px, py, bw, bh)
-        assert(s.x == m.0 && s.y == m.1, "ScreenMap differs from mapTouch at \(px),\(py) in \(bw)x\(bh)")
-    }
-}
-// Desktop session: a 1280x720 desktop letterboxed in a 4:3 view; centre and corners.
-assert(ScreenMap.toScreen(x: 512, y: 384, viewW: 1024, viewH: 768, screenW: 1280, screenH: 720) == (640, 360))
-assert(ScreenMap.toScreen(x: 0, y: 0, viewW: 1024, viewH: 768, screenW: 1280, screenH: 720) == (0, 0))
-assert(ScreenMap.toScreen(x: 1024, y: 768, viewW: 1024, viewH: 768, screenW: 1280, screenH: 720) == (1279, 719))
-assert(ScreenMap.toScreen(x: .nan, y: 1, viewW: 1024, viewH: 768, screenW: 1024, screenH: 768) == (0, 0))
-assert(ScreenMap.toScreen(x: 5, y: 5, viewW: 0, viewH: 0, screenW: 1024, screenH: 768) == (0, 0))
+// View-to-screen geometry is exercised by check-pointer-geometry.py.
 
 // Focus gate: losing focus hides held keys; a key pressed without focus stays
 // hidden until released, even after focus returns.
@@ -222,6 +301,25 @@ assert(PointerPolicy.route(focused: true, hover: true, locked: true, cursorShown
 assert(PointerPolicy.route(focused: true, hover: true, locked: false, cursorShown: false, absoluteAllowed: true) == .relative)
 assert(PointerPolicy.route(focused: true, hover: false, locked: false, cursorShown: true, absoluteAllowed: true) == .relative)
 assert(PointerPolicy.route(focused: true, hover: true, locked: false, cursorShown: true, absoluteAllowed: false) == .relative)
+// A virtual desktop is not evidence that a game's cursor is visible.
+assert(PointerPolicy.cursorShown(desktop: true, directEnabled: true, reports: 0, shown: false))
+assert(PointerPolicy.cursorShown(desktop: true, directEnabled: true, reports: 1, shown: true))
+let hiddenDesktopCursor = PointerPolicy.cursorShown(desktop: true, directEnabled: true, reports: 1, shown: false)
+assert(!hiddenDesktopCursor)
+assert(PointerPolicy.route(focused: true, hover: true, locked: false, cursorShown: hiddenDesktopCursor, absoluteAllowed: true) == .relative)
+assert(!PointerPolicy.cursorShown(desktop: false, directEnabled: false, reports: 1, shown: true))
+
+// The rollback keeps the desktop absolute even when its hidden-cursor
+// metadata says otherwise; direct-mode visibility remains unchanged.
+for enabled in [false, true] {
+    let shown = PointerPolicy.cursorShown(desktop: true, directEnabled: true,
+                                         reports: 1, shown: false, routingEnabled: enabled)
+    assert(shown == !enabled)
+    assert(PointerPolicy.route(focused: true, hover: true, locked: false,
+                               cursorShown: shown, absoluteAllowed: true) == (enabled ? .relative : .absolute))
+    assert(!PointerPolicy.cursorShown(desktop: false, directEnabled: true,
+                                      reports: 1, shown: false, routingEnabled: enabled))
+}
 
 // Automatic lock: only for a live program that hides its cursor under the pointer.
 func lockAction(locked: Bool = false, byUs: Bool = false, shown: Bool = false, hiddenFor: Double = 1,
@@ -248,9 +346,48 @@ print("SWIFT-OK")
 with tempfile.TemporaryDirectory(prefix='madeira-hwinput-') as tmp:
     tmp = Path(tmp)
     src, exe = tmp / 'main.swift', tmp / 'check'
-    src.write_text('import Foundation\n' + pure + swift_tests)
-    subprocess.run([os.environ.get('SWIFTC', 'swiftc'), str(src), '-o', str(exe)], check=True)
-    out = subprocess.run([str(exe)], check=True, capture_output=True, text=True).stdout
+    switch_source = source.split('// MARK: switches', 1)[1].split('/// Whether pointer lock can do anything', 1)[0]
+    bridge = re.search(r'@_cdecl\("winios_mouse_routing_enabled"\)\nfunc winiosMouseRoutingEnabled\(\) -> Int32 \{[^\n]+\}', source).group(0)
+    driver_source = (root / 'build/win32u-unix/driver_ios.c').read_text()
+    predicates = '\n'.join(re.search(r'static int ' + name + r'\(void\)\n\{.*?\n\}', driver_source, re.S).group(0)
+                           for name in ('winios_mouse_routing_on', 'winios_direct_cursor_on'))
+    csrc, obj = tmp / 'routing.c', tmp / 'routing.o'
+    csrc.write_text('extern int winios_mouse_routing_enabled(void) __attribute__((weak));\n'
+                   'static int desktop, wanted;\n'
+                   'static int winios_desktop_mode(void) { return desktop; }\n'
+                   'static int cursor_wanted(void) { return wanted; }\n'
+                   'static int (*winios_direct_cursor_wanted)(void) = cursor_wanted;\n' + predicates +
+                   '\nint check_driver_routing(int d, int w) { desktop=d; wanted=w; return winios_direct_cursor_on(); }\n')
+    subprocess.run([os.environ.get('CC', 'cc'), '-Wall', '-Wextra', '-Werror', '-c', str(csrc), '-o', str(obj)], check=True)
+    harness = '''enum MadeiraConfig {
+    static func get(_ key: String) -> String? {
+        key == "env.MADEIRA_MOUSE_ROUTING" ? ProcessInfo.processInfo.environment["TEST_CFG_ROUTING"] : nil
+    }
+}
+enum HardwareInput {
+''' + switch_source + '\n}\n' + bridge + r'''
+@_silgen_name("check_driver_routing") func checkDriverRouting(_ desktop: Int32, _ wanted: Int32) -> Int32
+let routingExpected = ProcessInfo.processInfo.environment["TEST_EXPECT_ROUTING"] != "0"
+assert(HardwareInput.mouseRoutingEnabled == routingExpected)
+assert(winiosMouseRoutingEnabled() == (routingExpected ? 1 : 0))
+for desktop: Int32 in [0, 1] {
+    for wanted: Int32 in [0, 1] {
+        assert(checkDriverRouting(desktop, wanted) == (wanted != 0 && (desktop == 0 || routingExpected) ? 1 : 0))
+    }
+}
+
+'''
+    src.write_text('import Foundation\n' + pure + harness + swift_tests)
+    subprocess.run([os.environ.get('SWIFTC', 'swiftc'), str(src), str(obj), '-o', str(exe)], check=True)
+    for cfg, env_value, expected in [(None, None, '1'), (None, '0', '0'), (None, '1', '1'),
+                                     ('0', '1', '0'), ('1', '0', '1')]:
+        env = dict(os.environ)
+        env.pop('TEST_CFG_ROUTING', None); env.pop('MADEIRA_MOUSE_ROUTING', None)
+        if cfg is not None: env['TEST_CFG_ROUTING'] = cfg
+        if env_value is not None: env['MADEIRA_MOUSE_ROUTING'] = env_value
+        env['TEST_EXPECT_ROUTING'] = expected
+        out = subprocess.run([str(exe)], env=env, check=True, capture_output=True, text=True).stdout
+    print('PASS: mouse-routing default, cfg precedence, C bridge and both driver modes')
 check('SWIFT-OK' in out, 'Swift pure-section checks')
 hid_to_vk = {int(u): int(v) for u, v in re.findall(r'^MAP (\d+) (-?\d+)$', out, re.M)}
 print(f'PASS: pure mapping ({len(hid_to_vk)} HID usages mapped), button edges, held sets, '
@@ -534,8 +671,8 @@ print('PASS: direct-mode cursor state: inert until enabled, first-report and tra
       'coalescing, visibility, image copy and bounds, concurrent reports')
 
 # ------------------------------------------------------- 4. Source wiring ---
-# The driver: reports only in direct mode and only once the app asked; the
-# desktop compositor path is unchanged; what the program sees is unchanged.
+# Cursor metadata is enabled only once the app asked, including desktop mode;
+# the compositor still owns the desktop cursor's image and drawing.
 check('if (!winios_desktop_mode() || !winios_cursor_set) return;' not in driver
       and 'cursor_set = winios_direct_cursor_set;' in driver
       and 'if (!winios_direct_cursor_on()) return;' in driver,
@@ -550,10 +687,11 @@ check('winios_user_driver.pSetCursorPos = winios_drv_set_cursor_pos;' in driver
       'pSetCursorPos reports and succeeds, as nulldrv does')
 check('if ((flags & MOUSEEVENTF_MOVE) && winios_direct_cursor_on()) winios_report_cursor_pos();' in driver,
       'every posted move reports where the server put the cursor')
-check(re.search(r'static int winios_direct_cursor_on\(void\)\s*\{\s*return !winios_desktop_mode\(\) && '
+check(re.search(r'static int winios_direct_cursor_on\(void\)\s*\{\s*return '
+                r'\(!winios_desktop_mode\(\) \|\| winios_mouse_routing_on\(\)\) &&\s*'
                 r'winios_direct_cursor_wanted && winios_direct_cursor_wanted\(\);', driver) is not None,
-      'the reports are gated on direct mode and the app')
-for sym in ('winios_direct_cursor_wanted', 'winios_direct_cursor_set', 'winios_direct_cursor_show',
+      'cursor metadata is gated on the app, available in both session modes')
+for sym in ('winios_mouse_routing_enabled', 'winios_direct_cursor_wanted', 'winios_direct_cursor_set', 'winios_direct_cursor_show',
             'winios_direct_cursor_pos'):
     check(re.search(sym + r'\([^;]*\)\s*__attribute__\(\(weak\)\);', driver) is not None, f'{sym} is a weak import')
 bridging = (app / 'Madeira-Bridging-Header.h').read_text()
@@ -578,16 +716,79 @@ check('HardwareInput.swift in Sources */,' in pbx and 'path = HardwareInput.swif
 check('Winios/WiniosCursor.c in Sources */,' in pbx and 'path = "Winios/WiniosCursor.c";' in pbx,
       'WiniosCursor.c is built')
 switches = ('MADEIRA_HWINPUT', 'MADEIRA_INPUT_FOCUS', 'MADEIRA_DIRECT_CURSOR', 'MADEIRA_POINTER_ABSOLUTE',
-            'MADEIRA_POINTER_LOCK', 'MADEIRA_POINTER_AUTOLOCK')
+            'MADEIRA_POINTER_LOCK', 'MADEIRA_POINTER_AUTOLOCK', 'MADEIRA_MOUSE_ROUTING')
 for switch in switches:
     check(f'flag("{switch}", defaultOn: true)' in source, f'{switch} switch, default on')
 glue = source.split('// MARK: - Device glue', 1)[1]
+check('Self.mouseRoutingEnabled && Self.enabled && gcDeltaSeen && currentRoute == .relative' in glue,
+      'surface positions are suppressed only when a raw mouse owns the relative route')
+check('SurfacePointerEvent.map(' in glue and 'hardwareRelative: relative' in glue,
+      'surface delivery uses the tested packet policy')
+check('HardwareInput.shared.surfacePointerEvent(x: x, y: y, flags: flags, data: data)' in cv,
+      'MetalBackedView routes surface packets through the hardware policy')
+for phase, method in [('down', 'Down'), ('move', 'Move'), ('up', 'Up')]:
+    calls = re.findall(r'\bwinios_post_touch_' + phase + r'\([^;\n]*', cv)
+    check(len(calls) == 1, f'legacy touch {phase} exists only in its normal-route wrapper')
+    wrapper = cv.split(f'private func postSurfaceTouch{method}', 1)[1].split('\n    }', 1)[0]
+    check('HardwareInput.shared.hardwareOwnsRelativeMotion' in wrapper
+          and 'postSurfacePointer(' in wrapper and f'winios_post_touch_{phase}(' in wrapper,
+          f'touch {phase} preserves the legacy route and maps hardware mouse-look')
+check('postSurfacePointer(ix, iy, F_MOVE)' in cv,
+      'surface relative motion cannot double-count a raw mouse delta')
+lock = glue.split('enum PointerLock {', 1)[1].split('private enum LegacyPointerLock', 1)[0]
+check('installedClasses.insert(ObjectIdentifier(cls)).inserted' in lock
+      and 'private static var installed = false' not in lock,
+      'pointer-lock hooks are installed per hosting class after root replacement')
+check('NSSelectorFromString("childViewControllerForPointerLock")' in lock
+      and 'childBody: @convention(block) (AnyObject) -> UIViewController? = { _ in nil }' in lock,
+      'the owned root keeps the lock preference rather than delegating it to a child')
+check(cv.count('PointerLock.register(host)') == 2,
+      'both app-owned overlay roots participate in the lock request')
+check('MetalBackedView.keyboardTarget?.window' in lock
+      and 'window.windowScene === scene && !window.isHidden' in lock,
+      'lock requests stay with visible owned roots in the game scene')
+check('scene.pointerLockState' in lock and 'state?.isLocked == true' in lock
+      and 'UIPointerLockState.didChangeNotification' in lock,
+      'diagnostics observe the resolved system lock, separately from its request')
+check('keyRoot != lastKeyRoot' in lock and 'request != lastWanted' in lock,
+      'key-controller and focus/preference changes refresh the lock request')
+check('private static weak var lastScene: UIWindowScene?' in lock
+      and 'gameWindow?.windowScene ?? lastScene' in lock,
+      'the previous scene can release its lock after the game surface detaches')
+check('guard HardwareInput.mouseRoutingEnabled else { LegacyPointerLock.refresh(); return }' in lock,
+      'rollback selects the previous key-window-only pointer-lock implementation')
+check('guard HardwareInput.mouseRoutingEnabled else { return }' in lock.split('static func register', 1)[1].split('private static func include', 1)[0],
+      'rollback does not register the new overlay lock owners')
+legacy = glue.split('private enum LegacyPointerLock {', 1)[1].split('final class PointerHider', 1)[0]
+check('childViewControllerForPointerLock' not in legacy and 'HardwareInput.shared.pointerLocked' in legacy
+      and 'keyWindow()?.rootViewController?.setNeedsUpdateOfPrefersPointerLocked()' in legacy,
+      'legacy pointer lock keeps child delegation and the original manual-lock preference')
+check('if Self.mouseRoutingEnabled {' in glue.split('private func attachMouse', 1)[1].split('private func detachMouse', 1)[0]
+      and 'm.leftButton.pressedChangedHandler =' in glue,
+      'rollback retains pressed callbacks rather than value callbacks and polling')
+check('guard Self.enabled, Self.mouseRoutingEnabled || !gcLive else { return }' in glue
+      and ': (baseFocused ? want : [])' in glue,
+      'rollback restores the original raw-versus-fallback button gate')
+check('if !Self.mouseRoutingEnabled {\n            let drop = shouldIgnore(touches, logging: phase == .began)' in glue,
+      'rollback restores per-callback touch filtering')
+check('if (winios_mouse_routing_enabled())' in (app / 'Winios/Winios.m').read_text(),
+      'desktop compositor metadata follows the same startup switch')
+check('input.valueChangedHandler =' in glue and 'down: value > 0' in glue,
+      'mouse callbacks use the normalized button value')
+check('rawButtons.sample(device, held: Self.heldButtons(inputs))' in glue
+      and 'DispatchSource.makeTimerSource(queue: self.mouseQueue)' in glue,
+      'button state sampling shares the serial callback queue and edge history')
+check('updateButtonPolling(active: Self.mouseRoutingEnabled && appActive && mouseConnected)' in glue,
+      'button polling stops while inactive or disconnected')
+check('touchFilter.consume(ObjectIdentifier(touch)' in glue,
+      'touch interception keeps the press decision through release/cancellation')
 # Every path to the program goes through the focus decision.
 check('keys.wanted(focused: keyboardFocused)' in glue and 'keys.press(vk, focused: keyboardFocused)' in glue,
       'keys reach the program only with keyboard focus')
 check('if r == .relative { postMotion(dx, -dy) }' in glue, 'GCMouse motion is posted only on the relative route')
 check('let blocked = route == .blocked' in glue, 'the wheel is gated on focus')
-check('let allowed = baseFocused ? want : []' in glue, 'UIKit pointer buttons are gated on focus')
+check(re.search(r'MouseButtonSources\.merge\([^)]*focused: baseFocused\)', glue) is not None,
+      'fallback pointer buttons use the tested focus-gated source merge')
 check('guard let p = profile, HardwareInput.shared.baseFocused, !GamepadInput.shared.keyboardMouseOn else { return }' in glue,
       'the right-stick mouse is gated on focus, and stands down in keyboard-and-mouse controller mode')
 check('presentedViewController != nil' in glue and 'fr is UIKeyInput' in glue

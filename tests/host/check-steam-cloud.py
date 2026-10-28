@@ -30,6 +30,7 @@ def require(condition, label):
 cloud = (app / 'SteamCloud.swift').read_text()
 owned = (app / 'SteamOwnedLibrary.swift').read_text()
 compare = cloud[cloud.index('// MARK: - Where a cloud path lives in the Wine prefix'):cloud.index('// MARK: - Download')]
+compare = compare[:compare.index('// MARK: - One Windows profile per prefix')] + compare[compare.index('// MARK: - Comparison'):]
 plan = cloud[cloud.index('// MARK: - What to do with a comparison'):cloud.index('// MARK: - Upload')]
 state = cloud[cloud.index('// MARK: - State the interface shows'):]
 

@@ -47,6 +47,29 @@ OVERLAY = {
                 "kind": "int", "default": "10",
                 "note": "Default 10 ms between pasted characters. Range 5-100 ms; use a longer interval for games "
                         "that miss fast text input. Enforced at delivery as well as queueing. Restart the session after changing it."},
+    "env.MADEIRA_DOCK_STEAM_RUN": {"category": "Steam & Dock", "kind": "bool", "default": "1",
+                "note": "On by default: when a game in a Madeira Dock session asks Steam to start another game "
+                        "(steam.exe with steam://run/<App ID>, as Black Ops II's campaign does for Zombies), "
+                        "steam.exe is not started and Madeira starts that game when it is next opened. 0 lets "
+                        "steam.exe start as before (the full Steam client, which updates itself and stops at a "
+                        "black window in a Dock session).",
+                "sources": ["build/ntdll-unix/process_ios.c"]},
+    # The iOS audio driver (build/ntdll-unix/audio_null_ios.c): the two a player may need.
+    "env.MADEIRA_AUDIO_LEAD_MS": {"category": "Audio", "title": "Sound buffer",
+                "kind": "choice", "default": "",
+                "choices": [("", "60 ms (default)"), ("100", "100 ms"), ("150", "150 ms"), ("200", "200 ms"),
+                            ("300", "300 ms")],
+                "note": "How much sound Madeira keeps queued ahead of the speaker (10-500 ms, default 60). If a "
+                        "game's sound crackles or sounds scratchy, a larger buffer usually clears it, at the cost "
+                        "of sound lagging slightly behind the picture: Black Ops II's Zombies crackled at 60 ms "
+                        "and was clean at 150. A game's own config can set it for that game alone. Applies at "
+                        "the next game start."},
+    "env.MADEIRA_AUDIO_DOWNMIX": {"category": "Audio", "title": "Mix surround sound down to stereo",
+                "kind": "bool", "default": "1",
+                "note": "On by default: a game that plays 5.1 or 7.1 sound has every channel folded into the "
+                        "two speakers, so voices (in the centre channel), bass and the rear channels are heard. "
+                        "Off keeps only the front left and right channels, as Madeira did before, which loses "
+                        "most dialogue in a surround game. Applies at the next game start."},
     "env.MADEIRA_PIN_GRAPHICS_DLLS": {"category": "Memory & JIT pool", "title": "Keep graphics DLLs loaded",
                 "kind": "bool", "default": "0",
                 "note": "Default off. On a D3D12 device/probe call, pins already loaded D3D12, DXGI and Wine Metal "
@@ -431,6 +454,8 @@ OVERLAY = {
                         "processes only. Does not shrink live buffers or the pool-low-margin."},
     "env.MADEIRA_IMAGE_PATCH_TRACE": {"category": "Debugging / logs", "title": "DLL code patch trace", "kind": "bool", "default": "0",
                 "note": "1 logs up to 64 successful 1–16 byte executable-image protection requests and their PE/pool bytes. Read-only, owner-aware diagnostics; does not alter hooks or code."},
+    "env.MADEIRA_MOUSE_ROUTING": {"title": "Mouse routing and pointer-lock fixes",
+        "note": "Default on. 0 restores the previous desktop cursor routing, mouse button callbacks, surface-touch handling and key-window-only pointer lock. Keyboard input and manual Ctrl+Alt+P remain available. Fully restart Madeira after changing this switch."},
     "swap-mb": { "note": "Moves game data to a file on this device's storage when memory runs short, up to this size. Off by default; read at launch.", "category": "Memory & JIT pool","title": "Swap tier size", "kind": "choice",
                 "choices": [("", "Off"), ("1024", "1 GB"), ("2048", "2 GB"), ("3072", "3 GB"), ("4096", "4 GB")]},
     "env.MADEIRA_SWAP_COVERAGE": {"category": "Memory & JIT pool", "note": "Which allocations the swap tier backs with its file (only when the tier is on). Large allocations (classic, the default): single 8 MB+ commits in the guest band. All allocations of 1 MB+ (blocks). 1 MB+ and overflow (wide): blocks plus allocations outside the band and fresh reservations. Whole reservations 4 MB+ (broad, ml1257): every new reservation of at least swap-min-mb (4 MB) below FEX's band backed whole when made, holes punched on decommit, swap-mb caps the disk it uses (a soft cap, checked when a block is backed). Unset: broad if swap-mode = 2, else classic.", "title": "Swap tier coverage", "kind": "choice",
@@ -678,6 +703,17 @@ OVERLAY = {
                 "note": "Kill switch, default 0: a file's size, index or end-of-file query (GetFileSizeEx and the "
                         "like) is answered from one fstat; the two extended-attribute reads that came after it fed "
                         "only file attributes, which these queries do not return. 1: as before. Read once per app run."},
+    "env.MADEIRA_DIRCACHE": {"category": "Wine core (ntdll)", "title": "Remember directory listings for file lookups",
+                "kind": "bool", "default": "1",
+                "note": "Kill switch, default 1: a file name that does not match in its exact case is looked up in "
+                        "an in-memory copy of its directory instead of a volume query and a directory read each "
+                        "time (twice when the name is absent). Source-engine games such as Team Fortress 2 probe "
+                        "thousands of absent paths while loading and during play. 0: as before. Read once per app run."},
+    "env.MADEIRA_DIRCACHE_TTL_MS": {"category": "Wine core (ntdll)", "title": "Directory listing trust window (ms)",
+                "kind": "int", "default": "1000",
+                "note": "How long a remembered listing is used without checking the directory, while no file was "
+                        "created, renamed, linked or deleted through Wine. After that one stat of the directory "
+                        "decides whether it is read again. 0 checks it on every lookup. Read once per app run."},
     "env.MADEIRA_SRV_LOG_ALL": {"category": "Wine server", "title": "Every per-descriptor server log line",
                 "kind": "bool", "default": "0",
                 "sources": ["build/wineserver/fd_ios.c", "build/wineserver/request_ios.c"],
@@ -755,16 +791,12 @@ OVERLAY = {
                 "note": "Only with env.MADEIRA_FPS_GOV_MW set: how much energy the running balance may drift above or "
                         "below the target before the cap moves one step (100-100000; unset or out of range: 1500). "
                         "Smaller moves the cap sooner and more often. Read at session start."},
-    # madeira-bcd: the orphan-lock reaper's stamped mode (wine: dlls/ntdll/unix/sync.c).
     "env.MADEIRA_LOCK_ORPHAN": {"category": "Wine core (ntdll)", "title": "Orphan-lock reaper mode",
                 "kind": "choice", "default": "",
-                "choices": [("", "As before"), ("stamped", "Only stamped locks"), ("0", "Off")],
-                "note": "The monitor releases an SRW lock it believes a dead thread left held. Unset (default): as "
-                        "before, which counts one strike per parked waiter, so a busy lock with 3 waiters is released "
-                        "at once even while its owner lives (Horizon Zero Dawn stopped with \"Error\" right after such "
-                        "a release, build 479). stamped: one strike per monitor cycle, three in a row, and only locks a "
-                        "live thread has stamped (FEX's code-buffer locks) can be released. 0: no releases. The "
-                        "dead-thread reaper is unchanged. Restart the session after changing it."},
+                "choices": [("", "Only stamped locks (default)"), ("stamped", "Only stamped locks"), ("0", "Off")],
+                "note": "Default and stamped: only a lock seen held by FEX can be released, after three monitor "
+                        "cycles with the same lock word and no live owner stamp. Guest locks are never released. "
+                        "0: no orphan-lock releases. The dead-thread reaper is unchanged. Restart the session after changing it."},
     # madeira-bcd: small staging rings in DXMT's d3d11 (the dxmt change of this wave).
     "env.DXMT_SMALL_RINGS": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Small DXMT staging rings for these programs",
                 "kind": "text", "default": "",

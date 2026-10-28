@@ -28,6 +28,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <locale.h>
+#include <limits.h>
 #include <langinfo.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -61,6 +62,8 @@
 #include "ios_wow.h"
 #include "locale_private.h"
 #include "error.h"
+#define MADEIRA_REDACT_WINE
+#include "../madeira_redact.h"   /* the command line is logged with credential-like values redacted */
 
 #ifdef WINE_IOS
 #include <os/log.h>
@@ -1509,19 +1512,24 @@ static WCHAR *get_initial_directory(void)
         if (madeira_cwd && *madeira_cwd)
         {
             size_t len = strlen(madeira_cwd);
-            ret = malloc((len + 8) * sizeof(WCHAR));
-            /* Format: \??\<path>[\] */
-            ret[0] = '\\'; ret[1] = '?'; ret[2] = '?'; ret[3] = '\\';
-            for (size_t i = 0; i < len; i++) ret[4 + i] = madeira_cwd[i];
-            ret[4 + len] = 0;
-            /* ensure trailing backslash */
-            if (len && ret[4 + len - 1] != '\\')
+            unsigned int written;
+
+            /* The bridge supplies UTF-8, not bytes in the Windows code page.
+             * Leave room for the NT prefix, an optional separator and NUL. */
+            if (len <= UINT_MAX / sizeof(WCHAR) - 6 &&
+                (ret = malloc((len + 6) * sizeof(WCHAR))))
             {
-                ret[4 + len] = '\\';
-                ret[4 + len + 1] = 0;
+                if (!utf8_mbstowcs(ret + 4, len, &written, madeira_cwd, len))
+                {
+                    ret[0] = '\\'; ret[1] = '?'; ret[2] = '?'; ret[3] = '\\';
+                    if (written && ret[4 + written - 1] != '\\') ret[4 + written++] = '\\';
+                    ret[4 + written] = 0;
+                    os_log(OS_LOG_DEFAULT, "[Wine] get_initial_directory: MADEIRA_INITIAL_CWD override = %s", madeira_cwd);
+                    return ret;
+                }
+                free(ret);
+                ret = NULL;
             }
-            os_log(OS_LOG_DEFAULT, "[Wine] get_initial_directory: MADEIRA_INITIAL_CWD override = %s", madeira_cwd);
-            return ret;
         }
     }
 
@@ -2260,7 +2268,7 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     cmdline = build_command_line( main_wargv );
 
     TRACE( "image %s cmdline %s dir %s\n",
-           debugstr_w(main_wargv[0]), debugstr_w(cmdline), debugstr_w(curdir) );
+           debugstr_w(main_wargv[0]), madeira_debugstr_cmdline_w(cmdline), debugstr_w(curdir) );
 
     /* Leave the following strings after the entire CWD, including its NUL. */
     dos_curdir = get_dos_path( curdir );

@@ -164,7 +164,14 @@ final class DepotDownloader {
         let remaining = prepared.remainingUncompressed
         if remaining > 0 {
             // Unknown free space does not block the download.
-            if let free = installURL.freeSpace, case let available = UInt64(free), available < remaining { throw SteamError.insufficientDiskSpace(needed: remaining, available: available) }
+            if let free = installURL.freeSpace, case let available = UInt64(free) {
+                if available < remaining { throw SteamError.insufficientDiskSpace(needed: remaining, available: available) }
+                let headroom = available - remaining
+                if headroom < 1_073_741_824 {
+                    let freeMB = headroom / (1024 * 1024)
+                    SteamLog.event("[steam-depot] low disk space warning: \(freeMB) MB free after install")
+                }
+            }
         }
 
         // 3a. Files already on disk (a repair, an update, a moved game): each is

@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include "../../build/madeira_cfg.h"   /* ml1095: one config file */
+#include "../../build/madeira_redact.h"   /* the arguments are logged with credential-like values redacted */
 #include <sys/stat.h>
 #include <pwd.h>
 #include <limits.h>
@@ -359,12 +360,26 @@ volatile int g_madeira_srv_log_all = 0;      /* env.MADEIRA_SRV_LOG_ALL = 1 */
  * logging. g_launch_exit holds (1 << 32) | status when the program ended with
  * an NTSTATUS error (0xC...), else 0. */
 static uint64_t g_launch_exit = 0;
+/* A game in a Madeira Dock session asked Steam to start another game
+ * (steam://run/<App ID>); ntdll's process gate (build/ntdll-unix/process_ios.c)
+ * refuses steam.exe and reports the App ID here. 0: none since the last reset. */
+static uint32_t g_steam_run_app = 0;
+void wine_steam_run_requested(unsigned int appid) {
+    __atomic_store_n(&g_steam_run_app, appid, __ATOMIC_RELEASE);
+}
+int wine_steam_run_request(uint32_t *appid) {
+    uint32_t value = __atomic_load_n(&g_steam_run_app, __ATOMIC_ACQUIRE);
+    if (!value) return 0;
+    if (appid) *appid = value;
+    return 1;
+}
 void wine_launched_process_did_exit(int status) {
     if ((uint32_t)status >= 0xC0000000u)
         __atomic_store_n(&g_launch_exit, (UINT64_C(1) << 32) | (uint32_t)status, __ATOMIC_RELEASE);
 }
 void wine_exit_status_reset(void) {
     __atomic_store_n(&g_launch_exit, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_steam_run_app, 0, __ATOMIC_RELEASE);
 }
 int wine_crash_exit_status(uint32_t *status) {
     uint64_t value = __atomic_load_n(&g_launch_exit, __ATOMIC_ACQUIRE);
@@ -568,6 +583,9 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
  * target take exactly the code path they took before.
  * ========================================================================= */
 #define MADEIRA_IMAGE_FILE_MACHINE_I386 0x014c
+#define MADEIRA_IMAGE_FILE_MACHINE_AMD64 0x8664
+#define MADEIRA_IMAGE_FILE_MACHINE_ARM64 0xaa64
+#define MADEIRA_IMAGE_FILE_MACHINE_ARM64EC 0xa641
 
 /* build/ntdll-unix/virtual_ios.c: nonzero when this session's MAIN image is
  * 32-bit. The unix side reserves the process's guest window before its first
@@ -600,8 +618,7 @@ static uint16_t madeira_pe_machine(const char *unix_path)
  * known (the caller then treats the target as 64-bit, as before).
  *  - "C:\...\app.exe": the file under the prefix's drive_c.
  *  - a bare name: the launch resolves it as C:\windows\system32\<name>, which
- *    links the 64-bit farms, so a name present in a 64-bit farm is not probed
- *    any further. Otherwise it is looked up in the bundle's i386-windows. To
+ *    links the 64-bit farms; the first farm copy's PE header is probed. Otherwise it is looked up in the bundle's i386-windows. To
  *    launch the 32-bit build of a name both sets carry (explorer.exe, cmd.exe),
  *    give its full path, C:\windows\syswow64\<name>.
  *  - any other form (another drive, a relative Win32 path) is not probed. */
@@ -624,14 +641,30 @@ static uint16_t madeira_target_machine(const char *exe, const char *prefix, NSSt
     {
         for (size_t i = 0; i < sizeof(farms64) / sizeof(farms64[0]); i++)
         {
-            snprintf(probe, sizeof(probe), "%s/%s/%s", bundle.fileSystemRepresentation, farms64[i], exe);
-            if (access(probe, R_OK) == 0) return 0;
+            if (snprintf(probe, sizeof(probe), "%s/%s/%s", bundle.fileSystemRepresentation, farms64[i], exe)
+                    >= (int)sizeof(probe))
+                return 0;
+            if (access(probe, R_OK) == 0) return madeira_pe_machine(probe);
         }
         if (snprintf(probe, sizeof(probe), "%s/i386-windows/%s", bundle.fileSystemRepresentation, exe)
                 >= (int)sizeof(probe))
             return 0;
     }
     return madeira_pe_machine(probe);
+}
+
+/* Select the core by the executable's machine, not its spelling. The explicit
+ * force switch stays available; the i386 (WoW64) rule still takes precedence.
+ * Unknown or unreadable targets keep the original name/path heuristic. */
+static BOOL madeira_use_arm64ec_for_target(const char *exe, const char *force_ec,
+                                           uint16_t machine, BOOL has_i386_set)
+{
+    if (has_i386_set && machine == MADEIRA_IMAGE_FILE_MACHINE_I386) return NO;
+    if (force_ec && *force_ec == '1') return YES;
+    if (machine == MADEIRA_IMAGE_FILE_MACHINE_AMD64 || machine == MADEIRA_IMAGE_FILE_MACHINE_ARM64EC)
+        return YES;
+    if (machine == MADEIRA_IMAGE_FILE_MACHINE_ARM64) return NO;
+    return strstr(exe, "x64") != NULL || strchr(exe, '\\') != NULL;
 }
 
 /* The bundle carries the i386 Wine set. */
@@ -951,6 +984,52 @@ static void madeira_publish_host_probe(void)
     }
     setenv("FEX_MADEIRA_HOSTPROBE", buf, 1);
     dprintf(STDERR_FILENO, "[WineProc] FEX host feature probe: %s\n", buf);
+}
+
+/* Decode Windows argument quoting before Wine rebuilds its command line from
+ * argv. Based on Wine's CommandLineToArgvW non-executable argument rules:
+ * backslashes escape quotes only when immediately followed by a quote.
+ * Never silently discard arguments or truncate the caller's command. */
+static int madeira_split_launch_args(const char *input, char *storage, size_t storage_capacity,
+                                     char **argv_out, size_t argv_capacity) {
+    const char *s = input ? input : "";
+    char *d = storage;
+    size_t length, argc = 0;
+    if (!storage || !storage_capacity || (!argv_out && argv_capacity)) return -1;
+    length = strnlen(s, storage_capacity);
+    if (length >= storage_capacity) return -1;
+    for (size_t i = 0; i < length; i++)
+        if (((unsigned char)s[i] < 32 && s[i] != '\t') || (unsigned char)s[i] == 127) return -1;
+    while (*s) {
+        unsigned int quotes = 0, backslashes = 0;
+        while (*s == ' ' || *s == '\t') s++;
+        if (!*s) break;
+        if (argc == argv_capacity) return -2;
+        argv_out[argc++] = d;
+        while (*s && !((*s == ' ' || *s == '\t') && !quotes)) {
+            if (*s == '\\') {
+                *d++ = *s++;
+                backslashes++;
+            } else if (*s == '"') {
+                if (!(backslashes & 1)) {
+                    d -= backslashes / 2;
+                    if (quotes && s[1] == '"') { *d++ = '"'; s++; }
+                    else quotes = !quotes;
+                } else {
+                    d -= backslashes / 2 + 1;
+                    *d++ = '"';
+                }
+                s++;
+                backslashes = 0;
+            } else {
+                *d++ = *s++;
+                backslashes = 0;
+            }
+        }
+        if (quotes) return -1;
+        *d++ = 0;
+    }
+    return (int)argc;
 }
 
 static void *wine_process_thread(void *arg) {
@@ -1323,6 +1402,7 @@ static void *wine_process_thread(void *arg) {
                  * applyEnvironment exports belongs here (check-frontend). The game's own
                  * config lines ($MADEIRA_CFG_GAME, below) come after and win over both. */
                 static const char *const per_launch[] = {
+                    "MADEIRA_DESKTOP",          /* the game's Directly / In the Wine desktop choice */
                     "MADEIRA_FASTSYNC", "MADEIRA_FASTSYNC_SEM", "MADEIRA_CPU_COUNT", "DXMT_D9_ANISO_LIMIT",
                     "FEX_X87REDUCEDPRECISION",   /* ml1184: the game's "Reduced-precision x87" */
                     "MADEIRA_DINPUT_PAD",        /* ml1240: the game's "XInput and DirectInput" */
@@ -1560,9 +1640,6 @@ static void *wine_process_thread(void *arg) {
         // Otherwise: detect "x64" in the exe name (cube-x64, fib-x64, etc.)
         // OR a Win32 full path (real game launches typically need ARM64EC).
         const char *force_ec = getenv("MADEIRA_USE_ARM64EC");
-        BOOL use_arm64ec = (force_ec && *force_ec == '1') ||
-                           (strstr(madeira_exe, "x64") != NULL) ||
-                           (strchr(madeira_exe, '\\') != NULL);
 
         /* WoW64: a 32-bit (i386) target, from the PE header on disk rather
          * than the name. Its 64-bit half runs on the plain aarch64 core (the
@@ -1576,7 +1653,11 @@ static void *wine_process_thread(void *arg) {
         dprintf(STDERR_FILENO, "[WineProc] PE probe: machine=0x%x%s\n", target_machine,
                 is_i386_target ? " (i386: WoW64)" :
                 target_machine == MADEIRA_IMAGE_FILE_MACHINE_I386 ? " (i386, but the bundle has no i386-windows)" : "");
-        if (is_i386_target) use_arm64ec = NO;
+        const BOOL use_arm64ec = madeira_use_arm64ec_for_target(madeira_exe, force_ec,
+                                                               target_machine, has_i386_set);
+        dprintf(STDERR_FILENO, "[WineProc] PE routing: machine=0x%04x bundle=%s i386-set=%d force-ec=%d\n",
+                target_machine, use_arm64ec ? "arm64ec-windows" : "aarch64-windows",
+                has_i386_set, force_ec && *force_ec == '1');
         const char *bundle_subdir = use_arm64ec ? "arm64ec-windows" : "aarch64-windows";
         LOG("Target exe: %{public}s (bundle=%{public}s)", madeira_exe, bundle_subdir);
         dprintf(STDERR_FILENO, "[WineProc] Target exe: %s (bundle=%s)\n", madeira_exe, bundle_subdir);
@@ -1910,43 +1991,36 @@ static void *wine_process_thread(void *arg) {
             snprintf(exe_path, sizeof(exe_path), "C:\\windows\\system32\\%s", madeira_exe);
         }
 
-        // Optional MADEIRA_ARGS env var: args appended to argv, split in place.
-        // ml1163: double quotes group a token, so a game path such as
-        // "C:\Program Files\Game\game.exe" (a library game started in the Wine
-        // desktop hands explorer one) stays ONE argument. The quotes themselves are
-        // dropped: Wine re-quotes any argv entry with a space when it builds the
-        // command line. Up to 64 extra tokens (was 16, split on spaces only).
+        // Optional MADEIRA_ARGS: Windows command-line quoting (CommandLineToArgvW
+        // rules), at most 64 arguments in 4 KB. Malformed or oversized input
+        // fails the launch instead of silently dropping or splitting arguments.
         static char args_buf[4096];
         char *extra_argv[64] = {0};
-        int extra_argc = 0;
         const char *madeira_args = getenv("MADEIRA_ARGS");
-        if (madeira_args && *madeira_args) {
-            strncpy(args_buf, madeira_args, sizeof(args_buf) - 1);
-            args_buf[sizeof(args_buf) - 1] = 0;
-            char *r = args_buf, *w = args_buf;   /* w never passes r: tokens only shrink */
-            while (*r && extra_argc < 64) {
-                while (*r == ' ' || *r == '\t') r++;
-                if (!*r) break;
-                extra_argv[extra_argc++] = w;
-                int quoted = 0;
-                while (*r && (quoted || (*r != ' ' && *r != '\t'))) {
-                    if (*r == '"') { quoted = !quoted; r++; continue; }
-                    *w++ = *r++;
-                }
-                if (*r) r++;
-                *w++ = 0;
-            }
+        int extra_argc = madeira_split_launch_args(madeira_args, args_buf, sizeof(args_buf),
+                                                   extra_argv, sizeof(extra_argv) / sizeof(extra_argv[0]));
+        if (extra_argc < 0) {
+            dprintf(STDERR_FILENO, "[WineProc] launch rejected: invalid or oversized arguments (parser=%d)\n", extra_argc);
+            wine_launched_process_did_exit((int)0xc000000d); /* STATUS_INVALID_PARAMETER */
+            g_wine_running = 0;
+            wineserver_stop();
+            return NULL;
         }
 
-        char *argv[72];
+        char *argv[67]; /* wine + executable + 64 arguments + NULL */
         int argc = 0;
         argv[argc++] = "wine";
         argv[argc++] = exe_path;
         for (int i = 0; i < extra_argc; i++) argv[argc++] = extra_argv[i];
         argv[argc] = NULL;
         dprintf(STDERR_FILENO, "[WineProc] argv[1] = %s\n", exe_path);
+        /* An argument may be a credential (a sign-in token, a password): each is
+         * logged as a redacted copy; argv itself is passed on unchanged. */
+        int credential_next = 0;
         for (int i = 0; i < extra_argc; i++) {
-            dprintf(STDERR_FILENO, "[WineProc] argv[%d] = %s\n", 2 + i, extra_argv[i]);
+            char shown[sizeof(args_buf) + 64];
+            madeira_redact_arg_a(extra_argv[i], &credential_next, shown, sizeof(shown));
+            dprintf(STDERR_FILENO, "[WineProc] argv[%d] = %s\n", 2 + i, shown);
         }
 
         /* iOS-Madeira: chdir to the unix path that maps to the exe's Wine
@@ -2088,6 +2162,8 @@ static void *wine_process_thread(void *arg) {
         unsetenv("MADEIRA_CPU_COUNT"); unsetenv("DXMT_D9_ANISO_LIMIT");
         unsetenv("FEX_X87REDUCEDPRECISION");   /* ml1184 */
         unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
+        unsetenv("MADEIRA_DESKTOP");           /* each launch chooses its own presentation mode */
+        unsetenv("MADEIRA_DIRECT_WINDOW_SIZE"); /* a game's opt-in must not resize the next game */
         /* madeira-bcd: Horizon Zero Dawn's per-game switches must not reach a later game
          * of this app run (GTA V Enhanced runs without them). */
         unsetenv("MADEIRA_SRV_FGETPATH");

@@ -190,6 +190,7 @@ struct FPSOverlay: View {
     private let bufferCapacity = 50  // 5s @ 100ms
     /// ml606: live phys_footprint in MB, refreshed on the 250ms display tick.
     @State private var memMB: Int = 0
+    @State private var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
 
     /// iOS jetsams this app at EXACTLY 4096MB of phys_footprint (memory:
     /// "Jetsam = EXACTLY 4096MB"). task_info(TASK_VM_INFO) reports the very
@@ -230,6 +231,7 @@ struct FPSOverlay: View {
                     capturePill
                     ecoPill
                     fencePill
+                    thermalPill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(6)
@@ -261,6 +263,7 @@ struct FPSOverlay: View {
                     capturePill
                     ecoPill
                     fencePill
+                    thermalPill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(.horizontal, 8)
@@ -378,6 +381,19 @@ struct FPSOverlay: View {
             }
     }
 
+    @ViewBuilder
+    private var thermalPill: some View {
+        if thermalState == .serious || thermalState == .critical {
+            let isCritical = thermalState == .critical
+            Text(isCritical ? "CRIT" : "HOT")
+                .foregroundColor(.white)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(isCritical ? Color.red : Color.orange)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(isCritical ? Color.red : Color.orange, lineWidth: 1))
+        }
+    }
+
     private func pillLabel(for mode: Int32) -> String {
         switch mode {
         case 1: return "60"
@@ -432,6 +448,7 @@ struct FPSOverlay: View {
             // ml606: piggybacks on the existing tick, so it costs one extra
             // task_info per 250ms and no additional SwiftUI invalidation.
             memMB = readFootprintMB()
+            thermalState = ProcessInfo.processInfo.thermalState
         }
     }
 

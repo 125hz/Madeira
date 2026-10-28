@@ -41,8 +41,13 @@ int wine_process_exit_code(void);
 // (0xC...) since the last reset.
 void wine_launched_process_did_exit(int status);
 int wine_crash_exit_status(uint32_t *status);
-// Forget the recorded status; called when a session begins.
+// Forget the recorded status (and the Steam request below); called when a session begins.
 void wine_exit_status_reset(void);
+// A game in a Madeira Dock session asked Steam to start another game
+// (steam://run/<App ID>). ntdll calls wine_steam_run_requested(); returns 1
+// and fills *appid when one was asked since the last reset.
+void wine_steam_run_requested(unsigned int appid);
+int wine_steam_run_request(uint32_t *appid);
 
 // Steam S0 net-test VPN gate: write C:\madeira-continue.flag into the
 // prefix's drive_c so the paused winhttp-test.exe resumes to the Steam

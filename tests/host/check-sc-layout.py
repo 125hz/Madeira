@@ -441,10 +441,10 @@ int main( void )
 
     /* best-fit basics */
     memset( t, 0, sizeof(t) );
-    t[0] = (struct ios_pool_free){ 0x100000, 0x800000, 0, 0 };
-    t[1] = (struct ios_pool_free){ 0x900000, 0x40000, 0, 0 };
-    t[2] = (struct ios_pool_free){ 0xa00000, 0x40000, 0, 0 };
-    t[3] = (struct ios_pool_free){ 0xb00000, 0x20000, 99, 0 };   /* still in its grace */
+    t[0] = (struct ios_pool_free){ 0x100000, 0x800000, 0, 0 , 0};
+    t[1] = (struct ios_pool_free){ 0x900000, 0x40000, 0, 0 , 0};
+    t[2] = (struct ios_pool_free){ 0xa00000, 0x40000, 0, 0 , 0};
+    t[3] = (struct ios_pool_free){ 0xb00000, 0x20000, 99, 0 , 0};   /* still in its grace */
     if (ios_pool_best_fit( t, 4, 0x40000, 100, (size_t)-1, 0 ) != 1) FAIL("smallest fit, first of equals\n");
     if (ios_pool_best_fit( t, 4, 0x10000, 100, (size_t)-1, 0 ) != 1) FAIL("a range in its grace was picked\n");
     if (ios_pool_best_fit( t, 4, 0x10000, 103, (size_t)-1, 0 ) != 3) FAIL("grace-expired smallest not picked\n");

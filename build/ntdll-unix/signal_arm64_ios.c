@@ -547,6 +547,399 @@ static void *ios_stale_va_scanner( void *arg )
 
 /* Per-thread trampoline for signal handlers (runs on faulting thread) */
 static __thread void *ios_my_trampoline = NULL;
+
+/***********************************************************************
+ *           write watch  (ml1201)
+ *
+ * MADEIRA_WATCH_WRITES=<hex address>[:<hex length>] names a guest range
+ * whose writers must be caught. Log 58 (upstream-1011-4) showed a
+ * bytecode-VM pointer slot in the main image's .rdata (zero on disk) that
+ * held a table address plus one at the time of the crash; .rdata is
+ * mapped write-copy, so the write was an ordinary host store and nothing
+ * saw it. The watch strips PROT_WRITE from the host page that holds the
+ * range whenever Wine grants it (mprotect_range in virtual_ios.c, plus a
+ * sweep from the pump), and the Mach handler then emulates every store to
+ * that page through the usual store emulator, reporting the ones that
+ * touch the range: host pc and instruction, the value, the guest RIP and
+ * its x86 bytes, the EC registers, and the bytes in the range afterwards.
+ * A store the emulator cannot decode disarms the watch (the page is left
+ * writable) rather than stopping the program. Diagnostic only; unset = off.
+ */
+enum { IOS_WATCH_PAGE = 0x4000 };
+static uintptr_t ios_watch_lo, ios_watch_hi, ios_watch_page;
+static int ios_watch_state;            /* 0 unconfigured, 1 active, -1 off, -2 disarmed */
+static unsigned long ios_watch_hits, ios_watch_other;
+
+static void ios_watch_init( void )
+{
+    const char *e;
+    char *end;
+    uintptr_t a, len = 8;
+
+    if (ios_watch_state) return;
+    e = getenv( "MADEIRA_WATCH_WRITES" );
+    if (!e || !*e) { ios_watch_state = -1; return; }
+    a = (uintptr_t)strtoull( e, &end, 16 );
+    if (*end == ':' || *end == ',') len = (uintptr_t)strtoull( end + 1, NULL, 16 );
+    if (!a || !len) { ios_watch_state = -1; return; }
+    ios_watch_lo = a;
+    ios_watch_hi = a + len;
+    ios_watch_page = a & ~(uintptr_t)(IOS_WATCH_PAGE - 1);
+    ios_watch_state = 1;
+    dprintf( 2, "[watch] ml1201 writes to [%p,%p) are watched through host page %p\n",
+             (void *)ios_watch_lo, (void *)ios_watch_hi, (void *)ios_watch_page );
+}
+
+static int ios_watch_covers( uintptr_t addr )
+{
+    ios_watch_init();
+    return ios_watch_state == 1 && (addr & ~(uintptr_t)(IOS_WATCH_PAGE - 1)) == ios_watch_page;
+}
+
+/* Called after Wine changes host protections (virtual_ios.c mprotect_range) and from the
+ * pump sweep: while the watch is active the host page must not be writable. */
+void ios_watch_after_protect( const void *base, size_t size, const char *why )
+{
+    mach_vm_address_t ra;
+    mach_vm_size_t rs = 0;
+    vm_region_basic_info_data_64_t ri;
+    mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t ro = MACH_PORT_NULL;
+    int prot;
+
+    ios_watch_init();
+    if (ios_watch_state != 1) return;
+    if ((uintptr_t)base >= ios_watch_page + IOS_WATCH_PAGE || (uintptr_t)base + size <= ios_watch_page) return;
+    ra = ios_watch_page;
+    if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&ri, &rc, &ro ) != KERN_SUCCESS || ra > ios_watch_page)
+        return;                                   /* not mapped yet */
+    if (!(ri.protection & VM_PROT_WRITE)) return;
+    prot = (ri.protection & VM_PROT_READ ? PROT_READ : 0) | (ri.protection & VM_PROT_EXECUTE ? PROT_EXEC : 0);
+    if (mprotect( (void *)ios_watch_page, IOS_WATCH_PAGE, prot ) == 0)
+    {
+        static unsigned long armed;
+        if (++armed <= 16 || !(armed & 1023))
+            dprintf( 2, "[watch] ml1201 armed #%lu (%s): host page %p write stripped (was %d)\n",
+                     armed, why, (void *)ios_watch_page, ri.protection );
+    }
+    else
+        dprintf( 2, "[watch] ml1201 mprotect(%p) failed errno=%d (%s); the watch has a hole\n",
+                 (void *)ios_watch_page, errno, why );
+}
+
+/* ml1205: dump a thread's block-entry ring (FEX writes it when MADEIRA_BLOCK_RING is set and
+ * publishes the pointer at TEB+0x1710). Oldest first, newest last, 16 x86 bytes per entry so a
+ * one-instruction fragment decodes from the line. Checked reads throughout. */
+static void ios_block_ring_dump( uintptr_t teb, unsigned max_entries, const char *why )
+{
+    enum { RING_N = 4096 };
+    uint64_t ring = 0, idx = 0, *ents = NULL;
+    mach_vm_size_t got = 0;
+    unsigned n, i, start;
+
+    if (!teb) { dprintf( 2, "[block-ring] ml1205 (%s): no TEB for this thread\n", why ); return; }
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(teb + 0x1710), 8, (mach_vm_address_t)&ring, &got ) != KERN_SUCCESS
+        || got != 8 || !ring)
+    {
+        dprintf( 2, "[block-ring] ml1205 (%s): no ring on this thread (MADEIRA_BLOCK_RING unset, or the thread predates it)\n", why );
+        return;
+    }
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)ring, 8, (mach_vm_address_t)&idx, &got ) != KERN_SUCCESS || got != 8)
+        return;
+    ents = malloc( RING_N * sizeof(uint64_t) );
+    if (!ents) return;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(ring + 8), RING_N * sizeof(uint64_t),
+                                (mach_vm_address_t)ents, &got ) != KERN_SUCCESS || got != RING_N * sizeof(uint64_t))
+    {
+        free( ents );
+        return;
+    }
+    idx &= RING_N - 1;
+    /* count the filled entries: a zero entry is an unused slot */
+    n = RING_N;
+    while (n && !ents[(idx + RING_N - n) & (RING_N - 1)]) n--;
+    if (n > max_entries) n = max_entries;
+    start = (idx + RING_N - n) & (RING_N - 1);
+    dprintf( 2, "[block-ring] ml1205 (%s): ring %p next=%llu, last %u block entries, oldest first:\n",
+             why, (void *)ring, (unsigned long long)idx, n );
+    for (i = 0; i < n; i++)
+    {
+        const uint64_t ent = ents[(start + i) & (RING_N - 1)];
+        const uint64_t rip = ent & 0xffffffffffffULL;           /* ml1206: high 16 bits = bytes in the block */
+        unsigned len = (unsigned)(ent >> 48); if (!len || len > 96) len = len ? 96 : 16;
+        unsigned char xb[96];
+        char hx[96 * 3 + 1] = "?";
+        got = 0;
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)rip, len, (mach_vm_address_t)xb, &got ) == KERN_SUCCESS
+            && got == len)
+        {
+            int b;
+            for (b = 0; b < (int)len; b++) snprintf( hx + b * 3, 4, "%02x ", xb[b] );
+        }
+        dprintf( 2, "[block-ring] -%-4u %llx: %s\n", n - i, (unsigned long long)rip, hx );
+    }
+    free( ents );
+}
+
+/* ml1203: WALK THE JUMP CHAIN BACK FROM THE WRITER.
+ *
+ * The writer the watch caught sits in jump-threaded code: one instruction, then
+ * `jmp rel32`, so the instruction that computed the stored value is not in the
+ * bytes before the writer's rip. Scan the mapped image around the rip for
+ * branches (E9/E8 rel32, 0F 8x rel32, EB/7x rel8) whose target lands in the
+ * window before the current address, group them by target and follow the group
+ * with the closest entry point (the start of the fragment that ends at the
+ * current address); print the 48 bytes before each branch of that group (the
+ * predecessor fragment's tail). ml1204: the first version kept six candidates
+ * and stopped on more; here a fragment every six bytes put six neighbours'
+ * entries in the window before the writer's own, so nothing was followed.
+ * MADEIRA_WATCH_CHASE = hop count (default 24, 0 off); only the first two hits
+ * are chased; reads go through mach_vm_read_overwrite in 1 MB pieces so an
+ * unmapped page cannot fault the handler thread. */
+static void ios_watch_chase( uint64_t rip )
+{
+    static int hops = -1;
+    static unsigned char *buf;
+    enum { CHUNK = 1u << 20, WINDOW = 48, MAX_CAND = 64, SPAN_CAP = 256u << 20 };
+    uint64_t lo, hi, cur_lo, cur_hi;
+    int hop;
+
+    if (hops < 0) { const char *e = getenv( "MADEIRA_WATCH_CHASE" ); hops = (e && *e) ? atoi( e ) : 24; }
+    if (hops <= 0) return;
+    if (!buf && !(buf = malloc( CHUNK ))) return;
+
+    /* the contiguous mapped span around rip, capped */
+    {
+        mach_vm_address_t a = rip;
+        mach_vm_size_t s = 0;
+        vm_region_basic_info_data_64_t ri;
+        mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t ro = MACH_PORT_NULL;
+        if (mach_vm_region( mach_task_self(), &a, &s, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&ri, &rc, &ro ) != KERN_SUCCESS
+            || a > rip)
+        {
+            dprintf( 2, "[watch-chase] ml1203 rip %p is not in a mapped region\n", (void *)rip );
+            return;
+        }
+        lo = a; hi = a + s;
+        while (hi - lo < SPAN_CAP)
+        {   /* extend downwards over adjacent readable regions */
+            mach_vm_address_t b = lo - 1;
+            mach_vm_size_t bs = 0;
+            rc = VM_REGION_BASIC_INFO_COUNT_64; ro = MACH_PORT_NULL;
+            if (lo == 0 || mach_vm_region( mach_task_self(), &b, &bs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&ri, &rc, &ro ) != KERN_SUCCESS
+                || b + bs != lo || !(ri.protection & VM_PROT_READ))
+                break;
+            lo = b;
+        }
+        while (hi - lo < SPAN_CAP)
+        {   /* and upwards */
+            mach_vm_address_t b = hi;
+            mach_vm_size_t bs = 0;
+            rc = VM_REGION_BASIC_INFO_COUNT_64; ro = MACH_PORT_NULL;
+            if (mach_vm_region( mach_task_self(), &b, &bs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&ri, &rc, &ro ) != KERN_SUCCESS
+                || b != hi || !(ri.protection & VM_PROT_READ))
+                break;
+            hi = b + bs;
+        }
+        dprintf( 2, "[watch-chase] ml1203 scanning %p-%p (%llu MB) for branches into the writer's fragment chain\n",
+                 (void *)lo, (void *)hi, (unsigned long long)((hi - lo) >> 20) );
+    }
+
+    cur_lo = rip > WINDOW ? rip - WINDOW : 0;
+    cur_hi = rip + 1;                                   /* targets in (rip-48, rip] */
+    for (hop = 1; hop <= hops; hop++)
+    {
+        struct { uint64_t at; uint64_t target; int len; const char *kind; } cand[MAX_CAND];
+        int ncand = 0, overflow = 0, c, best = -1, nbest = 0, bestc = -1;
+        uint64_t p, best_target = 0;
+
+        for (p = lo; p < hi && !overflow; p += CHUNK - 8)
+        {
+            mach_vm_size_t want = (hi - p < CHUNK) ? (hi - p) : CHUNK, got = 0;
+            size_t i;
+            if (want < 8) break;
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)p, want, (mach_vm_address_t)buf, &got ) != KERN_SUCCESS
+                || got != want)
+                continue;
+            for (i = 0; i + 6 <= got; i++)
+            {
+                uint64_t at = p + i, target;
+                int len;
+                const char *kind;
+                unsigned char b0 = buf[i];
+                if (b0 == 0xE9 || b0 == 0xE8)
+                {
+                    int32_t rel; memcpy( &rel, buf + i + 1, 4 );
+                    len = 5; target = at + 5 + (int64_t)rel; kind = b0 == 0xE9 ? "jmp" : "call";
+                }
+                else if (b0 == 0x0F && (buf[i + 1] & 0xF0) == 0x80)
+                {
+                    int32_t rel; memcpy( &rel, buf + i + 2, 4 );
+                    len = 6; target = at + 6 + (int64_t)rel; kind = "jcc";
+                }
+                else if (b0 == 0xEB || (b0 & 0xF0) == 0x70)
+                {
+                    len = 2; target = at + 2 + (int64_t)(int8_t)buf[i + 1]; kind = b0 == 0xEB ? "jmp8" : "jcc8";
+                }
+                else continue;
+                if (target < cur_lo || target >= cur_hi) continue;
+                if (ncand == MAX_CAND) { overflow = 1; break; }
+                cand[ncand].at = at; cand[ncand].target = target; cand[ncand].len = len; cand[ncand].kind = kind;
+                ncand++;
+            }
+        }
+
+        if (!ncand)
+        {
+            dprintf( 2, "[watch-chase] ml1203 hop %d: no branch targets (%p,%p]; the fragment is entered some other way (ret/indirect/fall-through)\n",
+                     hop, (void *)cur_lo, (void *)cur_hi );
+            return;
+        }
+        /* the closest entry point below the current address is the start of its fragment */
+        for (c = 0; c < ncand; c++)
+            if (best < 0 || cand[c].target > best_target) { best = c; best_target = cand[c].target; }
+        for (c = 0; c < ncand; c++)
+            if (cand[c].target == best_target) { nbest++; bestc = c; }
+        {
+            char others[400];
+            int n = 0;
+            for (c = 0; c < ncand && n < (int)sizeof(others) - 40; c++)
+                if (cand[c].target != best_target)
+                    n += snprintf( others + n, sizeof(others) - n, " %llx>%llx", (unsigned long long)cand[c].at, (unsigned long long)cand[c].target );
+            dprintf( 2, "[watch-chase] ml1203 hop %d: %d branches into (%p,%p]%s; entry %p has %d source(s); others:%s\n",
+                     hop, ncand, (void *)cur_lo, (void *)cur_hi, overflow ? " (capped at 64)" : "",
+                     (void *)best_target, nbest, n ? others : " none" );
+        }
+        for (c = 0; c < ncand; c++)
+        {
+            unsigned char fb[WINDOW + 8];
+            char hx[(WINDOW + 8) * 3 + 1] = "?";
+            mach_vm_size_t g = 0;
+            uint64_t from;
+            if (cand[c].target != best_target) continue;
+            from = cand[c].at > WINDOW ? cand[c].at - WINDOW : 0;
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)from, sizeof(fb), (mach_vm_address_t)fb, &g ) == KERN_SUCCESS
+                && g == sizeof(fb))
+            {
+                int b;
+                for (b = 0; b < (int)sizeof(fb); b++) snprintf( hx + b * 3, 4, "%02x ", fb[b] );
+            }
+            dprintf( 2, "[watch-chase] ml1203 hop %d: %s at %p -> %p ; bytes[%p..+%d]: %s\n",
+                     hop, cand[c].kind, (void *)cand[c].at, (void *)cand[c].target, (void *)from, (int)sizeof(fb), hx );
+        }
+        if (nbest != 1)
+        {
+            dprintf( 2, "[watch-chase] ml1203 hop %d: the entry is shared by %d sources, the walk stops here\n", hop, nbest );
+            return;
+        }
+        if (cand[bestc].kind[0] == 'c')
+        {
+            dprintf( 2, "[watch-chase] ml1203 hop %d: reached through a call; the walk stops here\n", hop );
+            return;
+        }
+        cur_hi = cand[bestc].at + 1;
+        cur_lo = cand[bestc].at > WINDOW ? cand[bestc].at - WINDOW : 0;
+    }
+}
+
+/* A store to the watched page was emulated (or could not be): report it. */
+static void ios_watch_report( const arm_thread_state64_t *st, uint64_t pc, uint32_t insn, uintptr_t addr, uintptr_t teb,
+                              int emulated, int watch_prot )
+{
+    static const char * const ec_name[32] = {
+        "rcx","rdx","r8 ","r9 ","r10","r11","tmp","tmp","rax","PF ",
+        "T1 ","T2 ","T3 ","T4 ","tmp","tmp","tmp","crs","x18","r12",
+        "r13","r14","r15","rsp","AF ","rsi","rdi","rbx","ST ","rbp","lr ","sp " };
+    const int touches = addr < ios_watch_hi && addr + 32 > ios_watch_lo;
+    const unsigned rt = insn & 31, rt2 = (insn >> 10) & 31;
+    const int pair = (insn & 0x3A000000u) == 0x28000000u;
+
+    if (!emulated)
+    {
+        ios_watch_state = -2;
+        dprintf( 2, "[watch] ml1201 DISARMED: store %08x at pc=%p to %p is not in the emulator; "
+                 "the page stays writable from here on (hits so far: %lu in range, %lu elsewhere)\n",
+                 insn, (void *)pc, (void *)addr, ios_watch_hits, ios_watch_other );
+        return;
+    }
+    if (!touches)
+    {
+        if (!(++ios_watch_other & 4095))
+            dprintf( 2, "[watch] ml1201 %lu stores to the page outside the range so far (latest pc=%p insn=%08x addr=%p)\n",
+                     ios_watch_other, (void *)pc, insn, (void *)addr );
+        return;
+    }
+    if (++ios_watch_hits > 24)
+    {
+        if (!(ios_watch_hits & 1023))
+            dprintf( 2, "[watch] ml1201 %lu stores in range so far (latest pc=%p insn=%08x addr=%p x%u=%llx)\n",
+                     ios_watch_hits, (void *)pc, insn, (void *)addr, rt, (unsigned long long)st->__x[rt & 31] );
+        return;
+    }
+    {
+        unsigned char now[16];
+        mach_vm_size_t got = 0;
+        char hex[16 * 3 + 1] = "?";
+        int b;
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)ios_watch_lo, sizeof(now),
+                                    (mach_vm_address_t)now, &got ) == KERN_SUCCESS && got == sizeof(now))
+            for (b = 0; b < 16; b++) snprintf( hex + b * 3, 4, "%02x ", now[b] );
+        dprintf( 2, "[watch] ml1201 HIT #%lu pc=%p insn=%08x addr=%p (range%+lld) x%u=%016llx%s%s%016llx"
+                 " | wine prot %d | [range] now: %s\n",
+                 ios_watch_hits, (void *)pc, insn, (void *)addr, (long long)(addr - ios_watch_lo),
+                 rt, (unsigned long long)(rt == 31 ? 0 : st->__x[rt]),
+                 pair ? " x" : "", pair ? "" : "", (unsigned long long)(pair && rt2 != 31 ? st->__x[rt2] : 0),
+                 watch_prot, hex );
+    }
+    {   /* guest RIP and its x86 bytes, when the store came from emitted code */
+        extern void *ios_jit_rx_base_global;
+        extern size_t ios_jit_pool_size_global;
+        extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
+        uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+        if (rx && pc >= rx && pc < rx + ios_jit_pool_size_global && st->__x[28])
+        {
+            uint64_t bb = 0, xrip = 0;
+            const char *why = "";
+            mach_vm_size_t g = 0;
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)st->__x[28], 8,
+                                        (mach_vm_address_t)&bb, &g ) == KERN_SUCCESS && g == 8 && bb)
+                xrip = ios_native_rip_from_hostpc( bb, pc, &why );
+            if (xrip)
+            {
+                unsigned char xb[48];
+                char hx[48 * 3 + 1] = "?";
+                int b;
+                g = 0;
+                if (xrip >= 16 &&
+                    mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(xrip - 16), sizeof(xb),
+                                            (mach_vm_address_t)xb, &g ) == KERN_SUCCESS && g == sizeof(xb))
+                    for (b = 0; b < 48; b++) snprintf( hx + b * 3, 4, "%02x ", xb[b] );
+                dprintf( 2, "[watch] ml1201   guest rip=%p block=%p x86[rip-16..rip+31]: %s\n",
+                         (void *)xrip, (void *)bb, hx );
+                if (ios_watch_hits <= 2) ios_watch_chase( xrip );   /* ml1203 */
+                if (ios_watch_hits <= 2) ios_block_ring_dump( teb, 1536, "watch hit" );   /* ml1205 */
+            }
+            else
+                dprintf( 2, "[watch] ml1201   guest rip unresolved (block=%p): %s\n", (void *)bb, why );
+        }
+        else
+            dprintf( 2, "[watch] ml1201   pc outside the JIT pool (native code) lr=%p\n", (void *)st->__lr );
+    }
+    {
+        int i;
+        for (i = 0; i < 28; i += 7)
+            dprintf( 2, "[watch] ml1201   x%-2d(%s)=%llx x%-2d(%s)=%llx x%-2d(%s)=%llx x%-2d(%s)=%llx x%-2d(%s)=%llx x%-2d(%s)=%llx x%-2d(%s)=%llx\n",
+                     i, ec_name[i], (unsigned long long)st->__x[i], i+1, ec_name[i+1], (unsigned long long)st->__x[i+1],
+                     i+2, ec_name[i+2], (unsigned long long)st->__x[i+2], i+3, ec_name[i+3], (unsigned long long)st->__x[i+3],
+                     i+4, ec_name[i+4], (unsigned long long)st->__x[i+4], i+5, ec_name[i+5], (unsigned long long)st->__x[i+5],
+                     i+6, ec_name[i+6], (unsigned long long)st->__x[i+6] );
+        dprintf( 2, "[watch] ml1201   x28(ST )=%llx fp=%llx lr=%llx sp=%llx\n",
+                 (unsigned long long)st->__x[28], (unsigned long long)st->__fp,
+                 (unsigned long long)st->__lr, (unsigned long long)st->__sp );
+    }
+}
 static __thread int ios_my_slot = -1;
 
 /* Thread registry: maps Mach thread port → TEB + trampoline.
@@ -567,6 +960,9 @@ struct ios_thread_entry {
 };
 static struct ios_thread_entry ios_thread_registry[IOS_MAX_WINE_THREADS];
 static volatile int32_t ios_thread_count = 0;
+/* Writers (ios_thread_registry_add, ios_thread_registry_purge_range) hold this
+ * so two of them never fill the same entry; the lookups stay lock-free. */
+static pthread_mutex_t ios_thread_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Exact-match registry probe — NO slot-0 fallback.
  *
@@ -632,8 +1028,10 @@ static int ios_teb_is_registered(uintptr_t teb)
  * called from the guest-window teardown (virtual_ios.c). */
 int ios_thread_registry_purge_range( uintptr_t base, uintptr_t size )
 {
-    int count = ios_thread_registry_count(), purged = 0, i;
+    int count, purged = 0, i;
 
+    pthread_mutex_lock( &ios_thread_registry_lock );
+    count = ios_thread_registry_count();
     for (i = 0; i < count; i++)
     {
         uintptr_t teb = ios_thread_registry[i].teb;
@@ -645,7 +1043,20 @@ int ios_thread_registry_purge_range( uintptr_t base, uintptr_t size )
         ios_thread_registry[i].trampoline = NULL;
         purged++;
     }
+    pthread_mutex_unlock( &ios_thread_registry_lock );
     return purged;
+}
+
+/* Has the thread behind a registry port name exited?  The registry pins send
+ * references on every name it stores, so an exited thread leaves a dead name
+ * that thread_info refuses.  An unexpected query failure counts as alive. */
+static int ios_thread_port_gone( thread_t port )
+{
+    struct thread_basic_info info;
+    mach_msg_type_number_t length = THREAD_BASIC_INFO_COUNT;
+    kern_return_t kr = thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&info, &length );
+
+    return kr == KERN_INVALID_ARGUMENT || kr == MACH_SEND_INVALID_DEST || kr == KERN_TERMINATED;
 }
 
 /* Is a thread whose TEB lies in [base, base+size) still alive?  An exited
@@ -660,15 +1071,133 @@ int ios_thread_registry_range_busy( uintptr_t base, uintptr_t size )
     {
         uintptr_t teb = ios_thread_registry[i].teb;
         thread_t port = ios_thread_registry[i].mach_thread;
-        struct thread_basic_info info;
-        mach_msg_type_number_t length = THREAD_BASIC_INFO_COUNT;
-        kern_return_t kr;
 
         if (!port || !teb || teb < base || teb - base >= size) continue;
-        kr = thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&info, &length );
-        if (kr != KERN_INVALID_ARGUMENT && kr != MACH_SEND_INVALID_DEST && kr != KERN_TERMINATED) return 1;
+        if (!ios_thread_port_gone( port )) return 1;
     }
     return 0;
+}
+
+/* An entry a full registry may give to a new thread: one its guest window's
+ * teardown purged, or one whose thread has exited.  Entry 0 is never taken, it
+ * is what ios_lookup_thread falls back to.  Neither is an exited thread's entry
+ * whose TEB still carries a FEX lock stamp (Instrumentation[6] or [8]):
+ * ios_lock_census finds the hold of a thread that died with it through that
+ * entry.  -1 when every entry belongs to a live thread. */
+static int ios_thread_registry_reclaim( void )
+{
+    int i;
+
+    for (i = 1; i < IOS_MAX_WINE_THREADS; i++)
+    {
+        thread_t port = ios_thread_registry[i].mach_thread;
+        uintptr_t teb = ios_thread_registry[i].teb;
+        uint64_t stamps[3] = { 0, 0, 0 };   /* TEB+0x16e8 [6], +0x16f0 [7], +0x16f8 [8] */
+        mach_vm_size_t got = 0;
+
+        if (!port) return i;
+        if (!ios_thread_port_gone( port )) continue;
+        if (teb && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(teb + 0x16e8),
+                                           sizeof(stamps), (mach_vm_address_t)stamps, &got ) == KERN_SUCCESS
+            && got == sizeof(stamps) && (stamps[0] || stamps[2]))
+            continue;
+        return i;
+    }
+    return -1;
+}
+
+static int ios_thread_registry_reuse_enabled( void )
+{
+    static int enabled = -1;
+    int v = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (v < 0)
+    {
+        /* On by default. MADEIRA_THREAD_REUSE=0 never gives a full thread registry's exited or purged entries to new threads (a session again registers 512 threads at most). */
+        const char *e = getenv( "MADEIRA_THREAD_REUSE" );
+
+        v = !(e && e[0] == '0');
+        __atomic_store_n( &enabled, v, __ATOMIC_RELEASE );
+    }
+    return v;
+}
+
+/* Register a thread's port, TEB and trampoline; returns its entry, or -1.
+ *
+ * ml384: replace an existing entry for the same port first — the kernel
+ * recycles thread port names, and a stale entry earlier in the array would
+ * shadow the new registration in ios_lookup_thread (first match wins).
+ *
+ * Entries were never given back, so the registry filled after 512 threads
+ * over the session's life, not 512 at once: a WoW64 game that keeps starting
+ * and ending worker threads got there within minutes with a few dozen alive
+ * (#397), and every later thread resolved to the slot-0 TEB.  A full registry
+ * now gives the new thread an entry ios_thread_registry_reclaim finds free;
+ * MADEIRA_THREAD_REUSE=0 turns that off. */
+static int ios_thread_registry_add( thread_t pe_thread, uintptr_t teb, void *trampoline )
+{
+    int idx, reg_count;
+
+    pthread_mutex_lock( &ios_thread_registry_lock );
+    reg_count = ios_thread_registry_count();
+    for (idx = 0; idx < reg_count; idx++)
+        if (ios_thread_registry[idx].mach_thread == pe_thread) break;
+    if (idx < reg_count)
+    {
+        /* ml390 (task #66): make the replace path LOUD.  If a name gets
+         * recycled while its previous owner still has live guest state, this
+         * overwrite silently redirects that thread's TEB resolution — and a
+         * thread_set_state aimed at the new owner could land on the old one
+         * (zeroed-state suspect).  old_teb!=0 && old_teb!=new_teb = the case
+         * to correlate offline against [reg-miss] and fault dumps. */
+        if (ios_thread_registry[idx].teb && ios_thread_registry[idx].teb != teb)
+            ERR( "[thread-registry] REPLACE idx=%d port=0x%x old_teb=%p new_teb=%p\n",
+                 idx, pe_thread, (void *)ios_thread_registry[idx].teb, (void *)teb );
+    }
+    else if (reg_count < IOS_MAX_WINE_THREADS)
+        idx = __sync_fetch_and_add(&ios_thread_count, 1);
+    else if (ios_thread_registry_reuse_enabled() && (idx = ios_thread_registry_reclaim()) >= 0)
+    {
+        static unsigned int reused;
+
+        if (++reused <= 16 || !(reused % 256))
+            ERR( "[thread-registry] REUSE #%u idx=%d port=0x%x old_port=0x%x old_teb=%p new_teb=%p\n",
+                 reused, idx, pe_thread, ios_thread_registry[idx].mach_thread,
+                 (void *)ios_thread_registry[idx].teb, (void *)teb );
+        ios_thread_registry[idx].mach_thread = 0;
+        __sync_synchronize();
+    }
+    else
+    {
+        ERR("[thread-registry] FULL (%d slots, %s) — thread 0x%x teb=%p NOT registered; "
+            "Mach events on it will resolve to the slot-0 TEB (wrong process!)\n",
+            IOS_MAX_WINE_THREADS, ios_thread_registry_reuse_enabled() ? "none free" : "MADEIRA_THREAD_REUSE=0",
+            pe_thread, (void *)teb);
+        idx = -1;
+    }
+    if (idx >= 0)
+    {
+        ios_thread_registry[idx].teb = teb;
+        ios_thread_registry[idx].trampoline = trampoline;
+        __sync_synchronize();
+        ios_thread_registry[idx].mach_thread = pe_thread;
+        /* ml401 (tasks #60/#66): EVERY registry port name proved
+         * MACH_SEND_INVALID_DEST when the census sampler tried to use it —
+         * something deallocates the mach_thread_self() ref after we store the
+         * name, leaving the registry full of dead keys ([pump-sample] blind,
+         * and dead names are exactly what the kernel recycles = the #66
+         * wrong-thread hazard).  Pin extra send refs so the name outlives any
+         * stray deallocate; dead-name lingering after thread exit is harmless
+         * and prevents recycling. */
+        {
+            kern_return_t krr = mach_port_mod_refs( mach_task_self(), pe_thread,
+                                                    MACH_PORT_RIGHT_SEND, 4 );
+            if (krr != KERN_SUCCESS)
+                ERR( "[thread-registry] mod_refs(+4) port=0x%x FAILED kr=%d\n", pe_thread, krr );
+        }
+    }
+    pthread_mutex_unlock( &ios_thread_registry_lock );
+    return idx;
 }
 
 static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tramp_out)
@@ -1030,6 +1559,7 @@ void ios_pump_sample(void)
         ios_orphan_check( stamps, ns );
     }
     ios_lock_census();
+    ios_watch_after_protect( (const void *)ios_watch_page, IOS_WATCH_PAGE, "sweep" );   /* ml1201 */
     if (samples >= 120) return;
     /* discover beacon TEBs (ml399: server thread and pump can differ) */
     if (nbeacons < IOS_PUMP_MAX)
@@ -1300,6 +1830,133 @@ void ios_dump_guest_callers( const char *tag, unsigned long long x28 )
 }
 
 
+/* Executable aliases deliberately lack host write permission. Resolve only
+ * live mappings; callers must also validate the end of a multi-byte access. */
+static uintptr_t ios_write_alias( uintptr_t addr )
+{
+    extern void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t );
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t size = ios_jit_pool_size_global;
+
+    if (rx && rw && ((addr >= rx && addr - rx < size) || ios_jit_low_contains( addr )))
+        return rw + (addr - rx);
+    return ios_jit_anon_alias_lookup( addr );
+}
+
+/* The writable alias is a host implementation detail, not permission to
+ * bypass a guest protection fault. FEX removes logical write permission
+ * while a guest page has cached translations. Let its normal exception
+ * handler invalidate those translations and restore logical write access
+ * before emulating the retried store. Native pool writes have no guest
+ * protection record and must retain their existing path. */
+static int ios_alias_write_is_trapped( uintptr_t addr )
+{
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    extern int ios_page_expected_prot( const void *addr );
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    int prot;
+
+    if ((rx && addr >= rx && addr - rx < ios_jit_pool_size_global) || ios_jit_low_contains( addr )) return 0;
+    prot = ios_page_expected_prot( (const void *)addr );
+    return prot >= 0 && !(prot & PROT_WRITE);
+}
+
+/* Adjacent guest pages need not occupy adjacent pool slots. Validate every
+ * fragment before writing anything, then route each through its own alias.
+ * Only ordinary stores use this; atomic RMW operations must remain atomic. */
+static int ios_alias_write( uintptr_t addr, const void *source, size_t size, uintptr_t *blocked,
+                            int honor_guest_prot )
+{
+    enum { PAGE = 0x4000, MAX_STORE = 32 };
+    uintptr_t destinations[2];
+    size_t lengths[2], done = 0;
+    unsigned count = 0, i;
+
+    *blocked = 0;
+    if (!size || size > MAX_STORE || addr > UINTPTR_MAX - (size - 1)) return 0;
+    while (done < size)
+    {
+        uintptr_t at = addr + done, rw = ios_write_alias( at );
+        size_t length = PAGE - (at & (PAGE - 1));
+        if (length > size - done) length = size - done;
+        /* A store can cross a 4KB Wine protection boundary within one
+         * 16KB alias page. At most 32 bytes means the endpoints cover all
+         * protection pages touched by this fragment. */
+        if (honor_guest_prot && ios_alias_write_is_trapped( at ))
+        {
+            *blocked = at;
+            return 0;
+        }
+        if (honor_guest_prot && ios_alias_write_is_trapped( at + length - 1 ))
+        {
+            *blocked = (at + length - 1) & ~(uintptr_t)0xfff;
+            return 0;
+        }
+        if (!rw || rw > UINTPTR_MAX - (length - 1) ||
+            ios_write_alias( at + length - 1 ) != rw + length - 1) return 0;
+        destinations[count] = rw;
+        lengths[count++] = length;
+        done += length;
+    }
+    done = 0;
+    for (i = 0; i < count; ++i)
+    {
+        memcpy( (void *)destinations[i], (const unsigned char *)source + done, lengths[i] );
+        done += lengths[i];
+    }
+    if (count > 1)
+    {
+        static unsigned logged;
+        if (logged++ < 8)
+            dprintf( 2, "[alias-span] routed %zu bytes at %p across %u guest pages\n",
+                     size, (void *)addr, count );
+    }
+    return 1;
+}
+
+/* GPR STP/STNP, including pre/post-index writeback. gpr[31] is SP when
+ * used as a base, but register 31 as a store source is always zero. */
+static int ios_alias_store_pair( uint32_t insn, uintptr_t addr, uint64_t gpr[32], uintptr_t *blocked,
+                                 int honor_guest_prot )
+{
+    unsigned rt = insn & 31, rt2 = (insn >> 10) & 31, rn = (insn >> 5) & 31;
+    unsigned mode = (insn >> 23) & 3;
+    unsigned width = (insn & 0x80000000u) ? 8 : 4;
+    unsigned span = width * 2;
+    uintptr_t effective;
+    int64_t offset = (insn >> 15) & 0x7f;
+    uint64_t values[2];
+
+    /* Exclude loads, SIMD pairs and reserved opc encodings. */
+    if ((insn & 0x7e400000u) != 0x28000000u) return 0;
+    if ((mode == 1 || mode == 3) && rn != 31 && (rn == rt || rn == rt2)) return 0;
+    if (offset & 0x40) offset -= 0x80;
+    offset *= width;
+    effective = mode == 1 ? gpr[rn] : gpr[rn] + offset;
+    if (effective > UINTPTR_MAX - (span - 1) || addr < effective || addr - effective >= span) return 0;
+    /* FAR may identify the second word. Translate the whole effective access,
+     * rather than treating that fault address as the first store destination. */
+    addr = effective;
+    values[0] = rt == 31 ? 0 : gpr[rt];
+    values[1] = rt2 == 31 ? 0 : gpr[rt2];
+    if (width == 8)
+    {
+        if (!ios_alias_write( addr, values, sizeof(values), blocked, honor_guest_prot )) return 0;
+    }
+    else
+    {
+        uint32_t words[2] = { (uint32_t)values[0], (uint32_t)values[1] };
+        if (!ios_alias_write( addr, words, sizeof(words), blocked, honor_guest_prot )) return 0;
+    }
+    if (mode == 1) gpr[rn] = addr + offset;
+    else if (mode == 3) gpr[rn] = addr;
+    return 1;
+}
+
 /* Signal-safe 32/64-bit CAS core, shared semantics with the BSD alias path.
  * Caller establishes full alias coverage. FP/LR encodings deliberately
  * decline: Darwin's __x array contains only x0..x28. No Wine logging here. */
@@ -1331,12 +1988,101 @@ static int ios_mach_emulate_cas(uint32_t insn, uintptr_t rw_addr, uint64_t gpr[2
     return 1;
 }
 
+/* CASP/CASPA/CASPL/CASPAL pair forms (0sz0 1000 0L1 Rs o0 11111 Rn Rt).
+ * FEX's unaligned-atomic helpers (DoCAS, RunCASPAL) issue a 128-bit CASPAL on
+ * guest memory from inside its exception handler. On an executable alias that
+ * was just copied again into the pool, the access faults and nothing else
+ * completes it: FEX re-enters its handler until the stack overflows. Run the
+ * same hardware CASPAL on the RW alias so it stays atomic against other users
+ * of that alias. Caller establishes full alias coverage. */
+static int ios_mach_emulate_casp(uint32_t insn, uintptr_t rw_addr, uint64_t gpr[29])
+{
+    unsigned rs = (insn >> 16) & 31, rt = insn & 31;
+    int wide = (insn >> 30) & 1;
+
+    if ((insn & 0xbfa07c00u) != 0x08207c00u) return 0;
+    if ((rs & 1) || (rt & 1) || rs + 1 >= 29 || rt + 1 >= 29) return 0;
+    if (!rw_addr || (rw_addr & (wide ? 15 : 7))) return 0;
+    {
+        register uint64_t c0 asm("x0") = gpr[rs];
+        register uint64_t c1 asm("x1") = gpr[rs + 1];
+        register uint64_t c2 asm("x2") = gpr[rt];
+        register uint64_t c3 asm("x3") = gpr[rt + 1];
+        if (wide)
+            asm volatile(".arch_extension lse\n\tcaspal x0, x1, x2, x3, [%4]"
+                         : "+r"(c0), "+r"(c1) : "r"(c2), "r"(c3), "r"(rw_addr) : "memory");
+        else
+            asm volatile(".arch_extension lse\n\tcaspal w0, w1, w2, w3, [%4]"
+                         : "+r"(c0), "+r"(c1) : "r"(c2), "r"(c3), "r"(rw_addr) : "memory");
+        gpr[rs] = c0;
+        gpr[rs + 1] = c1;
+    }
+    return 1;
+}
+
 /* ml938/ml939: defined far below, next to the store emulator they reuse.
  * Declared here because the Mach exception thread is the primary caller and
  * sits earlier in the file. */
 static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb );
 extern void *ios_jit_current_peb(void);   /* virtual_ios.c */
+extern int ios_jit_pool_pc_is_fex( uintptr_t pc );   /* virtual_ios.c */
 static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb );
+
+/* LSE read-modify-write atomics for the Mach alias-store emulator, each done as
+ * ONE host atomic on the RW alias, which maps the same physical pages as the
+ * view that faulted:
+ *   LD<OP>  size 111 0 00 A R 1 Rs 0 0 op(2) 00 Rn Rt (mask 0x3f20cc00, value
+ *           0x38200000); op 00 LDADD, 01 LDCLR, 10 LDEOR, 11 LDSET. Rt gets the
+ *           old value; Rt = 31 is the ST<OP> alias, which discards it.
+ *   CAS     size 001000 1 L 1 Rs o0 11111 Rn Rt (mask 0x3fa07c00, value
+ *           0x08a07c00). Rs holds the compare value and gets the old value.
+ * Every size (B, H, W, X) and every acquire/release form. The operation is
+ * __ATOMIC_SEQ_CST whatever A/R or L/o0 ask for, which is at least as strong as
+ * each of them (the SWP case does the same); the exception and its reply
+ * already order the faulting thread's own accesses around it. Old values are
+ * zero-extended, as the B, H and W forms define. gpr[0..30] are x0..x30 (x29 =
+ * FP, x30 = LR; FEX's JIT uses both); register 31 is the zero register in
+ * both encodings, so gpr[31] is neither read nor written. Returns 0 with
+ * nothing changed for any other encoding or a misaligned address, which these
+ * builtins cannot do atomically. No Wine logging here. */
+#define IOS_MACH_RMW(type) do { \
+        type *p_ = (type *)rw_addr; \
+        type e_ = (type)s; \
+        if (cas) \
+        { \
+            __atomic_compare_exchange_n( p_, &e_, (type)t, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); \
+            old = e_; \
+        } \
+        else switch ((insn >> 12) & 3) \
+        { \
+        case 0:  old = __atomic_fetch_add( p_, (type)s, __ATOMIC_SEQ_CST ); break; \
+        case 1:  old = __atomic_fetch_and( p_, (type)~s, __ATOMIC_SEQ_CST ); break; \
+        case 2:  old = __atomic_fetch_xor( p_, (type)s, __ATOMIC_SEQ_CST ); break; \
+        default: old = __atomic_fetch_or( p_, (type)s, __ATOMIC_SEQ_CST ); break; \
+        } \
+    } while (0)
+static int ios_mach_emulate_rmw( uint32_t insn, uintptr_t rw_addr, uint64_t gpr[32] )
+{
+    const unsigned size = insn >> 30, rs = (insn >> 16) & 31, rt = insn & 31;
+    const int cas = (insn & 0x3fa07c00u) == 0x08a07c00u;
+    uint64_t s, t, old = 0;
+
+    if (!cas && (insn & 0x3f20cc00u) != 0x38200000u) return 0;
+    if (!rw_addr || (rw_addr & ((1u << size) - 1))) return 0;
+    s = rs == 31 ? 0 : gpr[rs];
+    t = rt == 31 ? 0 : gpr[rt];
+    switch (size)
+    {
+    case 0:  IOS_MACH_RMW( uint8_t );  break;
+    case 1:  IOS_MACH_RMW( uint16_t ); break;
+    case 2:  IOS_MACH_RMW( uint32_t ); break;
+    default: IOS_MACH_RMW( uint64_t ); break;
+    }
+    if (cas && rs != 31) gpr[rs] = old;
+    else if (!cas && rt != 31) gpr[rt] = old;
+    return 1;
+}
+#undef IOS_MACH_RMW
 
 /* ml974: is the ucontext's NEON state real?
  *
@@ -1486,6 +2232,177 @@ done:
     close( fd );
     dprintf( 2, "[jit-dump] ml1242 %s: wrote %zu of %zu pool bytes to %s (untouched pages left as holes)\n",
              why, written, total, path );
+}
+
+/* The [fault-stuck] loop breaker in ios_mach_exception_thread keeps its state per thread, in
+ * 16 slots chosen by thread as the Mach-path delivery's redelivery guard does, and every
+ * exception delivered to the guest starts that thread's count again. It was one app-wide
+ * (page, pc, address) count, so faults of many threads at one instruction, or one thread's
+ * handled int3 or single-step exceptions there, read as a livelock: the thread was diverted
+ * to abort_thread and no exception reached the program. Windows delivers every one. A
+ * livelock is one thread re-faulting with no delivery in between; that is still broken. */
+static volatile unsigned ios_guest_deliv_seq[16];
+
+static inline int ios_fault_slot( uint64_t thread )
+{
+    return (int)((thread * 0x9E3779B97F4A7C15ull) >> 60);
+}
+
+static inline void ios_note_guest_delivery( uint64_t thread )
+{
+    __atomic_add_fetch( &ios_guest_deliv_seq[ios_fault_slot( thread )], 1, __ATOMIC_RELEASE );
+}
+
+/* ml1289: a store into aliased pages that CROSSES a 16 KB page boundary.
+ *
+ * The older cases of the write-fault store emulator (STR/STRB/STRH/STP/STUR,
+ * GPR and SIMD&FP, in ios_mach_exception_thread) write the whole access at
+ * alias(fault_addr): they take fault_addr as the start of the access and
+ * assume the alias goes on past the end of its page. A store that crosses a
+ * page breaks both: fault_addr need not be its first byte, and the next page
+ * may belong to another alias range or have none, so the bytes land at the
+ * wrong place or past the end of the first range's RW view. ml1276 and
+ * upstream's ml1283 already handle their encodings per page; this does the
+ * same for the rest, and only for crossing stores, so every other store keeps
+ * its existing case. The address comes from the registers, each page takes
+ * its own alias (a page without one that is plain writable memory is written
+ * directly), the store is refused when a page has neither, and the base
+ * register is written back after the whole store for the indexed forms.
+ * Store-release forms are left alone: a crossing STLR/STLUR is misaligned and
+ * takes the alignment-fault path instead.
+ *
+ * Returns 1 (written), -1 (refused: a page of the store has no alias) or 0
+ * (not a crossing store this helper decodes; the per-encoding cases run).
+ * ml1292: also called by the thread sampler (server_ios.c) to complete a store
+ * the kernel keeps faulting on, with the thread suspended. */
+int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
+                                     const arm_neon_state64_t *neon,
+                                     uintptr_t rx, uintptr_t rw, size_t sz )
+{
+    extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t fault_addr );
+    extern void ios_jit_anon_alias_note_write( unsigned long long );
+    const unsigned rt = insn & 31, rn = (insn >> 5) & 31, size = insn >> 30, v = (insn >> 26) & 1;
+    const unsigned opc = (insn >> 22) & 3;
+    const uint64_t base = rn == 31 ? st->__sp : rn == 30 ? st->__lr : rn == 29 ? st->__fp : st->__x[rn];
+    const int honor_guest_prot = !ios_jit_pool_pc_is_fex( arm_thread_state64_get_pc( *st ) );
+    uint8_t src[32];
+    uint64_t ea, a, x0, x1;
+    int64_t imm = 0;
+    int wb = 0, pair = 0;
+    unsigned bytes, elem, rt2 = (insn >> 10) & 31, parts = 0, done = 0, i, part_len[2];
+    uintptr_t part_rw[2];
+
+    if ((insn & 0x3a000000u) == 0x28000000u)                    /* STP/STNP and SIMD&FP pairs */
+    {
+        const unsigned mode = (insn >> 23) & 3;              /* 0 stnp, 1 post, 2 offset, 3 pre */
+        if ((insn >> 22) & 1) return 0;                      /* loads */
+        if (v) elem = size == 3 ? 0 : 4u << size;            /* S, D, Q */
+        else   elem = size == 0 ? 4 : size == 2 ? 8 : 0;     /* W, X (01 is STGP) */
+        if (!elem) return 0;
+        imm = (((int64_t)((insn >> 15) & 0x7f)) << 57 >> 57) * (int64_t)elem;
+        ea = mode == 1 ? base : base + (uint64_t)imm;
+        wb = mode == 1 || mode == 3;
+        bytes = 2 * elem;
+        pair = 1;
+    }
+    else if ((insn & 0x3b000000u) == 0x38000000u || (insn & 0x3b000000u) == 0x39000000u)
+    {
+        /* single-register LDR/STR families: a store has opc 00 (GPR) or opc<0> = 0 (SIMD&FP) */
+        if (v ? (opc & 1) : opc != 0) return 0;
+        elem = v && (opc & 2) ? (size == 0 ? 16u : 0u) : 1u << size;
+        if (!elem) return 0;
+        if ((insn & 0x3b000000u) == 0x39000000u)                 /* unsigned offset */
+            ea = base + ((uint64_t)((insn >> 10) & 0xfff) * elem);
+        else if ((insn & 0x00200c00u) == 0x00200800u)            /* register offset */
+        {
+            const unsigned option = (insn >> 13) & 7, rm = (insn >> 16) & 31;
+            uint64_t off = rm == 31 ? 0 : st->__x[rm];
+            if (!(option & 2)) return 0;
+            if (option == 2) off = (uint32_t)off;
+            else if (option == 6) off = (uint64_t)(int64_t)(int32_t)off;
+            if (insn & 0x1000) off *= elem;
+            ea = base + off;
+        }
+        else if (!(insn & 0x00200000u))                          /* unscaled, post, pre */
+        {
+            const unsigned idx = (insn >> 10) & 3;
+            if (idx == 2) return 0;                                /* unprivileged */
+            imm = ((int64_t)((insn >> 12) & 0x1ff)) << 55 >> 55;
+            ea = idx == 1 ? base : base + (uint64_t)imm;
+            wb = idx == 1 || idx == 3;
+        }
+        else return 0;
+        bytes = elem;
+    }
+    else return 0;
+
+    if (ea > UINTPTR_MAX - (bytes - 1)) return -1;
+    if (((ea ^ (ea + bytes - 1)) & ~(uint64_t)0x3fff) == 0) return 0;   /* within one page */
+    if (v && !neon) return 0;
+
+    if (v)
+    {
+        memcpy( src, &neon->__v[rt], elem );
+        if (pair) memcpy( src + elem, &neon->__v[rt2], elem );
+    }
+    else
+    {
+        x0 = rt == 31 ? 0 : rt == 30 ? st->__lr : rt == 29 ? st->__fp : st->__x[rt];
+        x1 = rt2 == 31 ? 0 : rt2 == 30 ? st->__lr : rt2 == 29 ? st->__fp : st->__x[rt2];
+        memcpy( src, &x0, elem );
+        if (pair) memcpy( src + elem, &x1, elem );
+    }
+
+    while (done < bytes && parts < 2)
+    {
+        unsigned len = bytes - done;
+        a = ea + done;
+        if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
+        part_rw[parts] = (rx && rw && len <= sz && a >= rx && a - rx <= sz - len)
+                         ? rw + (a - rx) : ios_write_alias( (uintptr_t)a );
+        if (part_rw[parts] && (ios_write_alias( a + len - 1 ) != part_rw[parts] + len - 1 ||
+            (honor_guest_prot && (ios_alias_write_is_trapped( a ) || ios_alias_write_is_trapped( a + len - 1 )))))
+            return -1;
+        if (!part_rw[parts])
+        {
+            /* A page with no alias that is plain writable memory (the aliased page is
+             * the one that faulted) takes its bytes directly. */
+            mach_vm_address_t ra = (mach_vm_address_t)a;
+            mach_vm_size_t rs = 0;
+            vm_region_basic_info_data_64_t ri;
+            mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t ro = MACH_PORT_NULL;
+            if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                (vm_region_info_t)&ri, &rc, &ro ) == KERN_SUCCESS &&
+                ra <= a && a + len <= ra + rs && (ri.protection & VM_PROT_WRITE))
+                part_rw[parts] = (uintptr_t)a;
+            if (ro != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), ro );
+        }
+        if (!part_rw[parts]) break;
+        part_len[parts++] = len;
+        done += len;
+    }
+    {
+        static int split_n;
+        if (split_n < 8)
+            dprintf( STDERR_FILENO, "[split-store] ml1289 #%d insn=0x%08x bytes=%u ea=0x%llx parts=%u %s\n",
+                     ++split_n, insn, bytes, (unsigned long long)ea, parts,
+                     done == bytes ? "emulated" : "REFUSED: a page of the store has no alias and is not writable" );
+    }
+    if (done != bytes) return -1;
+    for (i = 0, done = 0; i < parts; done += part_len[i], i++)
+    {
+        memcpy( (void *)part_rw[i], src + done, part_len[i] );
+        ios_jit_anon_alias_note_write( (unsigned long long)(ea + done) );
+    }
+    if (wb)
+    {
+        if (rn == 31) st->__sp = base + (uint64_t)imm;
+        else if (rn == 30) st->__lr = base + (uint64_t)imm;
+        else if (rn == 29) st->__fp = base + (uint64_t)imm;
+        else st->__x[rn] = base + (uint64_t)imm;
+    }
+    return 1;
 }
 
 static void *ios_mach_exception_thread( void *arg )
@@ -3303,12 +4220,29 @@ static void *ios_mach_exception_thread( void *arg )
                  * routed the same way -- its alias is at the pool's distance. in_low
                  * keeps the bounds checks below to C's own extent. */
                 int in_low = rx && rw && sz && ios_jit_low_contains( (uintptr_t)fault_addr );
+                int watch_hit = 0, watch_prot = 0;   /* ml1201 */
                 int in_jit = (rx && rw && sz &&
                               fault_addr >= rx && fault_addr < rx + sz) || in_low;
                 if (in_jit) {
                     rw_addr = rw + (fault_addr - rx);
                 } else {
                     rw_addr = ios_jit_anon_alias_lookup(fault_addr);
+                }
+                /* ml1201: a store to the watched page has no alias; make the page writable for
+                 * the emulator below and strip the write again once the store has landed. */
+                if (!rw_addr && ios_watch_covers( fault_addr ))
+                {
+                    extern int ios_page_expected_prot( const void *addr );
+                    watch_prot = ios_page_expected_prot( (const void *)fault_addr );
+                    if (watch_prot < 0) watch_prot = PROT_READ | PROT_WRITE;
+                    if (mprotect( (void *)ios_watch_page, IOS_WATCH_PAGE, (watch_prot & ~PROT_EXEC) | PROT_READ | PROT_WRITE ) == 0)   /* ml1202: image data pages take no EXEC on the host */
+                    {
+                        rw_addr = fault_addr;
+                        watch_hit = 1;
+                    }
+                    else
+                        dprintf( STDERR_FILENO, "[watch] ml1201 cannot unprotect %p (wine prot %d) for the store at pc=%p errno=%d\n",
+                                 (void *)ios_watch_page, watch_prot, (void *)(uintptr_t)fault_pc, errno );
                 }
                 /* ml348 DISCRIMINATOR: a write fault with NO alias is a
                  * different bug from a write fault whose instruction we can't
@@ -3350,10 +4284,37 @@ static void *ios_mach_exception_thread( void *arg )
                                 (unsigned long long)fault_pc);
                     }
                 }
+                /* FEX's exception handler completes some guest accesses itself
+                 * (ml657: DoCAS / RunCASPAL), after HandleRWXAccessViolation has
+                 * already invalidated the page. Its store must land through the
+                 * alias. Dispatching it again re-enters the handler while it holds
+                 * ThreadCreationMutex; the faults nest until the exception stack
+                 * overflows and the thread dies holding the lock (Stardew freeze,
+                 * 200111). Translated guest code is never in an image copy, so its
+                 * stores still reach FEX first. */
+                int honor_guest_prot = 1;
+                if (rw_addr && ios_alias_write_is_trapped( fault_addr ) &&
+                    ios_jit_pool_pc_is_fex( (uintptr_t)fault_pc ))
+                {
+                    static unsigned fex_alias_logs;
+                    honor_guest_prot = 0;
+                    if (fex_alias_logs++ < 16)
+                        dprintf( 2, "[alias-protection] completing FEX handler write pc=%llx addr=%llx\n",
+                                 (unsigned long long)fault_pc, (unsigned long long)fault_addr );
+                }
+                if (rw_addr && honor_guest_prot && ios_alias_write_is_trapped( fault_addr ))
+                {
+                    static unsigned trapped_alias_logs;
+                    if (trapped_alias_logs++ < 16)
+                        dprintf( 2, "[alias-protection] dispatching guest write fault pc=%llx addr=%llx\n",
+                                 (unsigned long long)fault_pc, (unsigned long long)fault_addr );
+                    goto dispatch_guest_fault;
+                }
                 if (rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
                 {
                     uint32_t insn; ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc, &insn );  /* ml982 */
                     int emulated = 0;
+                    uintptr_t alias_fault = 0;
                     /* STP (SIMD&FP, signed offset, 128-bit Q): 10 101 1 1 0 0 0 imm7 Rt2 Rn Rt
                      *   pattern bits 31-22: 10 1011 1000  → top10 = 0x2B8 (= bits 31..22)
                      *   So mask 0xFFC00000 = top10. Match 0x2B8 << 22 = 0xAE000000? Hmm.
@@ -3393,7 +4354,15 @@ static void *ios_mach_exception_thread( void *arg )
                      *
                      * STP Q is not architecturally one atomic 32-byte transaction, so two
                      * 16-byte copies are correct. Rn==31 is SP, never __x[31]. */
-                    if (have_neon && (insn & 0xFE400000) == 0xAC000000)
+                    /* ml1289: a store that crosses a 16 KB page is written per page here;
+                     * every other store goes on to its per-encoding case below. */
+                    const int split_r = ios_store_split_crossing( insn, &state, have_neon ? &neon_state : NULL,
+                                                                  rx, rw, sz );
+                    if (split_r)
+                    {
+                        if (split_r > 0) emulated = 1;
+                    }
+                    else if (have_neon && (insn & 0xFE400000) == 0xAC000000)
                     {
                         const int mode = (insn >> 23) & 0x3; /* 0 stnp, 1 post, 2 offset, 3 pre */
                         const int rt   = insn & 0x1f;
@@ -3403,36 +4372,25 @@ static void *ios_mach_exception_thread( void *arg )
                         if (imm7 & 0x40) imm7 -= 0x80;          /* sign-extend 7 bits */
                         const int64_t off = imm7 * 16;          /* Q registers scale by 16 */
 
-                        /* The WHOLE 32-byte destination must live in the SAME alias, or the
-                         * second copy would land outside it. */
-                        uintptr_t rw_end = in_jit ? ((in_low && !ios_jit_low_contains( (uintptr_t)fault_addr + 31 ))
-                                                     ? 0 : (uintptr_t)(rw + ((fault_addr + 31) - rx)))
-                                                  : (uintptr_t)ios_jit_anon_alias_lookup( fault_addr + 31 );
-                        if (!rw_end || rw_end != (uintptr_t)rw_addr + 31)
+                        uint64_t base_old = rn == 31 ? state.__sp : rn == 30 ? state.__lr :
+                                            rn == 29 ? state.__fp : state.__x[rn];
+                        uintptr_t effective = mode == 1 ? base_old : base_old + off;
+                        unsigned char values[32];
+                        memcpy( values, &neon_state.__v[rt], 16 );
+                        memcpy( values + 16, &neon_state.__v[rt2], 16 );
+                        if (fault_addr >= effective && fault_addr - effective < sizeof(values) &&
+                            ios_alias_write( effective, values, sizeof(values), &alias_fault, honor_guest_prot ))
                         {
-                            static int stp_span_n;
-                            if (stp_span_n < 4)
-                                dprintf(STDERR_FILENO,
-                                    "[stp-emul] ml629 #%d REFUSING: 32B span leaves the alias "
-                                    "(insn=0x%08x addr=0x%llx rw=0x%llx rw_end=0x%llx)\n",
-                                    ++stp_span_n, insn, (unsigned long long)fault_addr,
-                                    (unsigned long long)rw_addr, (unsigned long long)rw_end);
-                        }
-                        else
-                        {
-                            uint64_t base_old = (mode == 3) ? (uint64_t)fault_addr - (uint64_t)off
-                                                            : (uint64_t)fault_addr;
                             uint64_t base_new = base_old;
                             int wb = (mode == 1 || mode == 3);
-
-                            memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
-                            memcpy((void *)(rw_addr + 16), &neon_state.__v[rt2], 16);
 
                             if (wb)
                             {
                                 base_new = base_old + (uint64_t)off;
                                 if (rn == 31) state.__sp = base_new;
-                                else          state.__x[rn] = base_new;
+                                else if (rn == 30) state.__lr = base_new;
+                                else if (rn == 29) state.__fp = base_new;
+                                else state.__x[rn] = base_new;
                             }
                             emulated = 1;
                             {
@@ -3454,54 +4412,55 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffc00000) == 0xf9000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint64_t value = IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
                     /* STR (immediate, unsigned offset, 32-bit): 1011 1001 00 imm12 Rn Rt */
                     else if ((insn & 0xffc00000) == 0xb9000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint32_t value = (uint32_t)IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
                     /* STRB (immediate, unsigned offset, 8-bit): 0011 1001 00 imm12 Rn Rt */
                     else if ((insn & 0xffc00000) == 0x39000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint8_t *)rw_addr = (uint8_t)IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint8_t value = (uint8_t)IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
                     /* STRH (immediate, unsigned offset, 16-bit): 0111 1001 00 imm12 Rn Rt */
                     else if ((insn & 0xffc00000) == 0x79000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint16_t value = (uint16_t)IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
-                    /* STP (signed offset, 64-bit): 10101001 00 imm7 Rt2 Rn Rt */
-                    else if ((insn & 0xffc00000) == 0xa9000000)
+                    /* A native heap initializer uses pre-index STP on an
+                     * executable allocation. Complete it through the alias;
+                     * making the whole host page writable would bypass SMC. */
+                    else if ((insn & 0x7e400000u) == 0x28000000u)
                     {
-                        int rt = insn & 0x1f;
-                        int rt2 = (insn >> 10) & 0x1f;
-                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
-                        *(uint64_t *)(rw_addr + 8) = IOS_STORE_SRC(rt2);
-                        emulated = 1;
-                    }
-                    /* STP (signed offset, 32-bit): 00101001 00 imm7 Rt2 Rn Rt */
-                    else if ((insn & 0xffc00000) == 0x29000000)
-                    {
-                        int rt = insn & 0x1f;
-                        int rt2 = (insn >> 10) & 0x1f;
-                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
-                        *(uint32_t *)(rw_addr + 4) = (uint32_t)IOS_STORE_SRC(rt2);
-                        emulated = 1;
+                        uint64_t gpr[32];
+                        memcpy( gpr, state.__x, sizeof(state.__x) );
+                        gpr[29] = state.__fp;
+                        gpr[30] = state.__lr;
+                        gpr[31] = state.__sp;
+                        if (ios_alias_store_pair( insn, fault_addr, gpr, &alias_fault, honor_guest_prot ))
+                        {
+                            memcpy( state.__x, gpr, sizeof(state.__x) );
+                            state.__fp = gpr[29];
+                            state.__lr = gpr[30];
+                            state.__sp = gpr[31];
+                            emulated = 1;
+                        }
                     }
                     /* STR (register, 64-bit): 1111 1000 001 Rm option S 10 Rn Rt */
                     else if ((insn & 0xffe00c00) == 0xf8200800)
                     {
                         int rt = insn & 0x1f;
-                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint64_t value = IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
                     /* STLR (Store-Release Register, 64-bit):
                      *   1100 1000 1001 1111 1111 11nn nnnt tttt   (mask 0xfffffc00, val 0xc89ffc00)
@@ -3552,27 +4511,26 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;
                         uint64_t v = IOS_STORE_SRC(rt);
                         __atomic_thread_fence(__ATOMIC_RELEASE);
-                        memcpy((void *)rw_addr, &v, 1u << (insn >> 30));
-                        emulated = 1;
+                        emulated = ios_alias_write( fault_addr, &v, 1u << (insn >> 30), &alias_fault, honor_guest_prot );
                     }
                     /* STR (register, 32-bit): 1011 1000 001 Rm option S 10 Rn Rt */
                     else if ((insn & 0xffe00c00) == 0xb8200800)
                     {
                         int rt = insn & 0x1f;
-                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint32_t value = (uint32_t)IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
                     /* STR (immediate, post/pre-index, 64-bit): 1111 1000 00 0imm9 0[10]1 Rn Rt */
                     else if ((insn & 0xffe00000) == 0xf8000000 && (insn & 0x800) == 0)
                     {
                         int rt = insn & 0x1f;
-                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint64_t value = IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                         /* Post-index (bits 11:10 = 01) / pre-index (bits 11:10 = 11):
                          * MUST update Rn += signed imm9. Without this, memcpy-style
                          * loops would write the same address forever. */
                         int idx_mode = (insn >> 10) & 3;  // bits 11:10
-                        if (idx_mode == 1 || idx_mode == 3)
+                        if (emulated && (idx_mode == 1 || idx_mode == 3))
                         {
                             int rn = (insn >> 5) & 0x1f;
                             int imm9 = (insn >> 12) & 0x1ff;
@@ -3584,10 +4542,10 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffe00000) == 0xb8000000 && (insn & 0x800) == 0)
                     {
                         int rt = insn & 0x1f;
-                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint32_t value = (uint32_t)IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                         int idx_mode = (insn >> 10) & 3;
-                        if (idx_mode == 1 || idx_mode == 3)
+                        if (emulated && (idx_mode == 1 || idx_mode == 3))
                         {
                             int rn = (insn >> 5) & 0x1f;
                             int imm9 = (insn >> 12) & 0x1ff;
@@ -3602,10 +4560,10 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffe00000) == 0x38000000 && (insn & 0x800) == 0)
                     {
                         int rt = insn & 0x1f;
-                        *(uint8_t *)rw_addr = (uint8_t)IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint8_t value = (uint8_t)IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                         int idx_mode = (insn >> 10) & 3;
-                        if (idx_mode == 1 || idx_mode == 3)
+                        if (emulated && (idx_mode == 1 || idx_mode == 3))
                         {
                             int rn = (insn >> 5) & 0x1f;
                             int imm9 = (insn >> 12) & 0x1ff;
@@ -3617,10 +4575,10 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffe00000) == 0x78000000 && (insn & 0x800) == 0)
                     {
                         int rt = insn & 0x1f;
-                        *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint16_t value = (uint16_t)IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                         int idx_mode = (insn >> 10) & 3;
-                        if (idx_mode == 1 || idx_mode == 3)
+                        if (emulated && (idx_mode == 1 || idx_mode == 3))
                         {
                             int rn = (insn >> 5) & 0x1f;
                             int imm9 = (insn >> 12) & 0x1ff;
@@ -3638,10 +4596,9 @@ static void *ios_mach_exception_thread( void *arg )
                         if (have_neon)
                         {
                             /* Low 64 bits of the 128-bit Q-reg = D-reg. */
-                            memcpy((void *)rw_addr, &neon_state.__v[rt], 8);
-                            emulated = 1;
+                            emulated = ios_alias_write( fault_addr, &neon_state.__v[rt], 8, &alias_fault, honor_guest_prot );
                             int idx_mode = (insn >> 10) & 3;
-                            if (idx_mode == 1 || idx_mode == 3)
+                            if (emulated && (idx_mode == 1 || idx_mode == 3))
                             {
                                 int rn = (insn >> 5) & 0x1f;
                                 int imm9 = (insn >> 12) & 0x1ff;
@@ -3657,10 +4614,9 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;
                         if (have_neon)
                         {
-                            memcpy((void *)rw_addr, &neon_state.__v[rt], 4);
-                            emulated = 1;
+                            emulated = ios_alias_write( fault_addr, &neon_state.__v[rt], 4, &alias_fault, honor_guest_prot );
                             int idx_mode = (insn >> 10) & 3;
-                            if (idx_mode == 1 || idx_mode == 3)
+                            if (emulated && (idx_mode == 1 || idx_mode == 3))
                             {
                                 int rn = (insn >> 5) & 0x1f;
                                 int imm9 = (insn >> 12) & 0x1ff;
@@ -3676,10 +4632,9 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;
                         if (have_neon)
                         {
-                            memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
-                            emulated = 1;
+                            emulated = ios_alias_write( fault_addr, &neon_state.__v[rt], 16, &alias_fault, honor_guest_prot );
                             int idx_mode = (insn >> 10) & 3;
-                            if (idx_mode == 1 || idx_mode == 3)
+                            if (emulated && (idx_mode == 1 || idx_mode == 3))
                             {
                                 int rn = (insn >> 5) & 0x1f;
                                 int imm9 = (insn >> 12) & 0x1ff;
@@ -3700,8 +4655,7 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;
                         if (have_neon)
                         {
-                            memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
-                            emulated = 1;
+                            emulated = ios_alias_write( fault_addr, &neon_state.__v[rt], 16, &alias_fault, honor_guest_prot );
                         }
                     }
                     /* GPR STR (immediate, unsigned offset, 64-bit X-reg):
@@ -3714,8 +4668,8 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffc00000) == 0xf9000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint64_t value = IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
                     /* GPR STR (immediate, unsigned offset, 32-bit W-reg):
                      *   1011 1001 00 imm12 Rn Rt   (base 0xb9000000, mask 0xffc00000)
@@ -3723,8 +4677,8 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffc00000) == 0xb9000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint32_t value = (uint32_t)IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
                     /* SIMD/FP STR (immediate, unsigned offset, D-reg): 11 111 1 01 00 imm12 Rn Rt */
                     else if ((insn & 0xffc00000) == 0xfd000000)
@@ -3732,8 +4686,7 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;
                         if (have_neon)
                         {
-                            memcpy((void *)rw_addr, &neon_state.__v[rt], 8);
-                            emulated = 1;
+                            emulated = ios_alias_write( fault_addr, &neon_state.__v[rt], 8, &alias_fault, honor_guest_prot );
                         }
                     }
                     /* SIMD/FP STR (immediate, unsigned offset, S-reg): 10 111 1 01 00 imm12 Rn Rt */
@@ -3742,8 +4695,7 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;
                         if (have_neon)
                         {
-                            memcpy((void *)rw_addr, &neon_state.__v[rt], 4);
-                            emulated = 1;
+                            emulated = ios_alias_write( fault_addr, &neon_state.__v[rt], 4, &alias_fault, honor_guest_prot );
                         }
                     }
                     /* SIMD/FP STR (immediate, unsigned offset, Q-reg): 00 111 1 01 10 imm12 Rn Rt */
@@ -3752,8 +4704,7 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;
                         if (have_neon)
                         {
-                            memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
-                            emulated = 1;
+                            emulated = ios_alias_write( fault_addr, &neon_state.__v[rt], 16, &alias_fault, honor_guest_prot );
                         }
                     }
                     /* ml350: STRB (register offset): 0011 1000 001 Rm opt S 10 Rn Rt
@@ -3765,15 +4716,15 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffe00c00) == 0x38200800)
                     {
                         int rt = insn & 0x1f;
-                        *(uint8_t *)rw_addr = (uint8_t)IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint8_t value = (uint8_t)IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
                     /* ml350: STRH (register offset): 0111 1000 001 ... (val 0x78200800) */
                     else if ((insn & 0xffe00c00) == 0x78200800)
                     {
                         int rt = insn & 0x1f;
-                        *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
-                        emulated = 1;
+                        uint16_t value = (uint16_t)IOS_STORE_SRC(rt);
+                        emulated = ios_alias_write( fault_addr, &value, sizeof(value), &alias_fault, honor_guest_prot );
                     }
                     /* ml1276: SIMD&FP STR (register offset), B/H/S/D/Q:
                      *   size 111 1 00 opc(1)0 1 Rm option S 10 Rn Rt
@@ -4033,11 +4984,10 @@ static void *ios_mach_exception_thread( void *arg )
                      * alias maps the SAME physical pages as the faulting RX view, so the
                      * atomic applies to the memory the guest actually shares.
                      *
-                     * ⛔ Deliberately NOT extended to LDADD/LDCLR/LDSET/CAS here. Those
-                     * encodings appear in this run only AFTER the SWPAL was mishandled,
-                     * inside FEX's exception path, so they are probably fallout. A wide
-                     * speculative decoder carries more correctness surface than this
-                     * blocker justifies — add families when they actually appear. */
+                     * Not extended to LDADD/LDCLR/LDSET/CAS here: in this run those came
+                     * only AFTER the mishandled SWPAL, inside FEX's exception path, as
+                     * fallout. They have since appeared on their own (a JVM's LDADDAL on
+                     * anonymous RWX memory) and have their own case below. */
                     else if ((insn & 0x3F20FC00) == 0x38208000)
                     {
                         int size_lg2 = (insn >> 30) & 0x3;
@@ -4104,6 +5054,41 @@ static void *ios_mach_exception_thread( void *arg )
                             }
                         }
                     }
+                    /* LD<OP> and CAS, the other read-modify-write atomics. FEX lowers a guest
+                     * LOCK ADD/SUB/XADD/INC/DEC to LDADDAL, LOCK AND to LDCLRAL, LOCK OR to
+                     * LDSETAL, LOCK XOR to LDEORAL and LOCK CMPXCHG to CASAL. A bundled JVM
+                     * ran LDADDAL W6, W0, [X1] (0xb8e60020) on anonymous RWX memory; with no
+                     * case here the add never happened and the fault went back to the guest.
+                     * ios_mach_emulate_rmw does each as one atomic on the RW alias, in every
+                     * size and ordering, x29/x30 included. CAS only off the pool: FEX's own
+                     * CASAL on the pool keeps the block below. Misaligned is refused, as for
+                     * SWP. */
+                    else if ((insn & 0x3f20cc00u) == 0x38200000u ||               /* LD<OP> */
+                             (!in_jit && (insn & 0x3fa07c00u) == 0x08a07c00u))     /* CAS */
+                    {
+                        uint64_t gpr[32];
+
+                        memcpy( gpr, state.__x, sizeof(state.__x) );
+                        gpr[29] = state.__fp;
+                        gpr[30] = state.__lr;
+                        gpr[31] = state.__sp;
+                        if (ios_mach_emulate_rmw( insn, rw_addr, gpr ))
+                        {
+                            memcpy( state.__x, gpr, sizeof(state.__x) );
+                            state.__fp = gpr[29];
+                            state.__lr = gpr[30];
+                            emulated = 1;
+                        }
+                        {
+                            static int rmw_n;
+                            if (rmw_n < 8)
+                                dprintf(STDERR_FILENO,
+                                    "[mach-rmw] #%d insn=0x%08x pc=0x%llx addr=0x%llx rw=0x%llx %s\n",
+                                    ++rmw_n, insn, (unsigned long long)fault_pc,
+                                    (unsigned long long)fault_addr, (unsigned long long)rw_addr,
+                                    emulated ? "emulated" : "REFUSED: misaligned");
+                        }
+                    }
                     /* FEX's native backpatch lock uses CASAL on the pool RX
                      * view. Handle it before Mach-to-guest delivery; otherwise
                      * a host-runtime fault escapes into the guest's VEH.
@@ -4131,12 +5116,47 @@ static void *ios_mach_exception_thread( void *arg )
                                         (unsigned long long)rw_addr, cas_width);
                         }
                     }
+                    /* The host FAR can identify the first byte even when a
+                     * later guest page blocks a spanning store. Dispatch the
+                     * blocked page, leaving PC, registers and all bytes intact,
+                     * so FEX invalidates that page before the next retry. */
+                    if (!emulated && (insn & 0xbfa07c00u) == 0x08207c00u)
+                    {
+                        unsigned rn = (insn >> 5) & 31;
+                        unsigned casp_width = (insn & 0x40000000u) ? 16 : 8;
+                        uint64_t base = rn == 31 ? state.__sp : rn == 30 ? state.__lr :
+                                        rn == 29 ? state.__fp : state.__x[rn];
+                        uintptr_t casp_rw = ios_write_alias( (uintptr_t)base );
+                        if (fault_addr >= base && fault_addr - base < casp_width &&
+                            casp_rw && ios_write_alias( (uintptr_t)base + casp_width - 1 ) ==
+                                       casp_rw + casp_width - 1 &&
+                            !(honor_guest_prot && ios_alias_write_is_trapped( (uintptr_t)base )) &&
+                            ios_mach_emulate_casp( insn, casp_rw, state.__x ))
+                        {
+                            static unsigned casp_mach_logs;
+                            emulated = 1;
+                            if (casp_mach_logs++ < 16)
+                                dprintf( STDERR_FILENO, "[mach-casp] insn=%08x pc=%llx addr=%llx rw=%llx\n",
+                                         insn, (unsigned long long)fault_pc,
+                                         (unsigned long long)base, (unsigned long long)casp_rw );
+                        }
+                    }
+                    if (!emulated && alias_fault && honor_guest_prot)
+                    {
+                        fault_addr = alias_fault;
+                        goto dispatch_guest_fault;
+                    }
                     /* ml350 DISCRIMINATOR: alias EXISTS but the instruction is not
                      * in this decode list — every such miss previously cost a full
                      * run to name (ml349's STRB-reg took one). Print the insn so
                      * the next gap is a one-line diagnosis. Capped. */
                     if (!emulated)
                     {
+                        if (watch_hit)
+                        {   /* ml1201: leave the page writable, re-execute the store natively */
+                            ios_watch_report( &state, (uint64_t)fault_pc, insn, fault_addr, thread_teb, 0, watch_prot );
+                            handled = 1;
+                        }
                         static int undecoded_n;
                         if (undecoded_n < 8)
                             dprintf(STDERR_FILENO,
@@ -4147,6 +5167,12 @@ static void *ios_mach_exception_thread( void *arg )
                     }
                     if (emulated)
                     {
+                        if (watch_hit)
+                        {   /* ml1201: the store landed; report it and re-arm the page */
+                            ios_watch_report( &state, (uint64_t)fault_pc, insn, fault_addr, thread_teb, 1, watch_prot );
+                            if (ios_watch_state == 1)
+                                mprotect( (void *)ios_watch_page, IOS_WATCH_PAGE, PROT_READ );   /* ml1202: read only; EXEC would be refused */
+                        }
                         /* ml635: record that this alias page was written. FEX's cached
                          * translation is NOT invalidated here (the ARM64EC path would call
                          * HandleRWXAccessViolation); this counter is what proves whether a
@@ -4202,7 +5228,7 @@ static void *ios_mach_exception_thread( void *arg )
                                 extern int ios_wx_enabled( void );
                                 int wi, victim = -1;
 
-                                if (ios_wx_enabled())
+                                if (ios_wx_enabled() && !watch_hit)   /* ml1201: a watched page keeps its trap */
                                 {
                                     for (wi = 0; wi < WX_SLOTS; wi++)
                                     {
@@ -4785,6 +5811,7 @@ wx_done: ;
 skip_reclaim_band: ;
             }
 
+dispatch_guest_fault:
             /* madeira-bcd: a thread of an EXITED pseudo-process woke into its
              * reclaimed JIT copies; its ntdll copy is gone too, so guest SEH can
              * only re-fault until the ml461/ml465 terminal kills the whole app
@@ -4903,9 +5930,9 @@ skip_reclaim_band: ;
                      * eating an entire run, and dumps the region layout around it so the
                      * owner can be identified and the real fix aimed correctly. */
                     {
-                        static volatile uint64_t stuck_page;
-                        static volatile uint64_t stuck_pc;
-                        static volatile uint32_t stuck_n;
+                        static struct { uint64_t thread, page, pc, addr; uint32_t n, page_n; unsigned seq; } stk[16];
+                        const int ss = ios_fault_slot( (uint64_t)thread );
+                        const unsigned dseq = __atomic_load_n( &ios_guest_deliv_seq[ss], __ATOMIC_ACQUIRE );
                         /* ml876: exact faulting ADDRESS, and a page-level storm
                          * counter. ml871-875 killed a UE 5.4 game thread here on
                          * every run: an SDK dll walked its import table with the
@@ -4918,8 +5945,6 @@ skip_reclaim_band: ;
                          * = the SAME address re-faulting (ml261 sp-16 push, ml385
                          * NULL write, ml557 un-stuck heal); key on it. Keep a much
                          * larger page-level ceiling as the storm safety net. */
-                        static volatile uint64_t stuck_addr;
-                        static volatile uint32_t stuck_page_n;
                         uint64_t fpage = (uint64_t)fault_addr & ~0x3fffull;
                         /* ml385: NULL-page faults keyed as 1, not 0 — `if (fpage &&`
                          * excluded them entirely and a NULL-write loop in
@@ -4928,25 +5953,35 @@ skip_reclaim_band: ;
                          * had detached). */
                         if (!fpage) fpage = 1;
 
-                        if (fpage == stuck_page && fault_pc_check == stuck_pc &&
-                            (uint64_t)fault_addr != stuck_addr)
+                        /* Another thread in this slot, or an exception delivered to this
+                         * one since its last fault, starts a new run (page 0 never
+                         * matches, so the run is keyed again below). */
+                        if (stk[ss].thread != (uint64_t)thread || stk[ss].seq != dseq)
+                        {
+                            stk[ss].thread = (uint64_t)thread;
+                            stk[ss].seq = dseq;
+                            stk[ss].page = 0;
+                        }
+
+                        if (fpage == stk[ss].page && fault_pc_check == stk[ss].pc &&
+                            (uint64_t)fault_addr != stk[ss].addr)
                         {
                             /* ml876: same page+pc but a NEW address = progress.
                              * Restart the exact-address count; keep the page
                              * storm count (ceiling 20000, logged every 1000). */
-                            uint32_t pn = __sync_add_and_fetch(&stuck_page_n, 1);
-                            stuck_addr = (uint64_t)fault_addr;
-                            stuck_n = 0;
+                            uint32_t pn = __sync_add_and_fetch(&stk[ss].page_n, 1);
+                            stk[ss].addr = (uint64_t)fault_addr;
+                            stk[ss].n = 0;
                             if ((pn % 1000) == 0)
                                 dprintf(STDERR_FILENO,
                                     "[fault-stuck] ml876 page 0x%llx pc 0x%llx: %u faults, addresses advancing (last 0x%llx)\n",
                                     (unsigned long long)fpage, (unsigned long long)fault_pc_check, pn,
                                     (unsigned long long)fault_addr);
-                            if (pn >= 20000) stuck_n = 49;   /* storm ceiling: next fault breaks */
+                            if (pn >= 20000) stk[ss].n = 49;   /* storm ceiling: next fault breaks */
                         }
-                        if (fpage == stuck_page && fault_pc_check == stuck_pc)
+                        if (fpage == stk[ss].page && fault_pc_check == stk[ss].pc)
                         {
-                            uint32_t n = __sync_add_and_fetch(&stuck_n, 1);
+                            uint32_t n = __sync_add_and_fetch(&stk[ss].n, 1);
                             /* ml385 LOOP BREAKER: same page AND same pc 50 times
                              * with zero progress is a livelock, not a recoverable
                              * fault (guard/watch pages resolve in 1-3). Divert the
@@ -4968,7 +6003,7 @@ skip_reclaim_band: ;
                                 thread_set_state( thread, ARM_THREAD_STATE64,
                                                   (thread_state_t)&state, count );
                                 handled = 1;
-                                stuck_n = 0;
+                                stk[ss].n = 0;
                             }
                             /* ml369: was 2048, which NEVER fired — the
                              * debugger script kills the app after 8
@@ -5016,11 +6051,11 @@ skip_reclaim_band: ;
                         }
                         else
                         {
-                            stuck_page = fpage;
-                            stuck_pc = fault_pc_check;
-                            stuck_addr = (uint64_t)fault_addr;
-                            stuck_n = 0;
-                            stuck_page_n = 0;
+                            stk[ss].page = fpage;
+                            stk[ss].pc = fault_pc_check;
+                            stk[ss].addr = (uint64_t)fault_addr;
+                            stk[ss].n = 0;
+                            stk[ss].page_n = 0;
                         }
                     }
 
@@ -6563,56 +7598,8 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
         ios_exc_handler_started = 1;
     }
 
-    /* Register this thread in the registry.
-     * ml384: replace an existing entry for the same port first — the kernel
-     * recycles thread port names, and a stale entry earlier in the array would
-     * shadow the new registration in ios_lookup_thread (first match wins). */
-    int idx, reg_count = __sync_fetch_and_add(&ios_thread_count, 0);
-    if (reg_count > IOS_MAX_WINE_THREADS) reg_count = IOS_MAX_WINE_THREADS;
-    for (idx = 0; idx < reg_count; idx++)
-        if (ios_thread_registry[idx].mach_thread == pe_thread) break;
-    if (idx == reg_count)
-    {
-        idx = __sync_fetch_and_add(&ios_thread_count, 1);
-        if (idx >= IOS_MAX_WINE_THREADS)
-        {
-            ERR("[thread-registry] FULL (%d slots) — thread 0x%x teb=%p NOT registered; "
-                "Mach events on it will resolve to the slot-0 TEB (wrong process!)\n",
-                IOS_MAX_WINE_THREADS, pe_thread, (void *)teb);
-            idx = -1;
-        }
-    }
-    if (idx >= 0)
-    {
-        /* ml390 (task #66): make the replace path LOUD.  If a name gets
-         * recycled while its previous owner still has live guest state, this
-         * overwrite silently redirects that thread's TEB resolution — and a
-         * thread_set_state aimed at the new owner could land on the old one
-         * (zeroed-state suspect).  old_teb!=0 && old_teb!=new_teb = the case
-         * to correlate offline against [reg-miss] and fault dumps. */
-        if (idx < reg_count && ios_thread_registry[idx].teb &&
-            ios_thread_registry[idx].teb != teb)
-            ERR( "[thread-registry] REPLACE idx=%d port=0x%x old_teb=%p new_teb=%p\n",
-                 idx, pe_thread, (void *)ios_thread_registry[idx].teb, (void *)teb );
-        ios_thread_registry[idx].teb = teb;
-        ios_thread_registry[idx].trampoline = trampoline;
-        __sync_synchronize();
-        ios_thread_registry[idx].mach_thread = pe_thread;
-        /* ml401 (tasks #60/#66): EVERY registry port name proved
-         * MACH_SEND_INVALID_DEST when the census sampler tried to use it —
-         * something deallocates the mach_thread_self() ref after we store the
-         * name, leaving the registry full of dead keys ([pump-sample] blind,
-         * and dead names are exactly what the kernel recycles = the #66
-         * wrong-thread hazard).  Pin extra send refs so the name outlives any
-         * stray deallocate; dead-name lingering after thread exit is harmless
-         * and prevents recycling. */
-        {
-            kern_return_t krr = mach_port_mod_refs( mach_task_self(), pe_thread,
-                                                    MACH_PORT_RIGHT_SEND, 4 );
-            if (krr != KERN_SUCCESS)
-                ERR( "[thread-registry] mod_refs(+4) port=0x%x FAILED kr=%d\n", pe_thread, krr );
-        }
-    }
+    /* Register this thread in the registry. */
+    int idx = ios_thread_registry_add( pe_thread, teb, trampoline );
 
     /* Set exception port for this thread (shared port).
      * ml353: also claim EXC_BAD_INSTRUCTION. udf-class faults (executing
@@ -7483,6 +8470,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     NTSTATUS status;
 
     ios_log_guest_exception( "raise", rec, context->Pc );
+    ios_note_guest_delivery( (uint64_t)pthread_mach_thread_np( pthread_self() ) );   /* restarts [fault-stuck] */
 
     status = send_debug_event( rec, context, TRUE, TRUE );
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
@@ -8193,6 +9181,7 @@ dispatch:
     REGn_sig(18, &uc) = thread_teb;
 
     *state = mc.__ss;
+    ios_note_guest_delivery( (uint64_t)thread );   /* restarts [fault-stuck] */
 
     if (deliver_logs < 24 || (deliver_logs % 100) == 0)
         dprintf( 2, "[mach-deliver] rev=ml369 #%d code=%08x pc=0x%llx excaddr=%p addr=0x%llx frame=%p teb=%p disp=%p\n",
@@ -9507,6 +10496,187 @@ static int ios_tlswatch_fault( const void *addr, const void *pc, const char *whi
 static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb );
 #endif
 
+/***********************************************************************
+ *           ios_fault_operand_trace  (ml1200)
+ *
+ * A fatal fault in FEX-emitted code reports the ARM registers x0-x3,
+ * x8-x10 and x16-x20 and the guest GPRs from the CpuStateFrame. In the
+ * ARM64EC build the guest registers LIVE in ARM registers (x0=rcx x1=rdx
+ * x2=r8 x3=r9 x4=r10 x5=r11 x8=rax x19-x22=r12-r15 x23=rsp x25=rsi
+ * x26=rdi x27=rbx x29=rbp) and the frame copy is only refreshed at block
+ * boundaries, so the printed guest state is stale by up to a whole block
+ * and the registers that matter (x4-x7, x21-x27) were not printed at all.
+ * Log 57 (upstream-1011-3) faulted on `ldurh w8,[x2,#8]` with x2 holding
+ * a pointer rotated by one byte; x2 had been loaded by `ldur x2,[x4]` two
+ * instructions earlier and nothing showed x4 or the bytes at [x4].
+ *
+ * This prints every ARM register from the signal context, then decodes
+ * the faulting load/store's base register and walks back up to eight
+ * instructions for the load that produced that register (same Rt), and
+ * dumps the memory around both addresses with a checked read. The
+ * alignment and the eight bytes at the producer's address tell apart
+ * "memory already holds the bad value" (trace the writer) from "the load
+ * returned something other than memory" (our load emulation), and whether
+ * the producer's address was unaligned (our backpatch path).
+ * Diagnostic only. MADEIRA_FAULT_OPERANDS=0 disables it.
+ */
+static void ios_fault_operand_trace( ucontext_t *context, const void *fault_addr )
+{
+    static int enabled = -1;
+    static const char * const ec_name[32] = {
+        "rcx","rdx","r8 ","r9 ","r10","r11","tmp","tmp","rax","PF ",
+        "T1 ","T2 ","T3 ","T4 ","tmp","tmp","tmp","crs","x18","r12",
+        "r13","r14","r15","rsp","AF ","rsi","rdi","rbx","ST ","rbp","lr ","sp " };
+    uint64_t r[32];
+    uint32_t ins[9];
+    mach_vm_size_t got = 0;
+    uintptr_t pc = (uintptr_t)PC_sig(context);
+    int i;
+
+    if (enabled < 0) { const char *e = getenv( "MADEIRA_FAULT_OPERANDS" ); enabled = !(e && e[0] == '0'); }
+    if (!enabled) return;
+
+    for (i = 0; i < 29; i++) r[i] = (uint64_t)REGn_sig(i, context);
+    r[29] = (uint64_t)FP_sig(context);
+    r[30] = (uint64_t)REGn_sig(30, context);
+    r[31] = (uint64_t)SP_sig(context);
+
+    for (i = 0; i < 32; i += 4)
+        ERR("  [regs] ml1200 x%-2d(%s)=%016llx x%-2d(%s)=%016llx x%-2d(%s)=%016llx x%-2d(%s)=%016llx\n",
+            i,   ec_name[i],   (unsigned long long)r[i],   i+1, ec_name[i+1], (unsigned long long)r[i+1],
+            i+2, ec_name[i+2], (unsigned long long)r[i+2], i+3, ec_name[i+3], (unsigned long long)r[i+3]);
+
+    if (pc < 0x100000000ULL + 32) return;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(pc - 32), sizeof(ins),
+                                (mach_vm_address_t)ins, &got ) != KERN_SUCCESS || got != sizeof(ins))
+    {
+        ERR("  [operand] ml1200 instruction stream at pc=%p unreadable\n", (void *)pc);
+        return;
+    }
+
+    {
+        const uint32_t insn = ins[8];
+        unsigned rn;
+        uint64_t base;
+        long long off;
+        unsigned char mem[48];
+        int k, redefined = 0;
+
+        /* Loads and stores: bit 27 set, bit 25 clear. */
+        if ((insn & 0x0A000000u) != 0x08000000u)
+        {
+            ERR("  [operand] ml1200 faulting insn %08x is not a load/store; no operand trace\n", insn);
+            return;
+        }
+        rn = (insn >> 5) & 31;
+        base = r[rn];
+        off = (long long)((uint64_t)(uintptr_t)fault_addr - base);
+
+        ERR("  [operand] ml1200 fault insn %08x base x%u=%p fault=%p (base%+lld, base mod 8 = %u)\n",
+            insn, rn, (void *)base, fault_addr, off, (unsigned)(base & 7));
+
+        /* The producer: the nearest earlier load whose destination is the base register.
+         * A data-processing instruction with that destination in between is reported. */
+        for (k = 7; k >= 0; k--)
+        {
+            const uint32_t w = ins[k];
+            const int ldst = (w & 0x0A000000u) == 0x08000000u;
+            const unsigned rt = w & 31;
+
+            if (ldst)
+            {
+                const unsigned opc = (w >> 22) & 3;
+                if (rt == rn && opc != 0)
+                {
+                    const unsigned prn = (w >> 5) & 31;
+                    const unsigned size = (w >> 30) & 3;
+                    const uint64_t pbase = r[prn];
+                    uint64_t addr = pbase;
+                    const char *form = "other";
+                    uint64_t now8 = 0;
+
+                    if ((w & 0x3B000000u) == 0x39000000u)
+                    {   /* LDR (unsigned immediate), scaled by the access size */
+                        addr += (uint64_t)((w >> 10) & 0xfff) << size;
+                        form = "ldr-imm";
+                    }
+                    else if ((w & 0x3B200C00u) == 0x38000000u)
+                    {   /* LDUR: simm9 at bits 12-20 */
+                        int64_t imm9 = (int64_t)(int32_t)(((w >> 12) & 0x1ff) << 23) >> 23;
+                        addr += (uint64_t)imm9;
+                        form = "ldur";
+                    }
+                    else if ((w & 0x3B200C00u) == 0x38200800u)
+                    {   /* register offset: Rm with extend and optional shift */
+                        const unsigned rm = (w >> 16) & 31;
+                        const unsigned option = (w >> 13) & 7;
+                        const unsigned s = (w >> 12) & 1;
+                        uint64_t idx = r[rm];
+                        if (option == 2) idx = (uint32_t)idx;
+                        else if (option == 6) idx = (uint64_t)(int64_t)(int32_t)idx;
+                        addr += s ? (idx << size) : idx;
+                        form = "ldr-reg";
+                    }
+                    else if ((w & 0x3F200C00u) == 0x19000000u)
+                    {   /* LDAPUR (RCPC2): simm9 at bits 12-20 */
+                        int64_t imm9 = (int64_t)(int32_t)(((w >> 12) & 0x1ff) << 23) >> 23;
+                        addr += (uint64_t)imm9;
+                        form = "ldapur";
+                    }
+                    else if ((w & 0x3A000000u) == 0x28000000u)
+                    {   /* LDP/STP family: the address of the first register only */
+                        form = "ldp";
+                    }
+
+                    ERR("  [operand] ml1200 producer at pc-%u: %08x %s x%u <- [x%u=%p] addr=%p (mod 8 = %u, width %u)%s\n",
+                        (unsigned)(8 - k) * 4, w, form, rt, prn, (void *)pbase, (void *)addr,
+                        (unsigned)(addr & 7), 1u << size,
+                        redefined ? "  NOTE: base register redefined between producer and fault" : "");
+
+                    got = 0;
+                    if (addr >= 16 &&
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(addr - 16), sizeof(mem),
+                                                (mach_vm_address_t)mem, &got ) == KERN_SUCCESS && got == sizeof(mem))
+                    {
+                        char hex[sizeof(mem) * 3 + 1];
+                        int b;
+                        for (b = 0; b < (int)sizeof(mem); b++) snprintf( hex + b * 3, 4, "%02x ", mem[b] );
+                        memcpy( &now8, mem + 16, 8 );
+                        ERR("  [operand] ml1200 [addr-16 .. addr+31]: %s\n", hex);
+                        ERR("  [operand] ml1200 memory now holds %016llx at addr; register x%u holds %016llx -> %s\n",
+                            (unsigned long long)now8, rt, (unsigned long long)base,
+                            now8 == base ? "SAME: the bad value is in memory, trace its writer"
+                                         : "DIFFERENT: memory changed since the load, or the load did not return memory");
+                    }
+                    else
+                        ERR("  [operand] ml1200 producer address %p unreadable now\n", (void *)addr);
+                    break;
+                }
+                /* a store does not redefine its Rt; keep walking */
+            }
+            else if (rt == rn && (w >> 26) != 0x05 && (w & 0x7C000000u) != 0x14000000u)
+            {
+                /* data-processing with Rd == base (branches excluded) */
+                redefined = 1;
+            }
+        }
+        if (k < 0)
+            ERR("  [operand] ml1200 no load into x%u within the previous 8 instructions%s\n", rn,
+                redefined ? " (register redefined by data processing)" : "");
+
+        got = 0;
+        if (base >= 16 &&
+            mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(base - 16), sizeof(mem),
+                                    (mach_vm_address_t)mem, &got ) == KERN_SUCCESS && got == sizeof(mem))
+        {
+            char hex[sizeof(mem) * 3 + 1];
+            int b;
+            for (b = 0; b < (int)sizeof(mem); b++) snprintf( hex + b * 3, 4, "%02x ", mem[b] );
+            ERR("  [operand] ml1200 [base-16 .. base+31]: %s\n", hex);
+        }
+    }
+}
+
 static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { 0 };
@@ -10451,6 +11621,12 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 }
                 ERR("  insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
                     p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
+                ios_fault_operand_trace( context, siginfo->si_addr );
+                {   /* ml1205: the crashing thread's block ring */
+                    uintptr_t tsd_b; extern int ios_teb_tls_slot_offset;
+                    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_b)); tsd_b &= ~7ULL;
+                    ios_block_ring_dump( ios_teb_tls_slot_offset ? *(uintptr_t *)(tsd_b + ios_teb_tls_slot_offset) : 0, 1536, "fatal" );
+                }
             }
             else
                 ERR("  insn=<unmappable PC, skipping read>\n");
@@ -10814,6 +11990,48 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                      (unsigned long long)(pcv - (uint64_t)(uintptr_t)(di.dli_saddr ? di.dli_saddr : di.dli_fbase)),
                      di.dli_fbase );
         ios_dump_fault_region( siginfo->si_addr );
+    }
+    /* A 32-bit program's call or jump to an address below 64 KB. FEX refuses to
+     * compile such a block (CompileBlock: REFUSING low/invalid RIP) and returns 0,
+     * and its dispatcher branches there, so the fault arrives here with pc = 0 and
+     * lr just past the dispatcher's CompileBlock call. Wow64PrepareForException
+     * then asks FEX's BTCpuResetToConsistentState, which raises a guest exception
+     * only for a pc inside the JIT; for pc 0 it declined, the exception was
+     * dispatched as a native one, the unwind stalled and the program ended
+     * (c0000005). Black Ops II's campaign (build 26, 2026-10-26): DestroyWindow
+     * sent its window WM_ACTIVATE while the game was shutting down to start
+     * Zombies, its window procedure called a null pointer, and the campaign
+     * ended there instead of handing over. Windows and Wine swallow an exception
+     * in a window procedure called back from the kernel; to get there the guest
+     * has to see it. With pc at the dispatcher's call, FEX takes the guest state
+     * from its frame (rip = the refused address) and raises the access violation
+     * to the 32-bit program, whose own handlers then run.
+     * MADEIRA_WOW_LOW_RIP_GUEST=0 dispatches it natively as before. */
+    {
+        extern void *ios_jit_rx_base_global;
+        extern size_t ios_jit_pool_size_global;
+        static int low_rip_guest = -1;
+        uintptr_t lp_pc = (uintptr_t)PC_sig(context), lp_lr = (uintptr_t)LR_sig(context);
+        uintptr_t lp_rx = (uintptr_t)ios_jit_rx_base_global;
+        size_t lp_sz = ios_jit_pool_size_global;
+
+        int enabled = __atomic_load_n( &low_rip_guest, __ATOMIC_RELAXED );
+        if (enabled < 0)
+        {
+            const char *e = getenv( "MADEIRA_WOW_LOW_RIP_GUEST" );
+            enabled = !(e && e[0] == '0' && !e[1]);
+            __atomic_store_n( &low_rip_guest, enabled, __ATOMIC_RELAXED );
+        }
+        if (enabled && lp_pc < 0x10000 && (uintptr_t)siginfo->si_addr == lp_pc &&
+            NtCurrentTeb()->WowTebOffset && lp_lr >= 4 &&
+            ((lp_rx && lp_lr - 4 >= lp_rx && lp_lr - 4 - lp_rx < lp_sz) || ios_jit_low_contains( lp_lr - 4 )))
+        {
+            static int low_rip_logged;
+            if (__atomic_fetch_add( &low_rip_logged, 1, __ATOMIC_RELAXED ) < 16)
+                ERR( "[wow-low-rip] guest branch to %p: pc set to the dispatcher's call %p so the "
+                     "32-bit program gets the access violation\n", (void *)lp_pc, (void *)(lp_lr - 4) );
+            PC_sig(context) = lp_lr - 4;
+        }
     }
 #endif
     setup_exception( context, &rec );
@@ -12547,6 +13765,70 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         (void*)(uintptr_t)g_wine_return_ring[(ri-7)&7],
                         (void*)(uintptr_t)g_wine_return_ring[(ri-8)&7]);
                 }
+                /* ml1353: GIVE UP ON AN UNRECOVERABLE EXEC FAULT.
+                 *
+                 * A pool page whose max protection has lost EXECUTE can never run
+                 * code again (the ml1351 [pool-poison] class). When the faulting
+                 * code is the process's own ntdll copy, the exception dispatcher
+                 * sits on the same dead pages, so delivering the fault faults
+                 * again at the dispatcher, forever: device log 81, two launched
+                 * children at a full core each for the rest of the session. After
+                 * 32 consecutive faults of one thread at one pc on such a page,
+                 * end this pseudo-process (abort_process, run on the thread
+                 * itself after this handler returns) instead.
+                 * env.MADEIRA_POOL_NOEXEC_GIVEUP = 0 keeps the endless retry. */
+                {
+                    static int giveup = -1;
+                    extern int ios_addr_max_prot( const void *addr, int *prot );
+                    if (giveup < 0)
+                    {
+                        const char *e = getenv( "MADEIRA_POOL_NOEXEC_GIVEUP" );
+                        giveup = !(e && e[0] == '0');
+                    }
+                    if (giveup)
+                    {
+                        int cur = -1, maxp = ios_addr_max_prot( pc, &cur );
+                        if (maxp >= 0 && !(maxp & VM_PROT_EXECUTE))
+                        {
+                            static struct { uintptr_t teb, pc; unsigned int n; } trk[32];
+                            static unsigned int trk_next;
+                            uintptr_t fteb = (uintptr_t)REGn_sig(18, bus_ctx);
+                            unsigned int i, slot = 32, n;
+
+                            for (i = 0; i < 32; i++) if (trk[i].teb == fteb) { slot = i; break; }
+                            if (slot == 32)
+                            {
+                                slot = trk_next++ % 32;
+                                trk[slot].teb = fteb;
+                                trk[slot].pc = 0;
+                                trk[slot].n = 0;
+                            }
+                            if (trk[slot].pc != (uintptr_t)pc)
+                            {
+                                trk[slot].pc = (uintptr_t)pc;
+                                trk[slot].n = 0;
+                            }
+                            n = ++trk[slot].n;
+                            if (n >= 32)
+                            {
+                                TEB *cteb = NtCurrentTeb();
+                                dprintf( 2, "[pool] ml1353 giving up: pid %04x tid %04x pc=%p (pool+0x%lx) "
+                                         "faulted %u times in a row on a page whose max protection has no "
+                                         "EXECUTE (prot=%x/%x); ending this process (c0000005) instead of "
+                                         "retrying forever (env.MADEIRA_POOL_NOEXEC_GIVEUP=0 keeps retrying)\n",
+                                         cteb ? (int)HandleToULong( cteb->ClientId.UniqueProcess ) : 0,
+                                         cteb ? (int)HandleToULong( cteb->ClientId.UniqueThread ) : 0,
+                                         pc, (unsigned long)((uintptr_t)pc - rx), n, cur, maxp );
+                                trk[slot].teb = 0;
+                                REGn_sig(0, bus_ctx) = STATUS_ACCESS_VIOLATION;
+                                SP_sig(bus_ctx) &= ~(uintptr_t)15;
+                                LR_sig(bus_ctx) = 0;
+                                PC_sig(bus_ctx) = (uintptr_t)abort_process;
+                                return;
+                            }
+                        }
+                    }
+                }
                 /* Don't try store emulation, go straight to exception */
                 goto bus_fatal;
             }
@@ -12675,9 +13957,22 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             vrec.ExceptionAddress = (void *)PC_sig(bus_ctx);
             {
                 uint32_t f_insn = *(uint32_t *)(uintptr_t)PC_sig(bus_ctx);
+                /* The data abort's ESR says whether the access wrote (WnR, bit 6).
+                 * The encoding guess below calls the LSE atomics (LDADD, SWP, CAS...:
+                 * an x86 lock xadd / xchg) reads, because they have bit 22 set, so a
+                 * write was reported to the guest as a read. MADEIRA_FAULT_ESR_DIR=0
+                 * keeps the encoding guess alone. */
+                static int esr_dir = -1;
+                DWORD64 f_esr = get_fault_esr( bus_ctx );
+                unsigned f_ec = (unsigned)(f_esr >> 26) & 0x3f;
+                if (esr_dir < 0) { const char *e = getenv( "MADEIRA_FAULT_ESR_DIR" ); esr_dir = !(e && e[0] == '0'); }
+                if (esr_dir && (f_ec == 0x24 || f_ec == 0x25))
+                {
+                    if (f_esr & 0x40) vrec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
+                }
                 /* loads have bit22 set in the ld/st register/immediate classes;
                  * good enough to label the fault direction for wine's repair */
-                if ((f_insn & 0x0a000000) == 0x08000000 && !(f_insn & 0x00400000))
+                else if ((f_insn & 0x0a000000) == 0x08000000 && !(f_insn & 0x00400000))
                     vrec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
             }
 
@@ -12965,7 +14260,13 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 
                 {
                     static unsigned long wr_seen, wr_healed;
-                    int stripped = (is_write && (want & PROT_WRITE) &&
+                    /* Logical RWX does not mean the host may grant W: the
+                     * alias is RX by design. In particular, let FEX see CAS
+                     * writes so it invalidates translated code before patching
+                     * the RW alias. Healing here skips that invalidation and
+                     * leaves CoreCLR repeatedly executing its old prestub. */
+                    int aliased = ios_write_alias( (uintptr_t)siginfo->si_addr ) != 0;
+                    int stripped = (is_write && (want & PROT_WRITE) && !aliased &&
                                     host_prot >= 0 && !(host_prot & VM_PROT_WRITE));
                     ++wr_seen;
                     if (wr_seen <= 12 || (wr_seen % 4096) == 0)
@@ -12973,6 +14274,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                             "wine_want=%d host_prot=%d %s (seen=%lu healed=%lu) rev=ml552\n",
                             wr_seen, siginfo->si_addr, pc, (unsigned long long)esr,
                             is_write, want, host_prot,
+                            aliased ? "(intentional alias protection)" :
                             stripped ? "<== HOST STRIPPED WRITE" : "(not a strip)",
                             wr_seen, wr_healed);
 
@@ -13940,7 +15242,10 @@ void signal_init_process(void)
 
  error:
     perror("sigaction");
-    exit(1);
+    {   /* ml1310: this pseudo-process only, through its normal exit path (server_ios.c) */
+        extern void ios_unix_fatal_exit( int status, const char *why ) __attribute__((noreturn));
+        ios_unix_fatal_exit( 1, "signal handler set-up" );
+    }
 }
 
 

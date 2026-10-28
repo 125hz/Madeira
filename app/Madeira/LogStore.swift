@@ -89,6 +89,31 @@ final class LogStore: ObservableObject {
             try? FileManager.default.moveItem(at: logFileURL, to: prevLogURL)
         }
         try? "".write(to: logFileURL, atomically: true, encoding: .utf8)
+        // A session that never returned to the library (a crash, Force close) wrote
+        // no madeira-summary.txt; summarize it now. A launch without a session
+        // leaves the last summary in place (LogSummary.write).
+        if FileManager.default.fileExists(atPath: prevLogURL.path) {
+            LogSummary.writeLater(from: prevLogURL, source: "madeira-log.prev.txt (the previous run)")
+        }
+        // Madeira swiped away from the app switcher ends without returning to the
+        // library: summarize the session so far whenever Madeira goes to the background.
+        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                               object: nil, queue: .main) { [logFileURL] _ in
+            var task = UIBackgroundTaskIdentifier.invalid
+            task = UIApplication.shared.beginBackgroundTask(withName: "madeira-summary") {
+                guard task != .invalid else { return }
+                let finished = task; task = .invalid
+                UIApplication.shared.endBackgroundTask(finished)
+            }
+            DispatchQueue.global(qos: .utility).async {
+                LogSummary.write(from: logFileURL, source: "madeira-log.txt (this session, up to when Madeira went to the background)")
+                DispatchQueue.main.async {
+                    guard task != .invalid else { return }
+                    let finished = task; task = .invalid
+                    UIApplication.shared.endBackgroundTask(finished)
+                }
+            }
+        }
 
         // Start batch flush timer on main thread. Interval depends on uiPaused.
         DispatchQueue.main.async {
@@ -132,6 +157,9 @@ final class LogStore: ObservableObject {
                                 + "(low-power=\(process.isLowPowerModeEnabled ? 1 : 0))")
         }
     }
+
+    /// Documents/madeira-log.txt, this run's log.
+    var logURL: URL { logFileURL }
 
     /// Keeps this session's log under the program's name as well:
     /// Documents/logs/<exe>-<yyyy-MM-dd_HH-mm-ss>.txt, e.g.
@@ -188,6 +216,7 @@ final class LogStore: ObservableObject {
 
     /// Called from tail-file callback (background queue) or C callback.
     private func handleRawLine(_ raw: String) {
+        JITPoolMeter.note(raw)   // the overlay's JIT memory, also while the live log is hidden
         stateLock.lock(); let suppressed = displaySuppressed; stateLock.unlock()
         if suppressed { return }
         // Filter out lines we never want in UI (excessive byte spam, etc.)
