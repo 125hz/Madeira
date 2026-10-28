@@ -40,7 +40,7 @@ start = v.index("unsigned long long ios_avail_phys( unsigned long long host_free
 func = v[start:v.index("\n}\n", start) + 3]
 check("ios_avail_phys reads avail-phys once with madeira_cfg_bool, off by default",
       'on = madeira_cfg_bool( "avail-phys", 0 );' in func and "if (on < 0)" in func)
-cstart = v.index("static int ios_avail_phys_chromium( void )")
+cstart = v.index("static int ios_avail_phys_chromium( void )\n{")   # the definition, not the forward declaration
 chromium = v[cstart:v.index("\n}\n", cstart) + 3]
 check("avail-phys-cef-mb is read once with madeira_cfg_int (0 = off) next to avail-phys",
       'mb = madeira_cfg_int( "avail-phys-cef-mb", 0 );' in func

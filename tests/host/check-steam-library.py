@@ -1059,6 +1059,16 @@ downloader_host = downloader.replace('import Foundation\n', 'import Foundation\n
 if sys.platform != 'darwin':
     space = block(downloader_host, 'public var freeSpace: Int64?')
     downloader_host = downloader_host.replace(space, 'public var freeSpace: Int64? { nil }\n')
+    # F_NOCACHE and F_RDAHEAD are Darwin's fcntl read hints; Linux reads the same bytes without them.
+    for hint in ('        _ = fcntl(fd, F_NOCACHE, 1)\n', '        _ = fcntl(fd, F_RDAHEAD, 1)\n'):
+        downloader_host = downloader_host.replace(hint, '')
+    # swift-corelibs-foundation's URLSession.data(from:) sometimes never returns once its task
+    # is cancelled (the interrupt phase hung about one run in four), where Apple's throws
+    # URLError.cancelled. Fetch outside the group's cancellation; the sibling chunks still
+    # stop at their next cancellation check.
+    downloader_host = downloader_host.replace(
+        '        let (data, response) = try await http.data(from: url)\n',
+        '        let (data, response) = try await Task.detached { try await http.data(from: url) }.value\n', 1)
 fetcher_source = sources['SwiftSteam/Library/SteamLibraryFetcher.swift']
 
 work = Path(tempfile.mkdtemp(prefix='madeira-steam-library-'))
