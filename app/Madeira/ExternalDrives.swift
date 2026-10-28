@@ -17,6 +17,7 @@ struct ExternalFolder: Codable, Identifiable {
     var bookmark: Data
     /// Madeira's Steam downloads go to <folder>/SteamLibrary on this drive.
     var steamInstalls: Bool? = nil
+    var libraryID: String? = nil
 }
 
 final class ExternalDrives: ObservableObject {
@@ -36,6 +37,8 @@ final class ExternalDrives: ObservableObject {
     private static var libraries: [String] = []
     private static var installTarget: String?
     private static var installMissing: String?
+    private static var opened: [String: (root: URL, identity: String?)] = [:]
+    private var loadFailure: Error?
     static var steamLibraries: [String] { lock.lock(); defer { lock.unlock() }; return libraries }
     /// The library Madeira's Steam downloads go to, or nil for drive_c's own.
     static var steamInstallLibrary: String? { lock.lock(); defer { lock.unlock() }; return installTarget }
@@ -45,38 +48,98 @@ final class ExternalDrives: ObservableObject {
     private static let libraryFolders = ["", "SteamLibrary", "Steam", "Program Files (x86)/Steam", "Program Files/Steam"]
 
     private init() {
-        if let data = try? Data(contentsOf: Self.store),
-           let list = try? JSONDecoder().decode([ExternalFolder].self, from: data) { folders = list }
+        do {
+            let data = try Data(contentsOf: Self.store)
+            guard data.count <= 32 << 20 else { throw ExternalStorageError.invalidRecord }
+            let list = try JSONDecoder().decode([ExternalFolder].self, from: data)
+            try Self.validate(list)
+            folders = list
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { }
+        catch { loadFailure = error; LogStore.shared.log("[external] saved registrations could not be read; files kept") }
     }
 
-    private func save() {
-        if let data = try? JSONEncoder().encode(folders) { try? data.write(to: Self.store, options: .atomic) }
+    private static func validate(_ list: [ExternalFolder]) throws {
+        guard list.count <= 22, Set(list.map(\.id)).count == list.count,
+              list.filter({ $0.steamInstalls == true }).count <= 1,
+              Set(list.map { $0.name.lowercased() }).count == list.count,
+              Set(list.map(\.letter)).count == list.count else { throw ExternalStorageError.invalidRecord }
+        for folder in list {
+            guard try ExternalStoragePath.components(folder.name) == [folder.name],
+                  folder.letter.count == 1, "defghijklmnopqrstuvwxy".contains(folder.letter),
+                  !folder.bookmark.isEmpty, folder.bookmark.count <= 1 << 20,
+                  folder.libraryID == nil || UUID(uuidString: folder.libraryID!) != nil else { throw ExternalStorageError.invalidRecord }
+        }
+    }
+
+    private func save(_ list: [ExternalFolder]) throws {
+        if let loadFailure { throw loadFailure }
+        try Self.validate(list)
+        try JSONEncoder().encode(list).write(to: Self.store, options: .atomic)
+        folders = list
+    }
+
+    private func publishOpened() {
+        let next = Dictionary(uniqueKeysWithValues: folders.compactMap { folder in
+            mounted[folder.id].map { (folder.name, (root: $0, identity: folder.libraryID)) }
+        })
+        Self.lock.lock(); Self.opened = next; Self.lock.unlock()
+    }
+
+    static func externalRoot(for relative: String) throws -> (root: URL, identity: String?)? {
+        guard let name = driveName(library: relative) else { return nil }
+        lock.lock(); let folder = opened[name]; lock.unlock()
+        guard let folder else { throw ExternalStorageError.unavailable }
+        try validateRoot(folder.root, identity: folder.identity)
+        return folder
+    }
+
+    private static func validateRoot(_ root: URL, identity: String?) throws {
+        guard try root.checkResourceIsReachable(),
+              try root.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { throw ExternalStorageError.unavailable }
+        if let identity { try ExternalStorageIdentity.verify(identity, root: root) }
+    }
+
+    static func nativeURL(_ relative: String, write: Bool = false) throws -> URL {
+        _ = try ExternalStoragePath.components(relative)
+        guard let external = try externalRoot(for: relative) else { return MadeiraDock.drive.appendingPathComponent(relative) }
+        if write, try external.root.resourceValues(forKeys: [.volumeIsReadOnlyKey]).volumeIsReadOnly == true {
+            throw CocoaError(.fileWriteVolumeReadOnly)
+        }
+        let parts = try ExternalStoragePath.components(relative)
+        return parts.count == 2 ? external.root : try ExternalStoragePath.native(parts.dropFirst(2).joined(separator: "/"), root: external.root)
     }
 
     /// Opens every saved folder and refreshes the links. Safe to call again; it
     /// must run before the wineserver starts for Windows to list the drives.
-    func mountAll() {
+    @MainActor func mountAll() {
+        guard loadFailure == nil, wine_process_is_running() == 0 else { return }
         let fm = FileManager.default
         try? fm.createDirectory(at: Self.linkRoot, withIntermediateDirectories: true)
         try? fm.createDirectory(at: Self.dosdevices, withIntermediateDirectories: true)
-        var changed = false
+        var next = folders
         for i in folders.indices {
             let folder = folders[i]
-            if mounted[folder.id] != nil { continue }
-            var stale = false
-            guard let url = try? URL(resolvingBookmarkData: folder.bookmark, bookmarkDataIsStale: &stale),
-                  url.startAccessingSecurityScopedResource() else {
-                LogStore.shared.log("[external] \(folder.name) is not available")
+            if let root = mounted[folder.id], (try? Self.validateRoot(root, identity: folder.libraryID)) != nil { continue }
+            mounted.removeValue(forKey: folder.id)?.stopAccessingSecurityScopedResource()
+            do {
+                var stale = false
+                let url = try URL(resolvingBookmarkData: folder.bookmark, bookmarkDataIsStale: &stale)
+                guard url.startAccessingSecurityScopedResource() else { throw ExternalStorageError.unavailable }
+                do {
+                    try Self.validateRoot(url, identity: folder.libraryID)
+                    try link(folder, to: url, owned: true)
+                    if stale { next[i].bookmark = try url.bookmarkData() }
+                    mounted[folder.id] = url
+                } catch { url.stopAccessingSecurityScopedResource(); throw error }
+            } catch {
+                LogStore.shared.log("[external] \(folder.name) unavailable: \(error.localizedDescription)")
                 unlink(folder)
-                continue
             }
-            if stale, let fresh = try? url.bookmarkData() { folders[i].bookmark = fresh; changed = true }
-            mounted[folder.id] = url
-            link(folder, to: url)
-            LogStore.shared.log("[external] \(folder.letter.uppercased()): \(folder.name) -> \(url.path) fs=\(url.fileSystemType ?? "?")")
         }
-        if changed { save() }
+        do { try save(next) } catch { LogStore.shared.log("[external] bookmark refresh could not be saved") }
+        publishOpened()
         refreshSteam()
+        SteamOwnedLibrary.shared.externalStorageReconnected()
     }
 
     /// Finds the Steam libraries on the opened drives, makes the chosen download
@@ -86,18 +149,22 @@ final class ExternalDrives: ObservableObject {
         let fm = FileManager.default
         var found: [String] = [], target: String?, missing: String?
         for folder in folders {
-            guard let url = mounted[folder.id] else {
+            if folder.steamInstalls == true { target = "External/\(folder.name)/SteamLibrary/steamapps" }
+            guard mounted[folder.id] != nil, Self.isConnected(folder.name) else {
                 if folder.steamInstalls == true { missing = folder.name }
                 continue
             }
             if folder.steamInstalls == true {
-                try? fm.createDirectory(at: url.appendingPathComponent("SteamLibrary/steamapps/common", isDirectory: true), withIntermediateDirectories: true)
-                target = "External/\(folder.name)/SteamLibrary/steamapps"
+                do {
+                    let common = try Self.nativeURL("External/\(folder.name)/SteamLibrary/steamapps/common", write: true)
+                    try fm.createDirectory(at: common, withIntermediateDirectories: true)
+                } catch { missing = folder.name }
             }
             for sub in Self.libraryFolders {
                 let apps = sub.isEmpty ? "steamapps" : sub + "/steamapps"
                 var isDir: ObjCBool = false
-                if fm.fileExists(atPath: url.appendingPathComponent(apps).path, isDirectory: &isDir), isDir.boolValue {
+                if let appsURL = try? Self.nativeURL("External/\(folder.name)/" + apps),
+                   fm.fileExists(atPath: appsURL.path, isDirectory: &isDir), isDir.boolValue {
                     found.append("External/\(folder.name)/" + apps)
                 }
             }
@@ -118,29 +185,16 @@ final class ExternalDrives: ObservableObject {
     private static func listInSteamClient(_ relative: [String]) {
         guard !relative.isEmpty else { return }
         let vdf = MadeiraDock.drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot + "/steamapps/libraryfolders.vdf")
-        func windows(_ r: String) -> String { "C:\\" + r.replacingOccurrences(of: "/", with: "\\") }
-        var text = (try? String(contentsOf: vdf, encoding: .utf8)) ?? ""
-        var entries: [String: SteamValue]?
-        if var parser = try? SteamKeyValues(Data(text.utf8)), let root = try? parser.read() { entries = root["libraryfolders"]?.fields }
-        if entries == nil { text = "\"libraryfolders\"\n{\n}\n" }
-        var listed = Set((entries ?? [:]).values.compactMap { $0["path"]?.string?.replacingOccurrences(of: "\\\\", with: "\\").lowercased() })
-        var next = (entries ?? [:]).keys.compactMap { Int($0) }.max().map { $0 + 1 } ?? 0
-        var changed = false
-        // The client's own library comes first.
-        for path in [windows(SteamRuntimeFiles.relativeRoot)] + relative.map(windows) where !listed.contains(path.lowercased()) {
-            text = insert(entry: path, index: next, into: text); next += 1; changed = true
-            listed.insert(path.lowercased())
-        }
-        guard changed else { return }
-        try? FileManager.default.createDirectory(at: vdf.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? text.write(to: vdf, atomically: true, encoding: .utf8)
-    }
-
-    private static func insert(entry path: String, index: Int, into text: String) -> String {
-        guard let end = text.range(of: "}", options: .backwards) else { return text }
-        let escaped = path.replacingOccurrences(of: "\\", with: "\\\\")
-        let block = "\t\"\(index)\"\n\t{\n\t\t\"path\"\t\t\"\(escaped)\"\n\t\t\"apps\"\n\t\t{\n\t\t}\n\t}\n"
-        var out = text; out.insert(contentsOf: block, at: end.lowerBound); return out
+        do {
+            let existing: Data?
+            do { existing = try Data(contentsOf: vdf) }
+            catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { existing = nil }
+            let paths = [SteamRuntimeFiles.relativeRoot] + relative
+            let data = try ExternalSteamLibraries.add(paths: paths, to: existing)
+            guard data != existing else { return }
+            try FileManager.default.createDirectory(at: vdf.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: vdf, options: .atomic)
+        } catch { LogStore.shared.log("[external] Steam library metadata was kept: \(error.localizedDescription)") }
     }
 
     /// "External/<name>/..." -> "<name>", or nil for drive_c.
@@ -149,8 +203,7 @@ final class ExternalDrives: ObservableObject {
         return parts.count >= 2 && parts[0] == "External" ? parts[1] : nil
     }
     static func isConnected(_ name: String) -> Bool {
-        let link = linkRoot.appendingPathComponent(name)
-        return (try? link.resolvingSymlinksInPath().checkResourceIsReachable()) == true && link.resolvingSymlinksInPath() != link
+        (try? externalRoot(for: "External/" + name)) != nil
     }
     /// Places a Steam game can be installed or moved to: this device's own
     /// library and <folder>/SteamLibrary on each connected drive.
@@ -165,17 +218,23 @@ final class ExternalDrives: ObservableObject {
 
     /// Sends Madeira's Steam downloads to this folder (nil: back to drive_c).
     func setSteamInstalls(_ id: UUID?) {
-        for i in folders.indices { folders[i].steamInstalls = folders[i].id == id ? true : nil }
-        save(); refreshSteam()
+        var next = folders
+        for i in next.indices { next[i].steamInstalls = next[i].id == id ? true : nil }
+        do { try save(next); refreshSteam() }
+        catch { LogStore.shared.log("[external] install target was not changed: \(error.localizedDescription)") }
     }
 
     /// Adds a folder picked with the folder picker and links it right away.
     func add(_ url: URL) throws {
+        if let loadFailure { throw loadFailure }
+        guard wine_process_is_running() == 0 else { throw LibraryError.message("Close the running game before adding a drive.") }
         guard url.startAccessingSecurityScopedResource() else { throw LibraryError.message("Madeira could not open that folder.") }
         let bookmark: Data
         do { bookmark = try url.bookmarkData() } catch { url.stopAccessingSecurityScopedResource(); throw error }
         let used = Set(folders.map(\.letter))
-        guard let letter = "defghijklmnopqrstuvwxy".map(String.init).first(where: { !used.contains($0) }) else {
+        guard let letter = "defghijklmnopqrstuvwxy".map(String.init).first(where: {
+            !used.contains($0) && (try? FileManager.default.attributesOfItem(atPath: Self.dosdevices.appendingPathComponent($0 + ":").path)) == nil
+        }) else {
             url.stopAccessingSecurityScopedResource()
             throw LibraryError.message("No free drive letters.")
         }
@@ -183,18 +242,37 @@ final class ExternalDrives: ObservableObject {
         if name.isEmpty { name = "Drive" }
         let base = name; var n = 2
         while folders.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) { name = "\(base) \(n)"; n += 1 }
-        let folder = ExternalFolder(name: name, letter: letter, bookmark: bookmark)
-        folders.append(folder); save()
-        mounted[folder.id] = url
-        link(folder, to: url)
+        var folder = ExternalFolder(name: name, letter: letter, bookmark: bookmark)
+        do {
+            guard !mounted.values.contains(where: { $0.resolvingSymlinksInPath() == url.resolvingSymlinksInPath() }) else {
+                throw LibraryError.message("That folder is already registered.")
+            }
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isUbiquitousItemKey, .volumeIsLocalKey, .volumeIsReadOnlyKey])
+            guard values.isDirectory == true, values.isUbiquitousItem != true, values.volumeIsLocal == true else {
+                throw LibraryError.message("Choose a folder on a local USB or SSD drive.")
+            }
+            if values.volumeIsReadOnly != true { folder.libraryID = try ExternalStorageIdentity.register(root: url) }
+            try Self.validate(folders + [folder])
+            try link(folder, to: url, owned: false)
+            do { try save(folders + [folder]) } catch { unlink(folder); throw error }
+            mounted[folder.id] = url
+        } catch { url.stopAccessingSecurityScopedResource(); throw error }
+        publishOpened()
         refreshSteam()
         LogStore.shared.log("[external] added \(letter.uppercased()): \(name) -> \(url.path)")
     }
 
     /// Forgets a folder. Its files stay on the drive; the library entries that
     /// start programs on it (and its Steam games' entries) are removed.
-    func remove(_ id: UUID) {
+    @MainActor func remove(_ id: UUID) {
         guard let folder = folders.first(where: { $0.id == id }) else { return }
+        guard wine_process_is_running() == 0, GameMover.shared.moving == nil,
+              !SteamOwnedLibrary.shared.hasStorageWork else {
+            LogStore.shared.log("[external] drive kept while a game, download or cloud operation uses storage")
+            return
+        }
+        do { try save(folders.filter { $0.id != id }) }
+        catch { LogStore.shared.log("[external] drive registration could not be removed"); return }
         let prefix = "External/\(folder.name)/"
         let library = LibraryModel.shared
         for entry in library.entries where entry.relativePath.hasPrefix(prefix) {
@@ -202,19 +280,23 @@ final class ExternalDrives: ObservableObject {
         }
         unlink(folder)
         mounted.removeValue(forKey: id)?.stopAccessingSecurityScopedResource()
-        folders.removeAll { $0.id == id }; save()
+        publishOpened()
         refreshSteam()
         Task { @MainActor in SteamGamesModel.shared.refresh() }
         LogStore.shared.log("[external] removed \(folder.name)")
     }
 
-    private func link(_ folder: ExternalFolder, to url: URL) {
+    private func link(_ folder: ExternalFolder, to url: URL, owned: Bool) throws {
         let fm = FileManager.default
-        for (path, target) in [(Self.linkRoot.appendingPathComponent(folder.name).path, url.path),
-                               (Self.dosdevices.appendingPathComponent(folder.letter + ":").path, url.path)] {
-            try? fm.removeItem(atPath: path)
-            try? fm.createSymbolicLink(atPath: path, withDestinationPath: target)
+        for container in [Self.linkRoot, Self.dosdevices] {
+            try fm.createDirectory(at: container, withIntermediateDirectories: true)
+            guard try fm.attributesOfItem(atPath: container.path)[.type] as? FileAttributeType == .typeDirectory else {
+                throw ExternalStorageError.mappingConflict
+            }
         }
+        let links = [Self.linkRoot.appendingPathComponent(folder.name), Self.dosdevices.appendingPathComponent(folder.letter + ":")]
+        for path in links { try ExternalStorageMapping.validate(path, root: url, owned: owned) }
+        for path in links { try ExternalStorageMapping.replace(path, root: url, owned: owned) }
     }
 
     private func unlink(_ folder: ExternalFolder) {
@@ -422,7 +504,7 @@ struct ExternalDrivesSection: View {
     func move(_ entry: LibraryEntry, toSteamLibrary target: String? = nil, toRoot root: String? = nil) async throws -> LibraryEntry {
         guard moving == nil else { throw Failure(errorDescription: "Another game is being moved.") }
         guard wine_process_is_running() == 0 else { throw Failure(errorDescription: "Close the running game first.") }
-        let drive = LibraryModel.drive
+        guard !SteamOwnedLibrary.shared.hasStorageWork else { throw Failure(errorDescription: "Wait for downloads and cloud operations to finish.") }
         var entry = entry
         var items: [(from: URL, to: URL)] = []
         var newPath: String
@@ -432,12 +514,17 @@ struct ExternalDrivesSection: View {
                 throw Failure(errorDescription: "Steam does not list this game as installed.")
             }
             guard game.library.caseInsensitiveCompare(target) != .orderedSame else { return entry }
-            let from = drive.appendingPathComponent(game.library, isDirectory: true), to = drive.appendingPathComponent(target, isDirectory: true)
-            items.append((from.appendingPathComponent("common/" + game.installDir), to.appendingPathComponent("common/" + game.installDir)))
-            items.append((from.appendingPathComponent("appmanifest_\(appID).acf"), to.appendingPathComponent("appmanifest_\(appID).acf")))
+            guard SteamInstallPaths.isManaged(library: target) else { throw ExternalStorageError.invalidRecord }
+            let fromGame = try ExternalDrives.nativeURL(game.library + "/common/" + game.installDir, write: true)
+            let toGame = try ExternalDrives.nativeURL(target + "/common/" + game.installDir, write: true)
+            items.append((fromGame, toGame))
+            let manifest = "/appmanifest_\(appID).acf"
+            items.append((try ExternalDrives.nativeURL(game.library + manifest, write: true),
+                          try ExternalDrives.nativeURL(target + manifest, write: true)))
             let journal = "downloading/\(appID)"
-            if FileManager.default.fileExists(atPath: from.appendingPathComponent(journal).path) {
-                items.append((from.appendingPathComponent(journal), to.appendingPathComponent(journal)))
+            let fromJournal = try ExternalDrives.nativeURL(game.library + "/" + journal, write: true)
+            if FileManager.default.fileExists(atPath: fromJournal.path) {
+                items.append((fromJournal, try ExternalDrives.nativeURL(target + "/" + journal, write: true)))
             }
             newPath = target + "/common/" + game.installDir
         } else {
@@ -448,7 +535,7 @@ struct ExternalDrivesSection: View {
             else { throw Failure(errorDescription: "This game's folder cannot be moved.") }
             let dest = root + "/" + name
             guard dest.caseInsensitiveCompare(folder) != .orderedSame else { return entry }
-            items.append((drive.appendingPathComponent(folder, isDirectory: true), drive.appendingPathComponent(dest, isDirectory: true)))
+            items.append((try ExternalDrives.nativeURL(folder, write: true), try ExternalDrives.nativeURL(dest, write: true)))
             newPath = dest + entry.relativePath.dropFirst(folder.count)
         }
         if let name = ExternalDrives.driveName(library: newPath), !ExternalDrives.isConnected(name) {
@@ -467,7 +554,8 @@ struct ExternalDrivesSection: View {
         }.value
         entry.relativePath = newPath
         LibraryModel.shared.save(entry)
-        if entry.steamAppID != nil {
+        if let appID = entry.steamAppID, let target {
+            SteamOwnedLibrary.shared.installMoved(appID, to: target)
             if newPath.hasPrefix("External/") { ExternalDrives.shared.refreshSteam() }
             SteamGamesModel.shared.refresh()
         }

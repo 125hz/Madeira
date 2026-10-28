@@ -78,7 +78,7 @@ require('SteamEntrySection(entry: $entry)' in detail and 'if entry.steamAppID !=
         'Game details: the Steam section for a Steam game')
 for label in ['"Start with"', '"Madeira Dock"', '"Smaller JIT pool (512 MB) for this launch"', '"One-time installs"',
               '"Run at next start"', '"Skip"', '"Repair installed files"', '"Uninstall"', '"App ID"',
-              '"Free space on this device"', '"Pause update"', '"Resume update"', '"The game"', '"Program"', '"Choose…"']:
+              '"Free space where the game is installed"', '"Pause update"', '"Resume update"', '"The game"', '"Program"', '"Choose…"']:
     require(label in steam_section, f'Steam section: {label}')
 for label in ['"Library details"', '"Choose cover image"', '"Use Steam artwork"', '"Display"', '"Resolution"',
               '"Aspect & scaling"', '"Compatibility & performance"', '"Reduced-precision x87"', '"CPU cores reported"',
@@ -191,6 +191,7 @@ head = dock[dock.index('enum DockPerformancePolicy {'):dock.index('enum MadeiraD
 body = (dock[dock.index('enum MadeiraDock {'):dock.index('    @MainActor private static var lastReport =')] +
         dock[dock.index("    /// The host's environment for one launch."):])
 stubs = r'''
+enum ExternalDrives { static var steamLibraries: [String] { [] } }
 import Foundation
 #if canImport(Glibc)
 import Glibc
@@ -479,7 +480,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-steam-games-') as tmp:
     build = subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-o', str(exe),
                             str(tmp / 'stubs.swift'), str(tmp / 'dock.swift'), str(tmp / 'rules.swift'),
                             str(tmp / 'checks.swift'), str(tmp / 'owned.swift'), str(app / 'SteamKeyValues.swift'),
-                            str(app / 'SteamInstall.swift'), str(app / 'SwiftSteam/Library/SteamAppInfo.swift')],
+                            str(app / 'SteamInstall.swift'), str(app / 'ExternalStorage.swift'), str(app / 'SwiftSteam/Library/SteamAppInfo.swift')],
                            capture_output=True, text=True)
     require(build.returncode == 0, 'production Steam games rules and Dock discovery compile on the host')
     if build.returncode:
