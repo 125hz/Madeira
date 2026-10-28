@@ -1145,6 +1145,10 @@ static void *ios_pool_warmer_thread( void *arg )
             if (cycle == 1 || (cycle % 30) == 0)
                 dprintf(2, "[pool-warmer] cycle=%u touched=%lu pages (head=0x%lx tail=0x%lx)\n",
                         cycle, (unsigned long)touched, (unsigned long)head, (unsigned long)tail);
+            {
+                extern void ios_wow_pressure_tick( unsigned cycle );
+                ios_wow_pressure_tick( cycle );   /* ml2030: idle 32-bit placeholders back under band pressure */
+            }
             /* task #35: report the three pool slots every ~30s on this existing
              * timer — see ios_slot_probe. Cheap (a few mach queries) and it is
              * the only signal that says whether the ceiling is doing its job. */
@@ -15416,6 +15420,113 @@ static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned gua
         }
     }
     return 1;
+}
+
+/* ml2030: free bytes in [lo, hi), the holes between regions.  Stops once it has
+ * seen `enough`, so a window with room costs a few calls, not a full walk. */
+static unsigned long long ios_wow_band_free_bytes( mach_vm_address_t lo, mach_vm_address_t hi,
+                                                   unsigned long long enough )
+{
+    mach_vm_address_t addr = lo;
+    unsigned long long free_total = 0;
+
+    while (addr < hi && free_total < enough)
+    {
+        mach_vm_address_t q = addr;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        if (mach_vm_region( mach_task_self(), &q, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS || q >= hi)
+        {
+            free_total += hi - addr;   /* nothing mapped from here to the end */
+            break;
+        }
+        if (q > addr) free_total += q - addr;
+        addr = q + size;
+    }
+    return free_total;
+}
+
+/* ml2030: under host address pressure, give idle guest-window placeholders back.
+ *
+ * A held placeholder (MADEIRA_WOW_HOLD_WINDOWS) keeps 4 GB of the band for a
+ * 32-bit program the session may start later, and a window whose process has
+ * exited keeps its placeholder until the next 32-bit process boots.  Both are
+ * the right trade while the band has room.  Device logs 2026-10-28 (a 64-bit
+ * game with a 32-bit program in its folder) show the other case: the band's
+ * free space fell from 12 GB to under 200 MB in the first minutes and stayed
+ * there, with the unadopted placeholder (or, in the second log, the window of a
+ * 32-bit helper that ran for a second) as the one large idle range.  Metal's
+ * buffer allocations and then Wine's own maps failed with ENOMEM, a launcher
+ * helper crashed on the failed allocation and the game was closed with it.
+ *
+ * So, from the warmer's ~2 s cycle, every 5th cycle and only while a
+ * placeholder exists: when the band's free space is under the threshold, tear
+ * down exited windows whose threads are gone (the same reclaim a booting 32-bit
+ * process runs) and hand every unadopted placeholder back to the kernel.  A
+ * 32-bit program started after that takes a fresh slot if the band has one.
+ * MADEIRA_WOW_PRESSURE_RELEASE_MB=0 keeps the placeholders. */
+void ios_wow_pressure_tick( unsigned cycle )
+{
+    static long threshold_mb = -1;
+    unsigned long long free_bytes;
+    ULONG_PTR floor, ceil;
+    unsigned released = 0;
+
+    if (threshold_mb < 0)
+    {
+        const char *env = getenv( "MADEIRA_WOW_PRESSURE_RELEASE_MB" );   /* MB: when the 32-bit band has less free address space than this, idle 32-bit window placeholders are handed back (default 256); 0: never */
+        threshold_mb = (env && *env) ? strtol( env, NULL, 10 ) : 256;
+        if (threshold_mb < 0) threshold_mb = 0;
+    }
+    if (!threshold_mb || !ios_wow_placeholder_count || (cycle % 5)) return;
+
+    ios_wow_band( &floor, &ceil );
+    if (ceil <= floor) return;
+    free_bytes = ios_wow_band_free_bytes( floor, ceil, (unsigned long long)threshold_mb << 20 );
+    if (free_bytes >= ((unsigned long long)threshold_mb << 20)) return;
+
+    ios_wow_reclaim_dead_windows();
+
+    for (;;)
+    {
+        ULONG_PTR base = 0;
+        sigset_t sigset;
+        unsigned i;
+
+        pthread_mutex_lock( &ios_wow_mutex );
+        for (i = 0; i < ios_wow_placeholder_count; i++)
+        {
+            if (ios_wow_placeholders[i].adopted || ios_wow_slot_at_base( ios_wow_placeholders[i].base ))
+                continue;
+            base = ios_wow_placeholders[i].base;
+            ios_wow_placeholders[i] = ios_wow_placeholders[--ios_wow_placeholder_count];
+            memset( &ios_wow_placeholders[ios_wow_placeholder_count], 0, sizeof(ios_wow_placeholders[0]) );
+            break;
+        }
+        pthread_mutex_unlock( &ios_wow_mutex );
+        if (!base) break;
+
+        /* No lock is nested: a 32-bit process booting meanwhile finds no
+         * placeholder here and a range that is still mapped, so it moves on. */
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        remove_reserved_area( (void *)base, IOS_WOW_WINDOW_SIZE );
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        released++;
+        dprintf( 2, "[wow-window] ml2030 band free %llu MB (under %ld MB): idle placeholder B=%p..%p "
+                    "handed back to the kernel (MADEIRA_WOW_PRESSURE_RELEASE_MB=0 keeps it)\n",
+                 free_bytes >> 20, threshold_mb, (void *)base, (void *)(base + IOS_WOW_WINDOW_SIZE) );
+    }
+    if (!released)
+    {
+        static unsigned said;
+        if (said++ < 4)
+            dprintf( 2, "[wow-window] ml2030 band free %llu MB (under %ld MB) but every placeholder "
+                        "is in use\n", free_bytes >> 20, threshold_mb );
+    }
 }
 #endif  /* WINE_IOS */
 
