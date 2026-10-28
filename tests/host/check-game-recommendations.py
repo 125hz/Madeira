@@ -248,11 +248,17 @@ for ident in ('gta5e-steam', 'gta5e-other', 'rdr2-steam', 'rdr2-other', 'horizon
 # Version 3 of the Steam list (build 514): the VC++ setup's elevated engine is not started, as for RDR2.
 # Version 4 / 3 (2026-10-26): new pipelines are built off the render thread (pso-async).
 # Version 5 / 4: compiled pipelines kept in archives of our own (pso-archive).
-assert presets['gta5e-steam']['version'] == 5 and presets['gta5e-other']['version'] == 4, \
+# Version 6 / 5 (log 97, an 8 GB phone killed at its limit with Metal at 2.1 GB): shared argument-ring
+# chunks, and under 12 GB of RAM the video budget's trim starts 3584 MB below the limit.
+assert presets['gta5e-steam']['version'] == 6 and presets['gta5e-other']['version'] == 5, \
     (presets['gta5e-steam']['version'], presets['gta5e-other']['version'])
 for ident in ('gta5e-steam', 'gta5e-other'):
     assert 'pso-async = 1' in presets[ident]['lines'], ident
     assert 'pso-archive = 1' in presets[ident]['lines'], ident
+    assert 'ring-share = 1' in presets[ident]['lines'], ident
+    assert 'smallRAMConfig: gta5EnhancedSmallRAMLines' in presets[ident]['switches'], ident
+    assert not any(l.startswith('vram-trim-mb') for l in presets[ident]['lines']), ident   # small devices only
+assert 'static let gta5EnhancedSmallRAMLines = "vram-trim-mb = 3584"' in lists_src
 for ident in ('rdr2-steam', 'rdr2-other', 'gta5e-steam'):
     assert 'env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist' in presets[ident]['lines'], ident
 assert 'resolution: "1280x720"' in presets['ghost-of-tsushima']['switches'] and 'avx: true' in presets['ghost-of-tsushima']['switches']

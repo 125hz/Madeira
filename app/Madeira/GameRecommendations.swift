@@ -299,9 +299,15 @@ enum GameRecommendations {
     /// for 12 s in two minutes of driving and the game fell to 3-15 FPS. Version 5
     /// (2026-10-26 late): compiled pipelines kept in archives of our own (pso-archive):
     /// Metal's cache had 6,904 of 6,986 in one session and 19 of the first 500 in the
-    /// next, which froze for seconds at a time while they compiled again.
+    /// next, which froze for seconds at a time while they compiled again. Version 6
+    /// (2026-10-28, log 97, an 8 GB phone): Metal grew from 540 MB to 2.1 GB in ten
+    /// minutes and took the footprint to the 6 GB limit while the rest stayed flat.
+    /// 356 MB of it was argument-ring chunks lists kept, so lists share them
+    /// (ring-share, as RDR2's list since its version 6); and the video budget never
+    /// fell below what the game used (2.6 GB at the end), so on a device with less
+    /// than 12 GB of RAM its trim starts earlier (`gta5EnhancedSmallRAMLines`).
     static let gta5EnhancedSteam = GameRecommendation(
-        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 5,
+        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 6,
         config: """
         # Madeira's recommended settings for GTA V Enhanced (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -319,6 +325,7 @@ enum GameRecommendations {
         pso-warm = 2
         pso-async = 1
         pso-archive = 1
+        ring-share = 1
         env.FEX_VECTORTSOENABLED = 0
         env.MADEIRA_CHILD_ARGS = PlayGTAV.exe -nobattleye
         env.MADEIRA_DOCK_GAME_SCM = 1
@@ -347,7 +354,14 @@ enum GameRecommendations {
         env.MADEIRA_JIT_DUMP = 0
         """,
         avx: false, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: true, fpsMode: 4,
-        display: "fit")
+        display: "fit", smallRAMConfig: gta5EnhancedSmallRAMLines)
+
+    /// GTA V Enhanced on a device with less than 12 GB of RAM (log 97: limit 6136 MB,
+    /// the rest of the footprint ~4 GB). The video budget shrinks 1:1 with the
+    /// footprint above (limit - vram-trim-mb); from 3584 below it, a footprint of
+    /// ~5.3 GB leaves a budget of ~1.3 GB, under the 2.1 GB Metal held when it was
+    /// killed, and below where the churn filter yields (768 MB left).
+    static let gta5EnhancedSmallRAMLines = "vram-trim-mb = 3584"
 
     /// GTA V Legacy from Steam (App ID 271590, DirectX 11 through DXMT): the
     /// Enhanced list without its D3D12 lines and its DualSense mode (Legacy takes
@@ -511,8 +525,10 @@ enum GameRecommendations {
     /// the same orphan-lock reaper mode as the Steam copy (its launcher and
     /// Social Club too). Version 3: pipelines built off the render thread, as
     /// for the Steam copy. Version 4: the pipeline archive, as for the Steam copy.
+    /// Version 5: shared argument-ring chunks and, under 12 GB of RAM, the earlier
+    /// video-budget trim, as for the Steam copy.
     static let gta5EnhancedOther = GameRecommendation(
-        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 4,
+        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 5,
         config: """
         # Madeira's recommended settings for GTA V Enhanced outside Steam (Rockstar Games Launcher or another store).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -526,6 +542,7 @@ enum GameRecommendations {
         pool-split = 1
         pso-async = 1
         pso-archive = 1
+        ring-share = 1
         env.MADEIRA_KMT_ADAPTER = 1
         env.MADEIRA_LOCK_ORPHAN = stamped
         env.MADEIRA_PAD_MODE = hid
@@ -541,7 +558,8 @@ enum GameRecommendations {
         env.MADEIRA_WAIT_CHILDREN = 1
         env.MADEIRA_JIT_DUMP = 0
         """,
-        avx: false, nvidia: true, wineVCRT: false, fastSync: true, resolution: "1280x720", display: "fit")
+        avx: false, nvidia: true, wineVCRT: false, fastSync: true, resolution: "1280x720", display: "fit",
+        smallRAMConfig: gta5EnhancedSmallRAMLines)
 
     /// Ghost of Tsushima (build 336: DualSense input, rumble, triggers and light work).
     /// Build 492 adds Horizon Zero Dawn's proven fix for typed buffer views that
