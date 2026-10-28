@@ -770,11 +770,20 @@ OVERLAY = {
     # the video budget's trim counts the swap tier's donor pool (winemetal, log 96).
     "vram-count-donor": {"category": "Direct3D 9/10/11 (DXMT)",
                 "title": "Video memory budget counts donated RAM",
+                "kind": "bool", "default": "0",
+                "note": "The video memory budget a game reads shrinks as memory runs short (vram-trim-mb), judged "
+                        "by the app's own memory. 1: the donor pool's memory counts as well, since it is the device's "
+                        "RAM even though it is not under the app's limit, so with a full pool on a phone with less "
+                        "RAM the game is told to keep fewer textures. Off by default (a test option). Read at "
+                        "session start."},
+    # a 64-bit title beside 32-bit helpers keeps the churn filter (virtual_ios.c, log 96).
+    "env.MADEIRA_SWAP_TITLE_CHURN": {"category": "Memory & JIT pool",
+                "title": "Short-lived memory of the game stays in RAM",
                 "kind": "bool", "default": "1",
-                "note": "The video memory budget a game reads shrinks as memory runs short (vram-trim-mb). On by "
-                        "default: the donor pool's memory counts as well, since it is the device's RAM even though "
-                        "it is not under the app's limit, so with a full pool on a phone with less RAM the game is "
-                        "told to keep fewer textures. 0: the trim judges the app's own memory alone, as before. "
+                "note": "On by default: a 64-bit game started beside 32-bit helpers keeps memory it frees and "
+                        "allocates again soon in RAM instead of the swap file, until less than "
+                        "MADEIRA_SWAP_CHURN_TIGHT_MB is left before the memory limit. 0: that memory goes to the "
+                        "donor pool or the swap file like the rest (slower once the device is out of free RAM). "
                         "Read at session start."},
     # madeira-bcd: the wineserver names an opened file with F_GETPATH (build/wineserver/fd_ios.c).
     "env.MADEIRA_SRV_FGETPATH": {"category": "Wine core (ntdll)", "title": "Name opened files with one call (server)",

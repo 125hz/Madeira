@@ -22740,17 +22740,27 @@ static int ios_swap_wow_in_session( void );
  * helpers (MADEIRA_SWAP_X64_TITLE, below) skips it too, its churny sizes then
  * taking donor RAM first: log 95 (vk-1027-m5, which kept the filter for such a
  * title) left 125 blocks of three churny sizes (mostly 0xfd0000) anonymous, about
- * 1.6 GB, and the footprint went from log 94's 5.4 GB to the 6 GB limit. */
+ * 1.6 GB, and the footprint went from log 94's 5.4 GB to the 6 GB limit.
+ * Log 96 (vk-1027-m6, the skip): the pool was full by then, so those sizes went to
+ * the file; with the device out of free RAM their pages went out to flash and back,
+ * and the game fell below 1 FPS for seconds at a time from a 4.8 GB footprint
+ * (log 95 ran 26-53 FPS with the same full pool). Churny memory is hot memory, so
+ * such a title keeps the filter again, and ios_swap_footprint_tight lets it go near
+ * the limit instead. MADEIRA_SWAP_TITLE_CHURN=0 makes the title skip it (log 96). */
 static int ios_swap_x64_title;
+static int ios_swap_x64_policy( void );
 static int ios_swap_x64_idle( uintptr_t b, size_t size )
 {
-    static int keep = -1;
+    static int keep = -1, title_keep = -1;
     if (keep < 0)
     {
         const char *e = getenv( "MADEIRA_SWAP_X64_CHURN" );   /* 1: the churn filter also covers 64-bit ranges beside a 32-bit program */
+        const char *t = getenv( "MADEIRA_SWAP_TITLE_CHURN" );   /* 0: a 64-bit title beside 32-bit helpers skips the churn filter too (log 96) */
         keep = e && e[0] == '1';
+        title_keep = !(t && t[0] == '0');
     }
-    if (keep || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;
+    ios_swap_x64_policy();   /* sets ios_swap_x64_title */
+    if (keep || (title_keep && ios_swap_x64_title) || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;
     return ios_wow_window_covering( (const void *)b, (const void *)(b + size) ) == 0;
 }
 static int ios_swap_wow64_policy( void );

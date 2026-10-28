@@ -106,9 +106,11 @@ check("ios_swap_x64_title = policy == 0 && title && title[0] == '1';" in policy
       and 'getenv( "MADEIRA_SWAP_X64_TITLE" )' in policy,
       'MADEIRA_SWAP_X64_TITLE=1 (a 64-bit title beside 32-bit helpers): donor RAM first under swap-x64 unset only')
 idle = src[src.index('static int ios_swap_x64_idle( uintptr_t b, size_t size )'):src.index('static int ios_swap_wow64_policy( void );')]
-check('if (keep || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;' in idle
-      and 'ios_swap_x64_title' not in idle.split('{', 1)[1],
-      'such a title skips the churn filter beside 32-bit programs too (log 95: kept, 1.6 GB stayed in the footprint)')
+check('if (keep || (title_keep && ios_swap_x64_title) || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;' in idle
+      and 'ios_swap_x64_policy();   /* sets ios_swap_x64_title */' in idle
+      and "title_keep = !(t && t[0] == '0');" in idle and 'getenv( "MADEIRA_SWAP_TITLE_CHURN" )' in idle,
+      'such a title keeps the churn filter (log 96: skipped, its hot churny memory went to the file); '
+      'MADEIRA_SWAP_TITLE_CHURN=0 skips it')
 tight = src[src.index('static int ios_swap_footprint_tight( void )'):src.index('static int ios_swap_churn_exempt( uintptr_t b, size_t size )')]
 check('getenv( "MADEIRA_SWAP_CHURN_TIGHT_MB" )' in tight and ': 768;' in tight
       and 'tight = left && left < ((unsigned long long)margin << 20);' in tight and 'now - checked >= 250000000ull' in tight,
@@ -140,7 +142,7 @@ if wm_path.exists():
     wm = wm_path.read_text(encoding='utf-8', errors='replace')
     check('unsigned long long *donor_pool_mb, unsigned long long *donor_guarded) __attribute__((weak));' in wm,
           'winemetal reads the donated MB through the stats function (a weak reference)')
-    check('on = madeira_cfg_int("vram-count-donor", 1) != 0;' in wm, 'madeira.cfg vram-count-donor = 0 leaves the donor out')
+    check('on = madeira_cfg_int("vram-count-donor", 0) != 0;' in wm, 'madeira.cfg vram-count-donor = 1 counts the donor (off by default)')
     dyn = wm[wm.index('static uint64_t madeira_ml1075_dynamic_budget(uint64_t base) {'):wm.index('static uint64_t madeira_ml1042_video_budget(uint64_t metal_recommended) {')]
     check('if (cap && foot + donor > room && foot + donor - room > over) over = foot + donor - room;' in dyn
           and 'if (over) budget = base > over ? base - over : 0;' in dyn,
@@ -154,6 +156,7 @@ if catalog.exists():
     check('key: "env.MADEIRA_DONOR_WINDOWS"' in text, 'the config catalog documents env.MADEIRA_DONOR_WINDOWS')
     check('key: "swap-wow64"' in text, 'the config catalog documents swap-wow64')
     check('key: "vram-count-donor"' in text, 'the config catalog documents vram-count-donor')
+    check('key: "env.MADEIRA_SWAP_TITLE_CHURN"' in text, 'the config catalog documents env.MADEIRA_SWAP_TITLE_CHURN')
 
 print(f'check-donor-pool: {"OK" if not failures else f"{failures} FAILED"}')
 sys.exit(1 if failures else 0)
