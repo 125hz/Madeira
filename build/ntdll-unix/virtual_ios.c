@@ -4452,6 +4452,8 @@ void ios_push_subfloor_window( unsigned long long low_base, unsigned long long r
 {
     static int disabled = -1;
 
+    /* ml2240: a window above 4GB (between it and the task's floor) is marked with bit 63, which
+     * no PE base carries, so FEX files it as a window, not as a JIT alias (IosJitAlias.cpp). */
     if (disabled < 0) disabled = (getenv( "MADEIRA_NO_SUBFLOOR_XQUERY" ) != NULL);
     if (disabled)
     {
@@ -4469,7 +4471,7 @@ void ios_push_subfloor_window( unsigned long long low_base, unsigned long long r
         if (!own_cb) return;   /* pushed later by the owner's catch-up loop */
         fprintf( stderr, "ml951: pushing sub-floor window guest %#llx+%#llx -> real %#llx to FEX (owner %p, own callback)\n",
                  low_base, size, real_base, owner );
-        own_cb( low_base, real_base, size );
+        own_cb( low_base >= 0x100000000ull ? low_base | (1ull << 63) : low_base, real_base, size );
         return;
     }
     void (*cb)(unsigned long long, unsigned long long, unsigned long long) =
@@ -4483,7 +4485,7 @@ void ios_push_subfloor_window( unsigned long long low_base, unsigned long long r
     if (owner && owner != ios_jit_alias_pushback_peb) return;
     fprintf( stderr, "ml951: pushing sub-floor window guest %#llx+%#llx -> real %#llx to FEX (owner %p)\n",
              low_base, size, real_base, owner );
-    cb( low_base, real_base, size );
+    cb( low_base >= 0x100000000ull ? low_base | (1ull << 63) : low_base, real_base, size );
 }
 
 /* unix_ios_push_jit_aliases handler. Called from PE-side ntdll's
@@ -25511,6 +25513,8 @@ static int ios_shared_section_private(void)
  * headers are read fault-safe (mach_vm_read_overwrite): it may have made its
  * header page PAGE_NOACCESS. virtual_mutex must be held.
  */
+extern int ios_subfloor_high_ok( unsigned long long base, unsigned long long size );   /* ml2240, signal_arm64_ios.c */
+
 static BOOL ios_subfloor_window_held( ULONG_PTR low, ULONG_PTR real )
 {
     extern int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *real,
@@ -26102,7 +26106,10 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
      * base, and the image's own low absolutes are serviced by the ml938
      * sub-floor window registered just below. Only 64-bit images outside a WoW
      * guest window: a 32-bit image in a window is at its own guest address. */
-    else if (!image_info->map_addr && image_info->base && image_info->base < 0x100000000ull &&
+    /* ml2240: or a base between 4GB and the task's floor, outside the map too
+     * (ios_subfloor_high_ok, MADEIRA_SUBFLOOR_HIGH=0 restores the 4GB limit). */
+    else if (!image_info->map_addr && image_info->base &&
+             (image_info->base < 0x100000000ull || ios_subfloor_high_ok( image_info->base, total_size )) &&
              (ULONG_PTR)ptr != image_info->base &&
              (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) &&
              nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC && !ios_wow_in_window( ptr ))
@@ -26126,7 +26133,23 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     /* A PE32 image inside a WoW64 guest window lives at B + its guest base; the
      * session-wide sub-floor table would redirect one 32-bit process's accesses
      * into another's copy.  Outside a window this is the upstream rule. */
-    if (image_info->base && image_info->base < 0x100000000ull
+    /* ml2240: a 64-bit RELOCS_STRIPPED image based between 4GB and the task's floor
+     * gets its window too (it runs at its preferred-base addresses, header rewritten
+     * by ml1195 above); the low-allocation and narrowed-alias notes stay sub-4GB. */
+    if (image_info->base && image_info->base >= 0x100000000ull && (ULONG_PTR)ptr != image_info->base &&
+        nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+        (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) &&
+        ios_subfloor_high_ok( image_info->base, total_size ))
+    {
+        extern void ios_register_subfloor_image( unsigned long long pref_base,
+                                                 unsigned long long size,
+                                                 unsigned long long real_base, void *owner );
+        fprintf( stderr, "[subfloor] ml2240 image based at %#llx (outside the task's map, above 4GB) runs at %p "
+                 "through a window\n", (unsigned long long)image_info->base, ptr );
+        ios_register_subfloor_image( (unsigned long long)image_info->base, (unsigned long long)total_size,
+                                     (unsigned long long)(uintptr_t)ptr, ios_jit_current_peb() );
+    }
+    else if (image_info->base && image_info->base < 0x100000000ull
         && (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC || !ios_wow_in_window( ptr )))
     {
         extern void ios_register_subfloor_image( unsigned long long pref_base,

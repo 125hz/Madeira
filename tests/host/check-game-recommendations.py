@@ -129,10 +129,17 @@ assert bp['version'] == 5 and 'env.MADEIRA_STEAM_ALLOW_CRASHPAD = 1' in bp['line
 # libraries beside its own entries, before each start (env.MADEIRA_BIG_PICTURE_LIBRARIES = 0 leaves them alone).
 assert 'listMadeiraLibraries(in: folder)' in library \
     and 'MadeiraConfig.flag("MADEIRA_BIG_PICTURE_LIBRARIES", fallback: true)' in library \
-    and 'let libraries = [own, SteamRuntimeFiles.relativeRoot]' in library \
+    and 'var libraries = [own]' in library \
     and 'for sub in ["config", "steamapps"]' in library \
     and 'try ExternalSteamLibraries.add(paths: libraries, to: existing)' in library, \
     'Big Picture lists the games Madeira installed'
+# ml2240: every library Madeira's Steam list reads, including the other C: libraries the Dock client's
+# libraryfolders.vdf names (env.MADEIRA_BIG_PICTURE_DOCK_LIBRARIES = 0: its own folder and the drives only).
+dock = (app / 'MadeiraDock.swift').read_text()
+assert 'MadeiraConfig.flag("MADEIRA_BIG_PICTURE_DOCK_LIBRARIES", fallback: true)' in library \
+    and '? MadeiraDock.steamLibraries(drive: MadeiraDock.drive)' in library \
+    and 'static func steamLibraries(drive: URL) -> [String] {' in dock \
+    and 'let libraries = steamLibraries(drive: drive)' in dock, 'Big Picture reads the Dock\'s library list'
 assert 'MadeiraConfig.flag("MADEIRA_BIG_PICTURE_PIN", fallback: true)' in library \
     and 'fm.fileExists(atPath: "\\(folder.unix)/bin/cef/cef.win7/steamwebhelper.exe")' in library \
     and '(pinned ? " -nobootstrapperupdate -skipinitialbootstrap" : "")' in library

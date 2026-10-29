@@ -606,8 +606,21 @@ struct LibraryEntry: Codable, Identifiable {
         guard MadeiraConfig.flag("MADEIRA_BIG_PICTURE_LIBRARIES", fallback: true) else { return }   // 0: Big Picture's client lists only its own library
         let fm = FileManager.default
         let own = "Program Files/Steam Big Picture"
-        let libraries = [own, SteamRuntimeFiles.relativeRoot]
-            + ExternalDrives.steamLibraries.map { String($0.dropLast("/steamapps".count)) }
+        // ml2240: every library Madeira's Steam list reads (MadeiraDock.steamLibraries), not
+        // only the client's own folder and the external drives: the other C: libraries its
+        // libraryfolders.vdf names were left out. MADEIRA_BIG_PICTURE_DOCK_LIBRARIES=0 restores.
+        let found = MadeiraConfig.flag("MADEIRA_BIG_PICTURE_DOCK_LIBRARIES", fallback: true)
+            ? MadeiraDock.steamLibraries(drive: MadeiraDock.drive)
+            : [SteamRuntimeFiles.relativeRoot + "/steamapps"] + ExternalDrives.steamLibraries
+        var libraries = [own]
+        for library in found.prefix(32) where library.hasSuffix("/steamapps") {
+            let root = String(library.dropLast("/steamapps".count))
+            guard !libraries.contains(where: { $0.caseInsensitiveCompare(root) == .orderedSame }) else { continue }
+            libraries.append(root)
+            let manifests = ((try? fm.contentsOfDirectory(atPath: MadeiraDock.drive.appendingPathComponent(library).path)) ?? [])
+                .filter { $0.hasPrefix("appmanifest_") && $0.hasSuffix(".acf") }
+            LogStore.shared.log("[big-picture] ml2240 library C:\\\(root.replacingOccurrences(of: "/", with: "\\")): \(manifests.count) install record(s)")
+        }
         var added = 0
         for sub in ["config", "steamapps"] {
             let vdf = URL(fileURLWithPath: "\(folder.unix)/\(sub)/libraryfolders.vdf")

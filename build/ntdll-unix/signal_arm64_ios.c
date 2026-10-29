@@ -13603,6 +13603,41 @@ static unsigned long long ios_subfloor_hits;
 static unsigned long long ios_subfloor_unknown;
 static unsigned long long ios_subfloor_refused;   /* ml956: backing inaccessible */
 
+/* ml2240: the floor is not 4GB but a slide above it (0x102454000, 0x104638000
+ * measured), so [4GB, floor) is outside the map as well. An image based there (an
+ * old x64 linker's default 0x100000000: log 115, a DirectX redistributable's x64
+ * helper, 64 KB, relocations stripped) was mapped high and ntdll refused it with
+ * c0000018. Such a window is allowed when a fixed allocation at its first and at its
+ * last page both answer KERN_INVALID_ADDRESS: the whole range is then outside the
+ * map and no other handler can own a fault in it, the same argument as below 4GB.
+ * ios_subfloor_ceiling is the end of the highest window, the translate fast path's
+ * bound. MADEIRA_SUBFLOOR_HIGH=0 restores the 4GB limit. */
+#define IOS_SUBFLOOR_HIGH_MAX 0x200000000ull
+static uint64_t ios_subfloor_ceiling = IOS_SUBFLOOR_FLOOR;
+
+static int ios_subfloor_high_probe( mach_vm_address_t addr, mach_vm_size_t size )
+{
+    mach_vm_address_t a = addr;
+    kern_return_t kr = mach_vm_allocate( mach_task_self(), &a, size, VM_FLAGS_FIXED );
+
+    if (kr == KERN_SUCCESS) mach_vm_deallocate( mach_task_self(), a, size );
+    return kr == KERN_INVALID_ADDRESS;
+}
+
+int ios_subfloor_high_ok( unsigned long long base, unsigned long long size );
+int ios_subfloor_high_ok( unsigned long long base, unsigned long long size )
+{
+    static int enabled = -1;
+    const unsigned long long page = 0x4000;
+    unsigned long long end = base + ((size + page - 1) & ~(page - 1));
+
+    if (enabled < 0) { const char *e = getenv( "MADEIRA_SUBFLOOR_HIGH" ); enabled = !(e && e[0] == '0'); }
+    if (!enabled || base < IOS_SUBFLOOR_FLOOR || !size || (base & (page - 1)) || end <= base ||
+        end > IOS_SUBFLOOR_HIGH_MAX)
+        return 0;
+    return ios_subfloor_high_probe( base, page ) && ios_subfloor_high_probe( end - page, page );
+}
+
 void ios_register_subfloor_image( unsigned long long pref_base, unsigned long long size,
                                   unsigned long long real_base, void *owner );
 void ios_register_subfloor_image( unsigned long long pref_base, unsigned long long size,
@@ -13612,8 +13647,11 @@ void ios_register_subfloor_image( unsigned long long pref_base, unsigned long lo
                                           unsigned long long, void * );
     int i, slot = -1;
 
-    if (!pref_base || !size || pref_base >= IOS_SUBFLOOR_FLOOR) return;
+    if (!pref_base || !size) return;
+    if (pref_base >= IOS_SUBFLOOR_FLOOR && !ios_subfloor_high_ok( pref_base, size )) return;   /* ml2240 */
     pthread_mutex_lock( &ios_subfloor_lock );
+    if (pref_base + size > ios_subfloor_ceiling)   /* ml2240: raised before the window is published */
+        __atomic_store_n( &ios_subfloor_ceiling, pref_base + size, __ATOMIC_RELEASE );
     for (i = 0; i < ios_subfloor_count; i++)
     {
         if (!ios_subfloor[i].size)
@@ -13718,7 +13756,7 @@ static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb )
     int i, n = ios_subfloor_count;
     uintptr_t any = 0;
 
-    if (addr >= IOS_SUBFLOOR_FLOOR) return 0;   /* fast reject: the common case */
+    if (addr >= __atomic_load_n( &ios_subfloor_ceiling, __ATOMIC_ACQUIRE )) return 0;   /* fast reject: the common case */
     for (i = 0; i < n; i++)
     {
         uint64_t sz = ios_subfloor[i].size, lo, re;

@@ -109,22 +109,8 @@ enum MadeiraDock {
     /// libraries on C: that its `libraryfolders.vdf` lists. Read-only.
     static func games(drive: URL) -> [DockGame] {
         let fm = FileManager.default
-        let clientLibrary = SteamRuntimeFiles.relativeRoot + "/steamapps"
-        var libraries = [clientLibrary]
-        if let data = try? Data(contentsOf: drive.appendingPathComponent(clientLibrary + "/libraryfolders.vdf")),
-           data.count <= 1 << 20, var parser = try? SteamKeyValues(data), let root = try? parser.read() {
-            for (_, entry) in (root["libraryfolders"]?.fields ?? [:]).sorted(by: { $0.key < $1.key }) {
-                guard let path = entry["path"]?.string?.replacingOccurrences(of: "\\\\", with: "\\"),
-                      let relative = libraryRelative(path) else { continue }
-                if !libraries.contains(where: { $0.caseInsensitiveCompare(relative) == .orderedSame }) { libraries.append(relative) }
-            }
-        }
-        // Libraries on external drives (ExternalDrives.swift). They are reached
-        // through drive_c/External/<name> links, so they resolve outside drive_c.
+        let libraries = steamLibraries(drive: drive)
         let external = ExternalDrives.steamLibraries
-        for library in external where !libraries.contains(where: { $0.caseInsensitiveCompare(library) == .orderedSame }) {
-            libraries.append(library)
-        }
         var result: [DockGame] = []
         // Apps that only lend depots to another install ("Shared Only", e.g. GTA V
         // Enhanced's RGL/SC 1899670) have a record but nothing to start. A game that
@@ -148,6 +134,28 @@ enum MadeiraDock {
         }
         result.removeAll { game in lent[game.id].map { installed[game.id, default: []].isSubset(of: $0) } ?? false }
         return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// The client's own library, the libraries on C: its `libraryfolders.vdf` lists and
+    /// the ones on external drives, as drive_c-relative steamapps folders. Read-only.
+    static func steamLibraries(drive: URL) -> [String] {
+        let clientLibrary = SteamRuntimeFiles.relativeRoot + "/steamapps"
+        var libraries = [clientLibrary]
+        if let data = try? Data(contentsOf: drive.appendingPathComponent(clientLibrary + "/libraryfolders.vdf")),
+           data.count <= 1 << 20, var parser = try? SteamKeyValues(data), let root = try? parser.read() {
+            for (_, entry) in (root["libraryfolders"]?.fields ?? [:]).sorted(by: { $0.key < $1.key }) {
+                guard let path = entry["path"]?.string?.replacingOccurrences(of: "\\\\", with: "\\"),
+                      let relative = libraryRelative(path) else { continue }
+                if !libraries.contains(where: { $0.caseInsensitiveCompare(relative) == .orderedSame }) { libraries.append(relative) }
+            }
+        }
+        // Libraries on external drives (ExternalDrives.swift). They are reached
+        // through drive_c/External/<name> links, so they resolve outside drive_c.
+        let external = ExternalDrives.steamLibraries
+        for library in external where !libraries.contains(where: { $0.caseInsensitiveCompare(library) == .orderedSame }) {
+            libraries.append(library)
+        }
+        return libraries
     }
 
     /// "C:\\Games\\SteamLibrary" -> "Games/SteamLibrary/steamapps" (C: only).
