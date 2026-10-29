@@ -553,9 +553,14 @@ enum GameRecommendations {
     /// file, the pool and image lines, pipeline warm-up, BattlEye off for PlayGTAV.exe,
     /// the error handler and vc_redist blocked, a 30 FPS limit and the semaphore fast
     /// path switch. MADEIRA_FASTSYNC_SEM is gone (with it the Steam copy's loading
-    /// stalled at its first screen, logs 104-106).
+    /// stalled at its first screen, logs 104-106). Version 10 (ml2280, testers' log of
+    /// 2026-10-28): it starts in the Wine desktop. The Epic copy's first start runs the
+    /// Rockstar Games Launcher installer, whose service needs services.exe; started directly,
+    /// the session is the game's (ARM64EC), where that aarch64 program cannot run. In the
+    /// desktop sechost starts it on demand, as for the launcher's own list (no services
+    /// batch: it would write the Epic sign-in arguments to disk).
     static let gta5EnhancedOther = GameRecommendation(
-        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 9,
+        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 10,
         config: """
         # Madeira's recommended settings for GTA V Enhanced outside Steam (Rockstar Games Launcher or another store).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -602,7 +607,7 @@ enum GameRecommendations {
         env.MADEIRA_JIT_DUMP = 0
         """,
         avx: false, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: true, fpsMode: 3,
-        resolution: "1280x720", display: "fit", smallRAMConfig: gta5EnhancedSmallRAMLines)
+        resolution: "1280x720", display: "fit", launchMode: "desktop", smallRAMConfig: gta5EnhancedSmallRAMLines)
 
     /// Ghost of Tsushima (build 336: DualSense input, rumble, triggers and light work).
     /// Build 492 adds Horizon Zero Dawn's proven fix for typed buffer views that

@@ -1257,6 +1257,20 @@ static int ec_conhost_refuse( int arm64ec_session, const char *env, const WCHAR 
     return arm64ec_session && !(env && env[0] == '1') && ios_image_name_is( image, image_len, "conhost.exe" );
 }
 
+/* ml2280 (testers' log, 2026-10-28): every aarch64 program in an ARM64EC session, for
+ * the reason conhost is refused above. A launcher installer's service helper made
+ * sechost start services.exe (aarch64) on demand; it faulted at 0x38 at its first
+ * executable allocation, its exception path faulted 2000 times until the storm
+ * handler ended it, twice, and the installer waited 20 s for its pipe each time.
+ * Refused, CreateProcess fails at once. A program that needs one (a launcher that
+ * registers a service) starts in the Wine desktop, an aarch64 session, where its
+ * aarch64 children run on the session's ntdll. MADEIRA_EC_NATIVE_CHILD=1 starts
+ * them anyway (and MADEIRA_EC_CONHOST=1 still lets conhost.exe through). */
+static int ec_native_child_refuse( int arm64ec_session, const char *env, USHORT machine )
+{
+    return arm64ec_session && machine == IMAGE_FILE_MACHINE_ARM64 && !(env && env[0] == '1');
+}
+
 /* madeira-bcd: the JIT pool's variables in every child's environment. The app
  * exports WINE_IOS_JIT_RX/SIZE/RW (ContentView.swift) before Wine starts; the
  * first process imports the Unix environment and children inherit it. The
@@ -2632,6 +2646,25 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         if (ios_is_arm64ec_cur() && pe_info.is_hybrid && machine == IMAGE_FILE_MACHINE_ARM64)
             machine = ios_cur_image_info()->Machine;
     }
+#ifdef WINE_IOS
+    /* an aarch64 program is refused in an ARM64EC session (see ec_native_child_refuse) */
+    {
+        const char *ec_conhost = getenv( "MADEIRA_EC_CONHOST" );
+        int conhost_on = ec_conhost && ec_conhost[0] == '1' &&
+                         ios_image_name_is( params->ImagePathName.Buffer,
+                                            params->ImagePathName.Length / sizeof(WCHAR), "conhost.exe" );
+
+        if (!conhost_on && ec_native_child_refuse( is_arm64ec(), getenv( "MADEIRA_EC_NATIVE_CHILD" ), machine ))
+        {
+            dprintf(2, "[proc-gate] ml2280 REFUSING spawn of %s (an aarch64 program in an ARM64EC session: "
+                    "the session's ntdll loads the emulator into it and its threads have no CPU area, so it "
+                    "would crash; start this game in the Wine desktop; env.MADEIRA_EC_NATIVE_CHILD=1 starts it)\n",
+                    debugstr_us( &params->ImagePathName ));
+            status = STATUS_ACCESS_DENIED;
+            goto done;
+        }
+    }
+#endif
 #ifdef WINE_IOS
     /* a 32-bit child is about to need a guest window (see ios_wow_session_arm) */
     if (machine == IMAGE_FILE_MACHINE_I386 && !(pe_info.image_flags & IMAGE_FLAGS_ComPlusNativeReady))

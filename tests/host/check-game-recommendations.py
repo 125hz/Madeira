@@ -297,8 +297,10 @@ def settings(lines):
 assert settings(gta_other['lines']) == (settings(gta['lines']) - dock_lines) | {'env.SteamDeck = 1', 'env.MADEIRA_EC_HOOK_TRACE = 0'}, \
     sorted(settings(gta_other['lines']) ^ settings(gta['lines']))
 assert 'env.MADEIRA_FASTSYNC_SEM = 1' not in gta_other['lines']
-assert gta_other['switches'] == gta['switches'].replace('display: "fit"', 'resolution: "1280x720", display: "fit"'), \
-    gta_other['switches']
+# Version 10 (ml2280): it starts in the Wine desktop, an aarch64 session, so the launcher installer's
+# services.exe can run (in the game's own ARM64EC session that aarch64 program is refused).
+assert gta_other['switches'] == gta['switches'].replace(
+    'display: "fit"', 'resolution: "1280x720", display: "fit", launchMode: "desktop"'), gta_other['switches']
 # Version 2 of both GTA lists (2026-10-12): the orphan-lock reaper's stamped mode, as RDR2 and
 # Horizon Zero Dawn have. The default mode released a busy SocialClubHelper.exe lock at Story Mode.
 for ident in ('gta5e-steam', 'gta5e-other', 'rdr2-steam', 'rdr2-other', 'horizon-zero-dawn'):
@@ -310,7 +312,7 @@ for ident in ('gta5e-steam', 'gta5e-other', 'rdr2-steam', 'rdr2-other', 'horizon
 # chunks, and under 12 GB of RAM the video budget's trim starts 3584 MB below the limit.
 # Versions 9 / 8 (logs 103-106): the small-device memory guard; version 8 / 7's semaphore cells and lean
 # diagnostics are gone again (the game's loading stalled with them).
-assert presets['gta5e-steam']['version'] == 10 and presets['gta5e-other']['version'] == 9, \
+assert presets['gta5e-steam']['version'] == 10 and presets['gta5e-other']['version'] == 10, \
     (presets['gta5e-steam']['version'], presets['gta5e-other']['version'])
 for ident in ('gta5e-steam', 'gta5e-other'):
     assert 'pso-async = 1' in presets[ident]['lines'], ident
