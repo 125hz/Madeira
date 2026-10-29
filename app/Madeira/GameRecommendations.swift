@@ -1154,8 +1154,13 @@ enum GameRecommendations {
     /// memory in the 32-bit window, so every store to it was emulated (254,000 in 40 s
     /// against 5 jitless) and the renderer stopped producing frames: the UI froze. V8
     /// is interpreted again (the default); the verbose log stays off.
+    /// Version 6 (logs 116-119): in three starts of four the web helper's renderer thread
+    /// waited forever for a lock in libcef.dll that two other threads held, before the UI
+    /// came up or on the Steam logo. A 32-bit process stuck like that for 40 s is ended
+    /// (MADEIRA_SRW_HANG_KILL_S = 40), so the client starts a new web helper; the holders
+    /// are logged at 30 s.
     static let steamBigPicture = GameRecommendation(
-        id: "steam-big-picture", title: "Steam Big Picture", version: 5,
+        id: "steam-big-picture", title: "Steam Big Picture", version: 6,
         config: """
         # Madeira's recommended settings for Steam Big Picture.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -1174,6 +1179,7 @@ enum GameRecommendations {
         env.MADEIRA_GDI_SHARED_SECTION = 1
         env.MADEIRA_STEAM_ALLOW_CRASHPAD = 1
         env.MADEIRA_CEF_VERBOSE = 0
+        env.MADEIRA_SRW_HANG_KILL_S = 40
         env.MADEIRA_TOUCH_MOUSE = 1
         env.MADEIRA_WOW_MIN_FREE_GB = 2
         env.MADEIRA_WOW_PLACEHOLDERS = 1

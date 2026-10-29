@@ -1671,6 +1671,180 @@ static void ios_lock_census(void)
 uintptr_t ios_beacon_teb_list[4];
 int ios_beacon_teb_count;
 
+/* ml2250: SRW-LOCK HANGS IN 32-BIT PROCESSES (logs 116-119, 2026-10-28).
+ *
+ * Steam's 32-bit web helper stopped at start in three runs of four: its renderer
+ * thread waited without a timeout at an address inside libcef.dll's data that is
+ * 2 mod 4 with the word there reading 2. That is Wine's SRW lock: an exclusive
+ * acquire waits on the `owners` half (offset 2), and 2 means two shared owners
+ * that never let go. The census showed only the waiter, so the holders stayed
+ * unknown.
+ *
+ * Each census cycle, a 32-bit thread waiting like that for
+ * env.MADEIRA_SRW_HANG_DIAG_S (30; 0 = off) has every 32-bit thread of its
+ * process logged once: the x86 registers from the WoW64 CPU area (FEX stores
+ * them before every system call, so a thread parked in a wait has them current),
+ * the EBP chain and the module-resolved words above ESP, named from the
+ * process's own loader list. env.MADEIRA_SRW_HANG_KILL_S (unset = never, the
+ * Steam Big Picture list sets 40) also asks the wineserver to end that process
+ * once the wait is that old (fd_ios.c, on the server's own thread, as a
+ * TerminateProcess from another process would), so a parent that restarts its
+ * helper gets a new one. At most 3 such ends per app run. */
+volatile unsigned int ios_hang_kill_pid;   /* taken and cleared by the wineserver's main loop */
+
+#define IOS_WOW_MODS 160
+struct ios_wow_mod { uint32_t base, size; char name[32]; };
+
+static int ios_wow_rd( uint64_t a, void *out, size_t n )
+{
+    mach_vm_size_t got = 0;
+    return a > 0x10000 && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)a, n,
+                                                  (mach_vm_address_t)(uintptr_t)out, &got ) == KERN_SUCCESS && got == n;
+}
+
+/* The 32-bit process's modules, from PEB32->Ldr's load-order list (B = its window). */
+static int ios_wow_mods( uint64_t B, uint64_t teb64, struct ios_wow_mod *mods )
+{
+    uint32_t peb = 0, ldr = 0, head, link;
+    int n = 0, steps = 0;
+
+    if (!ios_wow_rd( teb64 + 0x2000 + 0x30, &peb, 4 ) || !peb ||
+        !ios_wow_rd( B + peb + 0x0c, &ldr, 4 ) || !ldr) return 0;
+    head = ldr + 0x0c;
+    if (!ios_wow_rd( B + head, &link, 4 )) return 0;
+    while (link && link != head && n < IOS_WOW_MODS && steps++ < 512)
+    {
+        uint32_t ent[13];   /* LDR_DATA_TABLE_ENTRY32 up to BaseDllName */
+        uint16_t wname[31];
+        int k, len;
+
+        if (!ios_wow_rd( B + link, ent, sizeof(ent) )) break;
+        mods[n].base = ent[6]; mods[n].size = ent[8];
+        len = (ent[11] & 0xffff) / 2;
+        if (len > 31) len = 31;
+        memset( wname, 0, sizeof(wname) );
+        if (!len || !ios_wow_rd( B + ent[12], wname, len * 2 )) len = 0;
+        for (k = 0; k < len; k++) mods[n].name[k] = (wname[k] >= 0x20 && wname[k] < 0x7f) ? (char)wname[k] : '?';
+        mods[n].name[len] = 0;
+        if (mods[n].base && mods[n].size) n++;
+        link = ent[0];
+    }
+    return n;
+}
+
+static const struct ios_wow_mod *ios_wow_mod_at( uint32_t va, const struct ios_wow_mod *mods, int n )
+{
+    int i;
+    for (i = 0; i < n; i++) if (va >= mods[i].base && va - mods[i].base < mods[i].size) return &mods[i];
+    return NULL;
+}
+
+static void ios_wow_dump_process( uint64_t B, uint32_t pid, uint64_t any_teb, int count )
+{
+    static struct ios_wow_mod mods[IOS_WOW_MODS];   /* census thread only */
+    int nmods = ios_wow_mods( B, any_teb, mods ), i, shown = 0;
+
+    dprintf( 2, "[srw-hang] ml2250 pid=%04x window=0x%llx: every 32-bit thread of the process, %d modules\n",
+             pid, (unsigned long long)B, nmods );
+    for (i = 0; i < count && shown < 128; i++)
+    {
+        extern int ios_alert_waiter_lookup( unsigned int tid, const void **addr, int *age_s, int *inf );
+        uint64_t teb = ios_thread_registry[i].teb, cpu = 0, tpid = 0, ttid = 0;
+        uint32_t ctx[0x34], ebp, eip, esp, w = 0;
+        uint16_t machine = 0;
+        const void *waddr = NULL;
+        int wage = 0, winf = 0, f;
+        char bt[400], st[400];
+        size_t bl = 0, sl = 0;
+        const struct ios_wow_mod *m;
+
+        if (!teb || (teb & ~0xffffffffull) != B) continue;
+        if (!ios_wow_rd( teb + 0x40, &tpid, 8 ) || (uint32_t)tpid != pid || !ios_wow_rd( teb + 0x48, &ttid, 8 )) continue;
+        if (!ios_wow_rd( teb + 0x1488, &cpu, 8 ) || !cpu || !ios_wow_rd( cpu + 2, &machine, 2 ) || machine != 0x14c) continue;
+        if (!ios_wow_rd( cpu + 4, ctx, sizeof(ctx) )) continue;
+        ebp = ctx[0xb4 / 4]; eip = ctx[0xb8 / 4]; esp = ctx[0xc4 / 4];
+        shown++;
+        if (ios_alert_waiter_lookup( (unsigned int)ttid, &waddr, &wage, &winf ))
+            ios_wow_rd( (uint64_t)(uintptr_t)waddr & ~3ull, &w, 4 );
+        bt[0] = st[0] = 0;
+        for (f = 0; f < 16 && ebp > 0x1000 && bl < sizeof(bt) - 48; f++)
+        {
+            uint32_t rec[2];
+            if (!ios_wow_rd( B + ebp, rec, sizeof(rec) )) break;
+            m = ios_wow_mod_at( rec[1], mods, nmods );
+            bl += snprintf( bt + bl, sizeof(bt) - bl, " %s+0x%x", m ? m->name : "?", m ? rec[1] - m->base : rec[1] );
+            if (rec[0] <= ebp) break;
+            ebp = rec[0];
+        }
+        for (f = 0; f < 256 && sl < sizeof(st) - 48; f++)
+        {
+            uint32_t v;
+            if (!ios_wow_rd( B + esp + 4u * f, &v, 4 )) break;
+            if ((m = ios_wow_mod_at( v, mods, nmods )))
+                sl += snprintf( st + sl, sizeof(st) - sl, " +%x:%s+0x%x", 4 * f, m->name, v - m->base );
+        }
+        m = ios_wow_mod_at( eip, mods, nmods );
+        dprintf( 2, "[srw-hang] tid=%04x eip=%08x(%s+0x%x) esp=%08x ebp=%08x wait=%p %ds %s w=%08x\n",
+                 (unsigned)ttid, eip, m ? m->name : "?", m ? eip - m->base : 0, esp, ctx[0xb4 / 4],
+                 waddr, wage, waddr ? (winf ? "INF" : "TMO") : "-", w );
+        dprintf( 2, "[srw-hang]   ebp:%s\n", bt );
+        dprintf( 2, "[srw-hang]   stack:%s\n", st );
+    }
+}
+
+static int ios_srw_hang_env( const char *name, int fallback )
+{
+    const char *e = getenv( name );
+    return e && *e ? atoi( e ) : fallback;
+}
+
+static void ios_srw_hang_census( int count )
+{
+    static int diag_s = -2, kill_s = -2, kills;
+    static uint32_t dumped[8], killed[8];
+    static int ndumped, nkilled;
+    int i, j;
+
+    if (diag_s == -2) { diag_s = ios_srw_hang_env( "MADEIRA_SRW_HANG_DIAG_S", 30 ); kill_s = ios_srw_hang_env( "MADEIRA_SRW_HANG_KILL_S", 0 ); }
+    if (diag_s <= 0 && kill_s <= 0) return;
+    for (i = 0; i < count; i++)
+    {
+        extern int ios_alert_waiter_lookup( unsigned int tid, const void **addr, int *age_s, int *inf );
+        uint64_t teb = ios_thread_registry[i].teb, cpu = 0, tpid = 0, ttid = 0;
+        uint16_t machine = 0, owners = 0;
+        const void *waddr = NULL;
+        int wage = 0, winf = 0, seen;
+
+        if (!teb || !ios_wow_rd( teb + 0x1488, &cpu, 8 ) || !cpu ||
+            !ios_wow_rd( cpu + 2, &machine, 2 ) || machine != 0x14c) continue;
+        if (!ios_wow_rd( teb + 0x40, &tpid, 8 ) || !ios_wow_rd( teb + 0x48, &ttid, 8 )) continue;
+        if (!ios_alert_waiter_lookup( (unsigned int)ttid, &waddr, &wage, &winf ) || !winf) continue;
+        if (((uintptr_t)waddr & 3) != 2 || !ios_wow_rd( (uint64_t)(uintptr_t)waddr, &owners, 2 ) || !owners) continue;
+        if (diag_s > 0 && wage >= diag_s)
+        {
+            for (seen = 0, j = 0; j < ndumped; j++) if (dumped[j] == (uint32_t)tpid) seen = 1;
+            if (!seen && ndumped < 8)
+            {
+                dumped[ndumped++] = (uint32_t)tpid;
+                dprintf( 2, "[srw-hang] ml2250 tid=%04x of pid %04x waits %ds for an SRW lock at %p held by %u shared owner(s)%s\n",
+                         (unsigned)ttid, (unsigned)tpid, wage, waddr, owners, owners == 0xffff ? " (exclusive)" : "" );
+                ios_wow_dump_process( teb & ~0xffffffffull, (uint32_t)tpid, teb, count );
+            }
+        }
+        if (kill_s > 0 && wage >= kill_s && kills < 3)
+        {
+            for (seen = 0, j = 0; j < nkilled; j++) if (killed[j] == (uint32_t)tpid) seen = 1;
+            if (seen || nkilled >= 8) continue;
+            killed[nkilled++] = (uint32_t)tpid;
+            kills++;
+            dprintf( 2, "[srw-hang] ml2250 pid %04x has waited %ds on that lock: asking the server to end it "
+                     "(env.MADEIRA_SRW_HANG_KILL_S=%d, end %d of 3)\n", (unsigned)tpid, wage, kill_s, kills );
+            __atomic_store_n( &ios_hang_kill_pid, (unsigned int)tpid, __ATOMIC_RELEASE );
+            return;   /* one per cycle: the server takes one pid at a time */
+        }
+    }
+}
+
 #define IOS_PUMP_MAX 4
 extern void ios_alert_ring_dump(void);   /* ml439 (#74): unix/sync.c alert-flow probe */
 extern void ios_alert_waiter_dump(void); /* ml440 (#74): >60s parkers + their lock words */
@@ -1686,6 +1860,7 @@ void ios_pump_sample(void)
 
     ios_alert_ring_dump();   /* ml439: static ring during a parked-stall = wakes dying PE-side */
     ios_alert_waiter_dump(); /* ml440: name the lock the parked crowd is starving on */
+    ios_srw_hang_census( count );   /* ml2250: who holds a 32-bit SRW lock a thread starves on */
     /* ml447: orphan-lock detector — collect live threads' TEB Instr[6]
      * CodeBufferWriteMutex stamps; a held-exclusive SRW with >=3 waiters that
      * NO live thread stamps (3 cycles running) has a vanished dead owner. */

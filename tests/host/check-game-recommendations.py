@@ -122,7 +122,7 @@ assert 'if bigPicture == true { Self.writeBigPictureBatch() }' in library \
 # ml2230 (version 4, logs 111-112): CEF's verbose log is off. Version 5 (logs 113-114): V8 is interpreted again
 # (version 4's MADEIRA_JITLESS = 0 froze the UI: every store to its pool-aliased code space was emulated).
 bp = presets['steam-big-picture']
-assert bp['version'] == 5 and 'env.MADEIRA_STEAM_ALLOW_CRASHPAD = 1' in bp['lines'] \
+assert bp['version'] == 6 and 'env.MADEIRA_STEAM_ALLOW_CRASHPAD = 1' in bp['lines'] and 'env.MADEIRA_SRW_HANG_KILL_S = 40' in bp['lines'] \
     and not any(l.startswith('env.MADEIRA_JITLESS') for l in bp['lines']) and 'env.MADEIRA_CEF_VERBOSE = 0' in bp['lines'] \
     and not any(l.startswith('env.MADEIRA_SC_PA_POOLS') for l in bp['lines']), bp
 # ml2230: Big Picture's libraryfolders.vdf (config/ and steamapps/) gets Madeira's Steam library and the drives'
