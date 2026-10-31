@@ -1551,15 +1551,26 @@ static void *wine_process_thread(void *arg) {
          * game", LibraryEntry.configureLaunch) knows its title too. It passes that
          * game's App ID and install folder in MADEIRA_STEAM_APPID / MADEIRA_STEAM_APPPATH,
          * and this launch publishes the game's own identity instead of the fixed one. Both
-         * are cleared here, so no later launch inherits them. */
+         * are cleared here, so no later launch inherits them.
+         *
+         * ml2310: a game from another store (an Epic library entry) is not a Steam game
+         * either. The library sets MADEIRA_NO_STEAM_IDENTITY=1 for its launch: with the
+         * fixed identity its launcher took its Steam path, the Steam API start failed and
+         * it showed only an error. */
         const char *dock_session = getenv("MADEIRA_DOCK_SESSION");
         const char *direct_app = getenv("MADEIRA_STEAM_APPID");    /* set by the library for one direct Steam start (Start with: The game); not a setting */
         const char *direct_path = getenv("MADEIRA_STEAM_APPPATH"); /* that game's install folder, with MADEIRA_STEAM_APPID; not a setting */
+        const char *no_steam_id = getenv("MADEIRA_NO_STEAM_IDENTITY"); /* set by the library for one launch of a game from another store; not a setting */
         if (dock_session && dock_session[0] == '1') {
             unsetenv("SteamAppPath");
             unsetenv("SteamGameId");
             unsetenv("SteamAppId");
             dprintf(STDERR_FILENO, "[steam-env] Madeira Dock session: no fixed Steam game identity published\n");
+        } else if (no_steam_id && no_steam_id[0] == '1') {
+            unsetenv("SteamAppPath");
+            unsetenv("SteamGameId");
+            unsetenv("SteamAppId");
+            dprintf(STDERR_FILENO, "[steam-env] a game from another store: no Steam game identity published\n");
         } else if (direct_app && direct_app[0] && strlen(direct_app) <= 10 &&
             strspn(direct_app, "0123456789") == strlen(direct_app) &&
             direct_path && (direct_path[0] == 'C' || direct_path[0] == 'c') && direct_path[1] == ':' &&
@@ -1575,6 +1586,7 @@ static void *wine_process_thread(void *arg) {
         }
         unsetenv("MADEIRA_STEAM_APPID");
         unsetenv("MADEIRA_STEAM_APPPATH");
+        unsetenv("MADEIRA_NO_STEAM_IDENTITY");
 
         /* iOS-Madeira 2026-07-02: publish the TRUE JIT-pool RX->RW offset to
          * xtajit64.dll (its own FEXCore copy reads this via getenv in
