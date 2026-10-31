@@ -28350,8 +28350,9 @@ void virtual_free_teb( TEB *teb )
  * the old window may have been replaced while join was in progress.
  * Keep the mutex through the free, so teardown/reuse cannot intervene.
  * It is recursive (virtual_init), as required by the existing alloc path.
- * Called only for exactly MADEIRA_EA_CEF=1; every other session retains the
- * old handoff. A stale/unjoinable entry is discarded, never freed by guess.
+ * ml2290: called for every session (exit_thread); env.MADEIRA_THREAD_REAP_CHECKED=0
+ * without MADEIRA_EA_CEF=1 keeps the old handoff. A stale/unjoinable entry is
+ * discarded, never freed by guess.
  */
 struct ios_ea_retired_thread
 {
