@@ -441,18 +441,46 @@ struct LibraryEntry: Codable, Identifiable {
     /// With startServices the target is the services batch, which carries the
     /// arguments itself. The exe is launchWindowsPath: "The game"'s program for
     /// a Steam game started as its own program.
-    private var launchCommand: (exe: String, args: String) {
+    private var launchCommand: (exe: String, args: String) { launchCommand(parent: nil) }
+    /// ml2320: with `parent` (a program, never with a batch) the program starts as its child:
+    /// "<parent>" "<program>" args, in the Wine desktop or directly.
+    private func launchCommand(parent: String?) -> (exe: String, args: String) {
         func quoted(_ s: String) -> String { "\"\(s)\"" }
         var path = launchWindowsPath
         var extra = programArguments.trimmingCharacters(in: .whitespaces)
         var batch = isBatch
         if servicesScript != nil { path = servicesScriptPath; extra = ""; batch = true }
         func withExtra(_ s: String) -> String { extra.isEmpty ? s : s + " " + extra }
+        let parent = batch ? nil : parent
         if runsInDesktop {
-            return ("explorer.exe", "/desktop=shell,\(resolution) " + withExtra(batch ? "cmd /c \(quoted(path))" : quoted(path)))
+            let program = parent.map { quoted($0) + " " + quoted(path) } ?? quoted(path)
+            return ("explorer.exe", "/desktop=shell,\(resolution) " + withExtra(batch ? "cmd /c \(quoted(path))" : program))
         }
         if batch { return ("C:\\windows\\system32\\cmd.exe", withExtra("/c \(quoted(path))")) }
+        if let parent { return (parent, withExtra(quoted(path))) }
         return (path, programArguments)   // upstream's direct launch, arguments verbatim
+    }
+    /// ml2320: an Epic game's x64 program starts as the child of a process with the Epic client's
+    /// name (build/epic-parent), as it does under the Epic client on Windows. A publisher's launcher
+    /// that did not find that process treated the Epic copy as not owned and offered it for sale.
+    /// nil for any other entry, a batch, a 32-bit program, a build without the program, or with
+    /// env.MADEIRA_EPIC_LAUNCHER_PARENT=0.
+    var epicParent: String? {
+        guard epicAppName != nil, !isBatch, servicesScript == nil,
+              MadeiraConfig.get("env.MADEIRA_EPIC_LAUNCHER_PARENT") != "0",
+              Bundle.main.url(forResource: "EpicGamesLauncher", withExtension: "exe", subdirectory: "arm64ec-windows") != nil,
+              let url = Self.hostURL(ofWindowsPath: launchWindowsPath), Self.peMachine(url) == 0x8664 else { return nil }
+        return "C:\\windows\\system32\\EpicGamesLauncher.exe"
+    }
+    /// The PE machine of an executable (0x14c: 32-bit x86, 0x8664: x64), nil when unreadable.
+    static func peMachine(_ url: URL) -> Int? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        guard let dos = try? h.read(upToCount: 64), dos.count == 64, dos[0] == 0x4d, dos[1] == 0x5a else { return nil }
+        let offset = (0..<4).reduce(UInt64(0)) { $0 | (UInt64(dos[60 + $1]) << ($1 * 8)) }
+        guard offset >= 64, offset < 16 * 1024 * 1024, (try? h.seek(toOffset: offset)) != nil,
+              let pe = try? h.read(upToCount: 6), pe.count == 6, Array(pe.prefix(4)) == [0x50, 0x45, 0, 0] else { return nil }
+        return Int(pe[4]) | Int(pe[5]) << 8
     }
     /// The details page's "command that runs" line: the program's file name and
     /// its arguments, as upstream shows a direct start; ml1163: what starts it
@@ -771,7 +799,9 @@ struct LibraryEntry: Codable, Identifiable {
             }
         }
         if bigPicture == true { Self.writeBigPictureBatch() }   // ml2021: the batch the desktop-mode launch runs
-        let command = desktop == true ? (exe: "explorer.exe", args: launchArguments) : launchCommand
+        let parent = desktop == true ? nil : epicParent
+        let command = desktop == true ? (exe: "explorer.exe", args: launchArguments) : launchCommand(parent: parent)
+        if parent != nil { fputs("[epic-parent] ml2320 the game starts as EpicGamesLauncher.exe's child\n", stderr) }
         setenv("MADEIRA_EXE", command.exe, 1)
         setenv("MADEIRA_ARGS", LaunchArgumentText.plain(command.args), 1)
         // Export both choices: unsetting Directly lets a global env.MADEIRA_DESKTOP=1
