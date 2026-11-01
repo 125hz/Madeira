@@ -559,9 +559,15 @@ struct LibraryEntry: Codable, Identifiable {
         let prefix = documents.appendingPathComponent("wine").path
         return ("C:\\Program Files\\Steam Big Picture", "\(prefix)/drive_c/Program Files/Steam Big Picture")
     }
-    /// Off by default: no Big Picture button beside Desktop and no Big Picture card in the
-    /// library. env.MADEIRA_BIG_PICTURE = 1 brings both back.
-    static var bigPictureShown: Bool { MadeiraConfig.flag("MADEIRA_BIG_PICTURE", fallback: false) }   // 1: the library offers Valve's client in Big Picture beside Desktop
+    /// Big Picture is unfinished: the button beside Desktop and a Big Picture card in the library
+    /// exist only in a build compiled with the Swift condition MADEIRA_BIG_PICTURE_UI (for example
+    /// xcodebuild SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) MADEIRA_BIG_PICTURE_UI').
+    /// No IPA build sets it, so release IPAs have neither; the launch code is compiled either way.
+#if MADEIRA_BIG_PICTURE_UI
+    static let bigPictureShown = true
+#else
+    static let bigPictureShown = false
+#endif
     /// Whether the library lists this entry: a Big Picture entry only while Big Picture is shown.
     var listedInLibrary: Bool { bigPicture != true || Self.bigPictureShown }
     /// The button is offered when Big Picture's folder has a client, or the Dock's steam.exe
@@ -3419,8 +3425,10 @@ struct LibraryView: View {
                 .animation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.4), value: liquidMetal.on)
                 .id(LibraryEntry.desktopID)
                 .overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == LibraryEntry.desktopID && controller.connected ? Color.cyan : .clear, lineWidth: 3))
-            // ml2021: Valve's client in Big Picture, beside the Desktop, once Steam is installed in the prefix.
-            if LibraryEntry.bigPictureShown, LibraryEntry.steamClientInstalled {
+            // ml2021: Valve's client in Big Picture, beside the Desktop, once Steam is installed in the prefix;
+            // only in builds with MADEIRA_BIG_PICTURE_UI (LibraryEntry.bigPictureShown).
+#if MADEIRA_BIG_PICTURE_UI
+            if LibraryEntry.steamClientInstalled {
                 Button { selected = model.entries.first(where: { $0.bigPicture == true }) ?? .bigPictureEntry } label: {
                     if liquidMetal.on {
                         let light = colorScheme == .light
@@ -3440,6 +3448,7 @@ struct LibraryView: View {
                     .id(LibraryEntry.bigPictureID)
                     .accessibilityHint("Steam's gamepad interface in the Wine desktop")
             }
+#endif
         }
     }
     /// The zoomable page (LibraryGridPage.swift): the card layouts as one pinchable collection view, with the same sheets and rules as `library`.
