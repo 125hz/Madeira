@@ -27,6 +27,8 @@ protocol SteamCMSession: AnyObject {
     func callServiceMethod(method: SteamServiceMethod, body: Data, timeout: TimeInterval) async throws -> Data
     /// The same, with the response header's EResult (1 = OK).
     func callServiceMethodWithResult(method: SteamServiceMethod, body: Data, timeout: TimeInterval) async throws -> (eresult: Int32, body: Data)
+    /// Sends a unified-service notification (a method without a response).
+    func sendServiceNotification(method: SteamServiceMethod, body: Data) async throws
 }
 
 extension SteamCMSession {
@@ -34,4 +36,6 @@ extension SteamCMSession {
     func callServiceMethodWithResult(method: SteamServiceMethod, body: Data, timeout: TimeInterval) async throws -> (eresult: Int32, body: Data) {
         (1, try await callServiceMethod(method: method, body: body, timeout: timeout))
     }
+    /// Sessions that never send notifications (scripted ones in tests) need not implement it.
+    func sendServiceNotification(method: SteamServiceMethod, body: Data) async throws {}
 }

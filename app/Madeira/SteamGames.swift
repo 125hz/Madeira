@@ -875,7 +875,20 @@ struct SteamDownloadStatus: View {
         VStack(alignment: .leading, spacing: 6) {
             ProgressView(value: download.progress.fraction)
             Text(caption).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            if let source { source.font(.caption).foregroundStyle(.secondary) }
         }
+    }
+    /// Where the bytes come from while downloading: the PC on this network
+    /// (Steam's local network game transfers) or Steam's servers.
+    private var source: Label<Text, Image>? {
+        let p = download.progress
+        guard case .active = download.state, p.phase == .downloading else { return nil }
+        if let pc = p.pcName {
+            if p.pcDropped { return Label("From Steam's servers (\(pc) stopped answering)", systemImage: "cloud") }
+            let sent = p.pcBytes > 0 ? " · \(formatBytes(Int64(p.pcBytes))) so far" : ""
+            return Label("From \(pc) on this network\(sent)", systemImage: "desktopcomputer")
+        }
+        return Label("From Steam's servers", systemImage: "cloud")
     }
     private var caption: String {
         let p = download.progress

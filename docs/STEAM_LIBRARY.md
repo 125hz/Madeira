@@ -294,6 +294,61 @@ Not checked on a device yet: whether Valve's client, started through Madeira
 Dock, starts a password-protected beta install without asking for the code
 itself. "The game" (SteamDirectStart) still picks among the launch entries
 without a beta key.
+## From a PC on this network
+Settings › Steam › **Downloads from PCs on this network** (off by default).
+A download then asks a PC of the same account on the same network first,
+through Steam's own local network game transfers, and takes from the content
+servers only what the PC does not serve. On the PC: the same Steam account,
+Settings › Downloads › Game file transfer over local network on, and no
+download or game running (Valve's client serves only while idle). The PC is
+found through Steam; **PC address** is only for a PC that is not found. Both
+devices must reach the internet through the same router: Valve refuses a
+transfer between different public IP addresses ("IP Login Restriction
+Failed" in the requester's `content_log.txt`).
+The code is `app/Madeira/SwiftSteam/Content/SteamLANPeer.swift`, the
+`[steam-lan]` part of `DepotDownloader.install` and `SteamSession.handleRelayed`.
+The messages and fields are Valve's (SteamDatabase protobufs:
+`steammessages_remoteclient_discovery`, `steammessages_remoteclient_service*`,
+`steammessages_contentsystem.steamclient`, `steammessages_clientlanp2p`), the
+order is the one a Steam client follows (worked out against Steam on Windows,
+2026-10-29):
+1. **Joining the account's devices.** `RemoteClient.NotifyOnline` (a
+   notification: no reply) with this device's client ID (random, kept in
+   `madeira.steam.lanClientID`), then this device's status
+   (`CMsgRemoteClientBroadcastStatus`) through
+   `RemoteClient.SendSteamBroadcastPacket`. Steam relays it to the account's
+   other clients and pushes theirs back
+   (`RemoteClientSteamClient.NotifySteamBroadcastPacket`): client ID, host
+   name, accounts and IP addresses. A relayed discovery from them is answered
+   with this device's status. Without this, `RequestPeerContentServer` fails
+   with Account Not Found (18) before reaching the PC.
+2. **Discovery on the network.** A `CMsgRemoteClientBroadcastDiscovery`
+   datagram goes straight to the PC's UDP port 27036 (its address from step 1,
+   in this device's /24), not as a broadcast: iOS gives sideloaded apps no
+   multicast entitlement. Every packet starts `FF FF FF FF 21 4C 5F A0`. The PC
+   answers with its status and sends a discovery of its own, which is answered
+   with this device's status; the PC's `remote_connections.txt` then logs
+   "Received broadcast message from client ... (Madeira)".
+3. **Opening the PC's content server.** `ContentServerDirectory.RequestPeerContentServer`
+   on the app's Steam connection: both client IDs, the account, the App ID and
+   `current_build_id`, the build this device already has (0: none). Sending
+   the PC's own build gets "Content Version" (47). The answer is a TCP port
+   (27040 on Windows), the depots the PC has and an access token; the PC logs
+   "Accepted peer connection ... (matching IP)".
+4. **Chunks.** On that TCP connection, `k_EMsgClientPeerChunkRequest` (9902:
+   app, depot, chunk SHA-1, access token) and `k_EMsgClientPeerChunkResponse`
+   (9903), framed like every Steam TCP message (length, `VT01`, message type
+   with the protobuf flag, header length 0, body). Up to 16 requests are in
+   flight at once on the one connection; answers are matched by SHA-1. Valve's
+   client sends the chunk decrypted and still compressed; it is decompressed,
+   checked against the manifest's Adler-32 and the chunk's SHA-1, and written
+   like a chunk from a content server.
+A chunk the PC fails to send is fetched from the content servers. After
+four failures in a row the PC is dropped for the rest of that download. Log:
+`[steam-lan] relayed status host=...` (a device of the account seen through
+Steam), `open app=... pc=... at <address>:<port>` (Steam opened it), `skip: ...`
+or `... did not open` (why not), and `done ... chunks= bytes= seconds=
+mbit/s= failures=`.
 
 ## Downloads in the background
 

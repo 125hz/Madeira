@@ -56,6 +56,16 @@ enum EMsg: UInt32 {
 enum SteamServiceMethod: String {
     case getManifestRequestCode = "ContentServerDirectory.GetManifestRequestCode#1"
     case getCDNAuthToken = "ContentServerDirectory.GetCDNAuthToken#1"
+    /// Opens a PC's Steam content server for this account on the local network (SteamLANPeer).
+    case requestPeerContentServer = "ContentServerDirectory.RequestPeerContentServer#1"
+    /// Which apps a PC on this account serves, and its public IP (SteamLANPeer).
+    case getPeerContentInfo = "ContentServerDirectory.GetPeerContentInfo#1"
+    /// Tells Steam this device is a remote client of the account, with its client ID (SteamLANPeer).
+    case remoteClientNotifyOnline = "RemoteClient.NotifyOnline#1"
+    /// The account's Steam clients and their remote client IDs (SteamLANPeer).
+    case remoteClientGetRecentClients = "RemoteClient.GetRecentClients#1"
+    /// Relays a discovery-format packet to the account's other clients (SteamLANPeer).
+    case remoteClientSendSteamBroadcastPacket = "RemoteClient.SendSteamBroadcastPacket#1"
     /// The account's own playtime and last-played times.
     case getOwnedGames = "Player.GetOwnedGames#1"
     /// The account's Steam Cloud file list for one app.

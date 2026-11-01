@@ -593,9 +593,42 @@ class SteamSession {
         }
 
         if response.header.eresult != 1 {
-            SteamLog.trace("\(method.rawValue) header eresult=\(response.header.eresult)")
+            if method.rawValue.hasPrefix("RemoteClient.") || method == .requestPeerContentServer || method == .getPeerContentInfo {
+                SteamLog.event("[steam-lan] \(method.rawValue) eresult=\(response.header.eresult)")
+            } else {
+                SteamLog.trace("\(method.rawValue) header eresult=\(response.header.eresult)")
+            }
         }
         return (response.header.eresult, response.body)
+    }
+
+    /// A unified-service notification (a method that returns NoResponse):
+    /// no source job, so the CM neither answers nor rejects it as a call.
+    func sendServiceNotification(method: SteamServiceMethod, body: Data) async throws {
+        resetIdleTimer()
+        var header = CMsgProtoBufHeader()
+        header.steamid = steamID
+        header.clientSessionid = sessionID
+        header.targetJobName = method.rawValue
+        let data = SteamMessageCodec.encode(eMsg: .serviceMethodCallFromClient, header: header, body: body)
+        try await connection.send(data)
+    }
+
+    /// A packet another client of this account sent through Steam: a status
+    /// is kept for SteamLANPeer; a discovery is answered with this device's
+    /// status, once it has one.
+    private func handleRelayed(method: String, body: Data) {
+        guard method.hasPrefix("RemoteClientSteamClient.NotifySteamBroadcastPacket"),
+              let packet = SteamLANPeer.relayedPacket(body) else { return }
+        let relay = SteamLANRelay.shared
+        if let status = SteamLANPeer.parseStatus(packet.payload) {
+            if relay.record(status) {
+                SteamLog.event("[steam-lan] relayed status host=\(status.hostname) client=\(status.clientID) addresses=\(status.addresses.count)")
+            }
+        } else if SteamLANPeer.packetType([UInt8](packet.payload)) == 0, let own = relay.ownStatus, packet.clientID != own.clientID {
+            let reply = SteamLANPeer.steamBroadcast(steamID: steamID, clientID: own.clientID, payload: own.status)
+            Task { try? await self.sendServiceNotification(method: .remoteClientSendSteamBroadcastPacket, body: reply) }
+        }
     }
 
     /// Send a message without waiting for response
@@ -662,6 +695,13 @@ class SteamSession {
         // Log unmatched service method responses for debugging
         if message.rawEMsg == EMsg.serviceMethodResponse.rawValue {
             SteamLog.trace("ServiceMethodResponse not matched: jobTarget=\(message.header.jobidTarget), pending=\(Array(pendingJobs.keys))")
+        }
+
+        // What Steam relays between this account's devices (SteamLANPeer):
+        // the other clients' discovery answers and connection packets.
+        if message.rawEMsg == EMsg.serviceMethod.rawValue, message.header.targetJobName.hasPrefix("RemoteClientSteamClient.") {
+            handleRelayed(method: message.header.targetJobName, body: message.body)
+            return
         }
 
         // Dispatch to registered handlers
