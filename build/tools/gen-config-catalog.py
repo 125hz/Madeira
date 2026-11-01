@@ -45,7 +45,7 @@ INT_READERS = {"madeira_cfg_int", "mad_cfg_int_pe"}
 OVERLAY = {
     "env.MADEIRA_PASTE_INTERVAL_MS": {"category": "Windows, display & input", "title": "Clipboard typing interval (ms)",
                 "kind": "int", "default": "10",
-                "note": "Default 10 ms between pasted characters. Range 5-100 ms; use a longer interval for games "
+                "note": "Default 10 ms between pasted characters. Range 1-100 ms; use a longer interval for games "
                         "that miss fast text input. Enforced at delivery as well as queueing. Restart the session after changing it."},
     "env.MADEIRA_DOCK_STEAM_RUN": {"category": "Steam & Dock", "kind": "bool", "default": "1",
                 "note": "On by default: when a game in a Madeira Dock session asks Steam to start another game "

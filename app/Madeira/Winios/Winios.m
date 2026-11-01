@@ -888,7 +888,7 @@ static double g_text_ready_at;
 static unsigned int g_text_paced_generation;
 
 int winios_try_post_text(unsigned int scalar, int vk, int shift, int interval_ms) {
-    if (interval_ms < 5) interval_ms = 5;
+    if (interval_ms < 1) interval_ms = 1;
     if (interval_ms > 100) interval_ms = 100;
     int accepted = 0;
     pthread_mutex_lock(&g_input_q.lock);
