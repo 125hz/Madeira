@@ -266,6 +266,9 @@ struct LibraryEntry: Codable, Identifiable {
     /// Keyboard-and-mouse mode: vertical speed of the right-stick mouse relative
     /// to horizontal (PadBindings.mouseVertical); nil = 1.
     var padMouseVertical: Double?
+    /// Gyro aim and turbo for player 1 (PadAssist.swift); nil = both off.
+    /// Optional, so older files decode.
+    var padAssist: PadAssistSettings?
     /// Processors reported to Windows code in this game's sessions
     /// (MADEIRA_CPU_COUNT, ntdll); nil = automatic.
     var cpuCount: Int?
@@ -978,6 +981,10 @@ final class LibraryModel: ObservableObject {
     @Published var padMouseVertical: Double = 1 {
         didSet { if oldValue != padMouseVertical { applyControllerMode() } }
     }
+    /// The session's gyro aim and turbo (LibraryEntry.padAssist); the pad sampler takes a change at once.
+    @Published var padAssist: PadAssistSettings? {
+        didSet { if oldValue != padAssist { GamepadInput.shared.setPadAssist(current == nil ? nil : padAssist) } }
+    }
     /// The session's touch-control opacity (the entry's Control opacity).
     @Published var opacity = 0.7
     /// The session's Aspect & scaling; MetalBackedView lays the game out with it.
@@ -1581,6 +1588,8 @@ final class LibraryModel: ObservableObject {
         padMouseVertical = GamepadInput.keyboardMouseAvailable ? (entry.padMouseVertical ?? 1) : 1
         controllerMode = GamepadInput.keyboardMouseAvailable ? entry.controllerMode : nil
         applyControllerMode()
+        padAssist = entry.padAssist
+        GamepadInput.shared.setPadAssist(padAssist)
         MetalHostView.shared.isHidden = false
         ProMotionIntent.apply(mode: entry.effectiveFPSMode)
         ThermalPacing.shared.begin()
@@ -1732,6 +1741,7 @@ final class LibraryModel: ObservableObject {
             if GamepadInput.keyboardMouseAvailable { entry.controllerMode = controllerMode }
             if GamepadInput.keyboardMouseAvailable { entry.controllerBinds = controllerBinds.isEmpty ? nil : controllerBinds }
             if GamepadInput.keyboardMouseAvailable { entry.padMouseVertical = padMouseVertical == 1 ? nil : padMouseVertical }
+            entry.padAssist = padAssist
             // The in-game Aspect & scaling choice sticks to the game. MADEIRA_SESSION_TOOLS=0
             // hides that picker and leaves the stored choice alone.
             if MadeiraConfig.flag("MADEIRA_SESSION_TOOLS") { entry.display = displayMode.rawValue }
@@ -1746,6 +1756,8 @@ final class LibraryModel: ObservableObject {
         controllerMode = nil
         controllerBinds = [:]
         padMouseVertical = 1
+        padAssist = nil
+        GamepadInput.shared.setPadAssist(nil)
         let controls = TouchControlsModel.shared
         controls.editing = false; controls.selected = nil
         controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
@@ -3900,6 +3912,13 @@ struct LibraryDetail: View {
                     }
                 }
             }
+            if GamepadInput.enabled {
+                NavigationLink("Gyro aim & turbo") {
+                    Form { PadAssistPage(settings: $entry.padAssist) }
+                        .navigationTitle("Gyro aim & turbo")
+                        .toolbar { Button("Reset") { entry.padAssist = nil }.disabled(entry.padAssist == nil) }
+                }
+            }
             LabeledContent("Control opacity") {
                 Slider(value: Binding(get: { entry.controlOpacity ?? 0.7 }, set: { entry.controlOpacity = $0 }), in: 0.15...1)
             }
@@ -5186,6 +5205,7 @@ struct LibraryHUD: View {
     @ObservedObject private var curtain = LaunchCurtain.shared
     /// The Session menu's Controller binds page (keyboard-and-mouse mode).
     @State private var bindsPage = false
+    @State private var assistPage = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         GeometryReader { geo in
@@ -5212,7 +5232,7 @@ struct LibraryHUD: View {
                 if !model.startingScreen { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.menu {
                     Color.black.opacity(SessionMenuBackground.blur ? 0.3 : 0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
-                    (bindsPage ? AnyView(bindsMenu) : AnyView(menu))
+                    (bindsPage ? AnyView(bindsMenu) : assistPage ? AnyView(assistMenu) : AnyView(menu))
                         .frame(width: min(460, geo.size.width - 32), height: min(650, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom - 24))
                         .modifier(SessionMenuBackground())
                         .clipShape(RoundedRectangle(cornerRadius: 28))
@@ -5249,7 +5269,7 @@ struct LibraryHUD: View {
         .onAppear { model.saveCurrentProfile() }
         .onChange(of: model.menu) { _, open in
             LibraryController.shared.configure(enabled: model.enabled, ownsInput: open)
-            if !open { bindsPage = false }
+            if !open { bindsPage = false; assistPage = false }
             if !open { model.saveCurrentProfile() }
             if open { eco = madeira_get_eco() != 0; fenceMode = FPSOverlayFenceMode.current }
         }
@@ -5481,6 +5501,25 @@ struct LibraryHUD: View {
         }
     }
 
+    /// Gyro aim and turbo, as a page of the Session menu; each change reaches the
+    /// pad at once (model.padAssist) and is saved to the game.
+    private var assistMenu: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button("Session", systemImage: "chevron.left") { assistPage = false }.buttonStyle(.borderless)
+                Spacer()
+                Text("Gyro aim & turbo").font(.headline)
+                Spacer()
+                Button("Reset") { model.padAssist = nil; model.saveCurrentProfile() }
+                    .buttonStyle(.borderless).disabled(model.padAssist == nil)
+                Button("Done") { model.menu = false }.buttonStyle(.bordered)
+            }.padding(.horizontal, 22).padding(.top, 22).padding(.bottom, 8)
+            Form {
+                PadAssistPage(settings: Binding(get: { model.padAssist }, set: { model.padAssist = $0; model.saveCurrentProfile() }))
+            }.scrollContentBackground(.hidden)
+        }
+    }
+
     /// Controller binds, as a page of the Session menu: a Form, so the rows read
     /// like Game details; the driver takes each change at once (model.controllerBinds).
     private var bindsMenu: some View {
@@ -5530,6 +5569,9 @@ struct LibraryHUD: View {
                         Text("XInput and DirectInput applies to the next launch.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                }
+                if GamepadInput.enabled {
+                    Button("Gyro aim & turbo", systemImage: "gyroscope") { assistPage = true }
                 }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
                 Divider()
