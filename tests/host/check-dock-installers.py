@@ -51,11 +51,16 @@ madsync = (root / 'build/madsync/madsync.c').read_text(encoding='utf-8')
 
 # ------------------------------------------------------------------ static rules
 lower = installers.lower()
-require(not any(n in lower for n in ('dxsetup', 'vcredist', 'vc_redist', 'dotnetfx', 'dxwebsetup', 'physx', 'ndp4')),
-        'no redistributable names: nothing is decided by program name')
+# One documented exception: .NET Framework setups (isDotNetFramework, env.MADEIRA_INSTALL_SKIP_DOTNET),
+# which do not finish under Wine's own .NET. Outside that function no name decides anything.
+named = re.sub(r'nonisolated static func isdotnetframework.*?\n    \}\n', '', lower, flags=re.S)
+require('func isdotnetframework' in lower and 'dotnetfx' not in named and
+        not any(n in lower for n in ('dxsetup', 'vcredist', 'vc_redist', 'dxwebsetup', 'physx', 'ndp4')),
+        'no redistributable names: nothing is decided by program name, except the .NET Framework setups')
 require('SteamSignIn.flag(name, default: true)' in installers, 'every installer switch defaults on and reads env.NAME')
 for switch in ('MADEIRA_DOCK_INSTALLERS', 'MADEIRA_INSTALL_DEFAULT_KEY', 'MADEIRA_DOCK_INSTALL_CHOICE',
-               'MADEIRA_DOCK_INSTALL_SCM', 'MADEIRA_DOCK_INSTALL_SERVER_SYNC', 'MADEIRA_DOTNET_FUSION'):
+               'MADEIRA_DOCK_INSTALL_SCM', 'MADEIRA_DOCK_INSTALL_SERVER_SYNC', 'MADEIRA_DOTNET_FUSION',
+               'MADEIRA_INSTALL_SKIP_DOTNET'):
     require(f'flag("{switch}")' in installers, f'switch {switch} is read')
 require('reg.exe' not in installers, 'the batch never writes the registry (no reg.exe in the bundle)')
 require(content.count('setenv("MADEIRA_MADSYNC_SESSION", "0", 1)') == 1 and
@@ -301,6 +306,20 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(DockInstallers.runnable(tool, drive: drive, has32Bit: false, hasMsiexec: false) == nil, "an x64 installer runs")
         require(DockInstallers.runnable(package, drive: drive, has32Bit: true, hasMsiexec: false) == "Windows Installer package" &&
                 DockInstallers.runnable(package, drive: drive, has32Bit: false, hasMsiexec: true) == nil, "a package needs msiexec.exe")
+        // .NET Framework setups: Wine's own .NET answers for them (Arkham City's DotNetFx35.exe never finished).
+        func setup(_ exe: String, key: String = "Software\\Valve\\Steam\\Apps\\200260") -> SteamInstallProcess {
+            SteamInstallProcess(run: SteamInstallRun(name: "dotnet", hive: .machine, key: key, value: 1), executable: exe, arguments: "/q")
+        }
+        let fx35 = setup("C:\\Games\\Setup\\DotNetFx35.exe")
+        require(DockInstallers.runnable(fx35, drive: drive, has32Bit: true, hasMsiexec: true, skipDotNet: true) == "Wine's own .NET is used" &&
+                DockInstallers.runnable(fx35, drive: drive, has32Bit: true, hasMsiexec: true) == nil, "a .NET Framework setup is left out only with skipDotNet")
+        require(DockInstallers.isDotNetFramework(setup("C:\\x\\NDP472-KB4054530-x86-x64-AllOS-ENU.exe")) &&
+                DockInstallers.isDotNetFramework(setup("C:\\x\\setup.exe", key: "SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v4\\Full")) &&
+                DockInstallers.isDotNetFramework(setup("C:\\x\\setup.exe", key: "Software\\Valve\\Steam\\Apps\\CommonRedist\\DotNet\\3.5")),
+                "  found by file name or by its setup key")
+        require(!DockInstallers.isDotNetFramework(setup("C:\\x\\windowsdesktop-runtime-8.0.11-win-x64.exe")) &&
+                !DockInstallers.isDotNetFramework(setup("C:\\x\\DXSETUP.exe", key: "Software\\Valve\\Steam\\Apps\\CommonRedist\\DirectX\\Jun2010")) &&
+                !DockInstallers.isDotNetFramework(tool), "  newer .NET, DirectX and other programs still run")
         let (found, scripts) = DockInstallers.found(game, drive: drive, defaultKey: true)
         require(scripts == 2 && found.map(\.run.name) == ["runtime a", "tool", "package", "gone", "shared runtime"], "game and shared scripts (\(found.map(\.run.name)))")
         require(found[4].executable == "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Steamworks Shared\\_CommonRedist\\Shared\\2015\\setup.exe",

@@ -542,6 +542,8 @@ struct DockInstallLedger: Codable, Equatable, Sendable {
 /// - `MADEIRA_DOCK_INSTALL_SERVER_SYNC`: a start that runs installers turns madsync off for
 ///   its session (off: madsync stays and the service-manager step is left out).
 /// - `MADEIRA_DOTNET_FUSION`: place Wine's fusion.dll in the .NET 2.0 folder when missing.
+/// - `MADEIRA_INSTALL_SKIP_DOTNET`: .NET Framework 2.0-4.x setups are left out (Wine's own
+///   .NET answers for them; off: they run like any other program).
 /// - `MADEIRA_DOCK_INSTALL_SEPARATE` (madeira-bcd): a start that runs installers runs only
 ///   them; the game starts after Madeira is restarted (off: the host follows in the same session).
 /// - `MADEIRA_DOCK_RESET_CLEAN` (madeira-bcd): Reset also moves what the installers put into
@@ -702,10 +704,28 @@ enum DockInstallers {
     /// Why this build cannot run a program, nil when it can. Decided by what the program is
     /// (a Windows Installer package, a 32-bit executable) and what the bundle has, never by
     /// its name: a package needs msiexec.exe, a 32-bit executable needs 32-bit support.
-    nonisolated static func runnable(_ process: SteamInstallProcess, drive: URL, has32Bit: Bool, hasMsiexec: Bool) -> String? {
+    ///
+    /// The one exception, with `skipDotNet`: Microsoft's .NET Framework setups (2.0 to 4.x).
+    /// Wine answers for the .NET Framework with its own Mono, and these setups do not finish
+    /// under it: Batman: Arkham City GOTY's .NET 3.5 setup ("/web /q") sat invisible on
+    /// "Extracting Files" and held the game's start (log 2026-10-31 23:22). They are left out,
+    /// as GameNative (Wine on Android) does. Newer .NET (Core, 5+) setups still run.
+    nonisolated static func runnable(_ process: SteamInstallProcess, drive: URL, has32Bit: Bool, hasMsiexec: Bool,
+                                     skipDotNet: Bool = false) -> String? {
+        if skipDotNet && isDotNetFramework(process) { return "Wine's own .NET is used" }
         if process.executable.lowercased().hasSuffix(".msi") { return hasMsiexec ? nil : "Windows Installer package" }
         guard let file = resolve(process.executable, drive: drive), let machine = machine(file) else { return nil }
         return machine == 0x14c && !has32Bit ? "32-bit installer" : nil
+    }
+
+    /// A .NET Framework 2.0-4.x setup: its file name (as Microsoft and
+    /// Steam's _CommonRedist\DotNet ship them) or the Framework's own setup key as the
+    /// entry's HasRunKey.
+    nonisolated static func isDotNetFramework(_ process: SteamInstallProcess) -> Bool {
+        let file = process.executable.split(separator: "\\").last.map { $0.lowercased() } ?? ""
+        if file.hasPrefix("dotnetfx") || (file.hasPrefix("ndp") && file.hasSuffix(".exe")) { return true }
+        let key = process.run.key.lowercased()
+        return key.contains("\\net framework setup\\ndp") || key.contains("\\commonredist\\dotnet\\")
     }
 
     nonisolated static var bundleHas32Bit: Bool { bundled("i386-windows") }
@@ -880,6 +900,7 @@ enum DockInstallers {
             LogStore.shared.log("[dock-installers] app=\(app) off (MADEIRA_DOCK_INSTALLERS=0)"); return
         }
         let defaultKey = flag("MADEIRA_INSTALL_DEFAULT_KEY")
+        let skipDotNet = flag("MADEIRA_INSTALL_SKIP_DOTNET")   // 0: .NET Framework setups run too
         let (found, scripts) = Self.found(game, drive: drive, defaultKey: defaultKey)
         // A Record as done / Reset request saved since the last start, before the plan reads
         // the registry.
@@ -893,7 +914,8 @@ enum DockInstallers {
         let items = DockInstallScripts.plan(found,
                                             done: { DockInstallScripts.marked($0, in: registry[$0.hive] ?? "") },
                                             exists: { resolve($0, drive: drive) != nil },
-                                            runnable: { runnable($0, drive: drive, has32Bit: has32Bit, hasMsiexec: hasMsiexec) })
+                                            runnable: { runnable($0, drive: drive, has32Bit: has32Bit, hasMsiexec: hasMsiexec,
+                                                                 skipDotNet: skipDotNet) })
         // ml2020: a publisher's program the script installed (or installs now), by its record's
         // key: the game session's service-manager decision (DockGameSession) reads the count.
         thirdPartyInstalls = items.filter { [.done, .pending, .limit].contains($0.status)
