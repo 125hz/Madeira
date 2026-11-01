@@ -1125,7 +1125,9 @@ int madeira_audio_background(int keepalive, int mute, int halt)
         int failed_before = g_dev.failed;
         if (ios_dev_create_locked(&fmt) && !failed_before) g_dev.failed = 0;
     }
-    if (g_dev.au && !g_dev.running && !g_bg_halt && (any || g_bg_keepalive)) {
+    /* Not while iOS holds the endpoint (MADEIRA_AUDIO_RESUME): the session event starts it. */
+    if (g_dev.au && !g_dev.running && !g_bg_halt && (any || g_bg_keepalive)
+        && !atomic_load_explicit(&g_dev_suspended, memory_order_acquire)) {
         OSStatus err = AudioOutputUnitStart(g_dev.au);
         if (err) fprintf(stderr, "[ios_audio] bg AudioOutputUnitStart: %d\n", (int)err);
         else g_dev.running = 1;
