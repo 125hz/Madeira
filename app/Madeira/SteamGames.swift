@@ -365,6 +365,8 @@ enum SteamDirectStart {
     @Published private(set) var depots: [Int: Set<Int>] = [:]
     /// The DLC each of those install records names (`dlcappid`), with their bytes.
     @Published private(set) var installedDLC: [Int: [Int: Int64]] = [:]
+    /// The beta branch each of those install records names (`BetaKey`); none for public.
+    @Published private(set) var branches: [Int: String] = [:]
     private var scanning = false
     /// A refresh was asked for while a scan ran (an install record was just
     /// written): scan again once it ends.
@@ -392,7 +394,7 @@ enum SteamDirectStart {
         Task.detached(priority: .utility) {
             let found = MadeiraDock.games(drive: drive)
             var builds: [Int: Int] = [:], languages: [Int: String] = [:], depots: [Int: Set<Int>] = [:]
-            var dlc: [Int: [Int: Int64]] = [:]
+            var dlc: [Int: [Int: Int64]] = [:], branches: [Int: String] = [:]
             for game in found where SteamInstallPaths.isManaged(library: game.library) && game.installed {
                 let steamApps = drive.appendingPathComponent(game.library, isDirectory: true)
                 if let build = SteamInstallFiles.buildID(appID: game.id, steamApps: steamApps) {
@@ -401,8 +403,10 @@ enum SteamDirectStart {
                 languages[game.id] = SteamInstallFiles.language(appID: game.id, steamApps: steamApps)
                 depots[game.id] = SteamInstallFiles.depots(appID: game.id, steamApps: steamApps)
                 dlc[game.id] = SteamInstallFiles.installedDLC(appID: game.id, steamApps: steamApps)
+                branches[game.id] = SteamInstallFiles.betaKey(appID: game.id, steamApps: steamApps)
             }
             let recorded = builds, recordedLanguages = languages, recordedDepots = depots, recordedDLC = dlc
+            let recordedBranches = branches
             await MainActor.run {
                 self.scanning = false
                 let again = self.rescan
@@ -419,6 +423,7 @@ enum SteamDirectStart {
                 if self.languages != recordedLanguages { self.languages = recordedLanguages }
                 if self.depots != recordedDepots { self.depots = recordedDepots }
                 if self.installedDLC != recordedDLC { self.installedDLC = recordedDLC }
+                if self.branches != recordedBranches { self.branches = recordedBranches }
                 if found.count != self.lastCount {
                     self.lastCount = found.count
                     LogStore.shared.log("[steam-games] installed=\(found.count) ready=\(found.filter(\.installed).count)")
@@ -740,7 +745,8 @@ struct SteamGameCell: View {
     var body: some View {
         let download = steam.downloads[item.id]
         let status = SteamGamesRules.status(installed: item.installed, transfer: download?.transfer,
-                                            updateAvailable: steam.updateAvailable(appID: item.id, installedBuild: games.builds[item.id]))
+                                            updateAvailable: steam.updateAvailable(appID: item.id, installedBuild: games.builds[item.id],
+                                                                                   installedBranch: games.branches[item.id]))
         // An installed game's format (bits, graphics API, size) is kept on its library entry.
         let entry = library.entries.first { $0.steamAppID == item.id }
         let notDownloaded = item.installed?.installed != true && download == nil
@@ -926,6 +932,121 @@ struct SteamGameLanguagePicker: View {
     }
 }
 
+// MARK: - Version (Steam branches)
+
+/// Tells the pages that show a game's version that the choice or the kept beta
+/// code changed (SteamBranch keeps them).
+final class SteamBranchChoices: ObservableObject {
+    static let shared = SteamBranchChoices()
+
+    @MainActor func choose(_ appID: Int, _ name: String) {
+        SteamBranch.choose(name, for: appID)
+        objectWillChange.send()
+    }
+
+    @MainActor func forgetCode(_ appID: Int) {
+        SteamBranch.setCode(nil, branches: [], for: appID)
+        objectWillChange.send()
+    }
+
+    @MainActor func changed() { objectWillChange.send() }
+}
+
+/// Version on a Steam game's pages, like Steam's Betas tab: the public build and
+/// the game's beta branches, a password-protected one once its beta code was
+/// entered here. The choice applies to the game's next download, update or
+/// repair. Shown when Steam lists a beta for the game; the pages that show it
+/// read the game's branches again once per run (SteamOwnedLibrary.refreshBranches).
+struct SteamBranchPicker: View {
+    let appID: Int
+    /// The branch the install record names; nil before the game is installed.
+    var installedBranch: String?
+    @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @ObservedObject private var choices = SteamBranchChoices.shared
+    @State private var askingCode = false
+    @State private var code = ""
+    @State private var checking = false
+    @State private var codeResult: String?
+
+    var body: some View {
+        let branches = steam.game(appID)?.branches ?? []
+        let unlocked = Set(SteamBranch.unlocked(appID))
+        let options = branches.filter { !$0.passwordRequired || unlocked.contains($0.name) }
+        let current = SteamBranch.chosen(appID)
+        let hasPrivate = branches.contains(where: \.passwordRequired) || !unlocked.isEmpty
+        Group {
+            if branches.count > 1 || current != SteamAppInfo.publicBranch {
+                Picker("Version", selection: Binding(get: { current }, set: { choices.choose(appID, $0) })) {
+                    ForEach(options, id: \.name) { Text(Self.label($0)).tag($0.name) }
+                    if !options.contains(where: { $0.name == current }) { Text(current).tag(current) }
+                }
+                .pickerStyle(.navigationLink)
+                if let note = note(current, branches: branches) {
+                    Text(note).font(.caption).foregroundStyle(current == SteamAppInfo.publicBranch ? Color.secondary : Color.orange)
+                }
+                if hasPrivate {
+                    if SteamBranch.code(appID) == nil {
+                        Button { code = ""; codeResult = nil; askingCode = true } label: {
+                            Label("Enter beta code", systemImage: "key")
+                        }.disabled(!steam.signedIn || checking)
+                    } else {
+                        Button("Remove beta code", role: .destructive) { choices.forgetCode(appID) }
+                    }
+                }
+                if checking { LabeledContent("Checking the beta code") { ProgressView() } }
+                if let codeResult { Text(codeResult).font(.caption).foregroundStyle(.secondary) }
+            }
+        }
+        .alert("Beta code", isPresented: $askingCode) {
+            TextField("Code", text: $code)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Check") { check() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The code the game's developer gave for a private beta, as in Steam's Betas tab. Steam checks it.")
+        }
+    }
+
+    /// "public" reads as Steam's own label; a beta shows its description when it has one.
+    static func label(_ branch: SteamAppInfo.Branch) -> String {
+        if branch.name == SteamAppInfo.publicBranch { return "Public (default)" }
+        return branch.description.isEmpty ? branch.name : "\(branch.name) – \(branch.description.prefix(60))"
+    }
+
+    private func note(_ current: String, branches: [SteamAppInfo.Branch]) -> String? {
+        let installed = installedBranch ?? SteamAppInfo.publicBranch
+        if installedBranch != nil, current != installed {
+            return current == SteamAppInfo.publicBranch
+                ? "Installed: \(installed). Download below goes back to the public build."
+                : "Installed: \(installed == SteamAppInfo.publicBranch ? "public" : installed). Download below switches to \(current)."
+        }
+        guard current != SteamAppInfo.publicBranch else { return nil }
+        if branches.contains(where: { $0.name == current && $0.passwordRequired }), SteamBranch.code(appID) == nil {
+            return "This beta needs its beta code."
+        }
+        return "A beta build: it can be unstable, and its saves may not work on the public build."
+    }
+
+    private func check() {
+        let typed = code
+        checking = true
+        codeResult = nil
+        Task { @MainActor in
+            defer { checking = false }
+            let (opened, problem) = await steam.enterBetaCode(typed, appID: appID)
+            if let problem {
+                codeResult = problem
+            } else if opened.isEmpty {
+                codeResult = "Steam did not accept that code for this game."
+            } else {
+                codeResult = "Opened: " + opened.joined(separator: ", ") + "."
+                if opened.count == 1 { choices.choose(appID, opened[0]) } else { choices.changed() }
+            }
+        }
+    }
+}
+
 // MARK: - DLC
 
 /// Tells the pages that show a game's DLC that a switch moved (SteamDLC keeps
@@ -1042,6 +1163,7 @@ struct SteamGameSheet: View {
                             .disabled(steam.downloads[appID] != nil || partial)
                         }
                         if item.installed == nil { SteamGameLanguagePicker(appID: appID) }
+                        if item.installed == nil { SteamBranchPicker(appID: appID) }
                         if item.installed == nil, let game = steam.game(appID) {
                             if let bytes = game.downloadBytes {
                                 LabeledContent("Download size", value: "About " + formatBytes(Int64(clamping: bytes)))
@@ -1083,6 +1205,7 @@ struct SteamGameSheet: View {
                 partial = steam.hasPartialDownload(appID)
                 freeSpace = SteamOwnedLibrary.drive.appendingPathComponent(target ?? steam.library(for: appID)).freeSpace
             }
+            .task(id: appID) { await steam.refreshBranches(appID) }
             .confirmationDialog("Cancel this download? Downloaded files are deleted.", isPresented: $confirmCancel, titleVisibility: .visible) {
                 Button("Cancel download", role: .destructive) {
                     steam.cancelInstall(appID, installed: games.games.contains { $0.id == appID })
@@ -1335,6 +1458,7 @@ struct SteamEntrySection: View {
     @ObservedObject private var games = SteamGamesModel.shared
     @ObservedObject private var languageChoices = SteamGameLanguageChoices.shared
     @ObservedObject private var dlcChoices = SteamDLCChoices.shared
+    @ObservedObject private var branchChoices = SteamBranchChoices.shared
     @State private var confirmUninstall = false
     @State private var freeSpace: Int64?
     /// "The game": the install folder's programs (the Program picker) and whether
@@ -1414,7 +1538,7 @@ struct SteamEntrySection: View {
                 case .active, .queued: Button("Pause update") { steam.pause(appID) }
                 case .paused, .failed: Button("Resume update") { steam.install(appID) }
                 }
-            } else if downloads, steam.updateAvailable(appID: appID, installedBuild: games.builds[appID]) {
+            } else if downloads, steam.updateAvailable(appID: appID, installedBuild: games.builds[appID], installedBranch: games.branches[appID]) {
                 Button { steam.install(appID) } label: { Label("Update available — download", systemImage: "arrow.down.circle") }
                     .disabled(!steam.signedIn)
             }
@@ -1427,6 +1551,19 @@ struct SteamEntrySection: View {
                         Label("Download in \(SteamLanguage.name(wanted))", systemImage: "character.bubble")
                     }.disabled(!steam.signedIn)
                     Text("Adds the game's \(SteamLanguage.name(wanted)) content and tells Steam to start it in that language. Files of the current language are kept.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if downloads {
+                let installedBranch = games.branches[appID] ?? SteamAppInfo.publicBranch
+                SteamBranchPicker(appID: appID, installedBranch: installedBranch)
+                let chosen = SteamBranch.chosen(appID)
+                if download == nil, chosen != installedBranch {
+                    Button { steam.install(appID) } label: {
+                        Label(chosen == SteamAppInfo.publicBranch ? "Download the public build" : "Download \(chosen)",
+                              systemImage: "arrow.triangle.branch")
+                    }.disabled(!steam.signedIn)
+                    Text("Files that match are kept; only what differs is downloaded. Steam then starts the game on this version.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -1492,6 +1629,7 @@ struct SteamEntrySection: View {
         }
         .task(id: "\(entry.steamStart ?? "dock") \(installed?.installed == true) \(download == nil)") { await resolveProgram() }
         .task(id: "\(installed?.installed == true) \(download == nil) \(games.builds[appID] ?? 0)") { await loadDLC() }
+        .task(id: appID) { if downloads { await steam.refreshBranches(appID) } }
         .confirmationDialog("Uninstall \(entry.title)? Its downloaded files are deleted from where it is installed. Saves stored elsewhere are kept.",
                             isPresented: $confirmUninstall, titleVisibility: .visible) {
             Button("Uninstall", role: .destructive) {

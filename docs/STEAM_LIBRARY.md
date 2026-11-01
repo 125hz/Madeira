@@ -256,6 +256,45 @@ Dock, takes the recorded DLC as installed without downloading it again, and DLC
 whose files live in the DLC's own product info rather than the game's (listed
 as **No download** for now).
 
+## Version (beta branches)
+
+A game's **Version** picker, on its download sheet and in the Steam section of
+its Game details page, works like the Betas tab of Valve's client. It lists
+**Public (default)** and the game's beta branches (`depots.branches`, with
+their descriptions). A password-protected beta (`pwdrequired`) shows up once
+its code was entered with **Enter beta code**: Steam checks the code
+(`ClientCheckAppBetaPassword`) and names the private branches it opens. The
+code and those names are kept per game in the app's defaults
+(`steam-beta-codes`, `steam-beta-unlocked`; **Remove beta code** forgets them
+and puts a chosen private branch back to public). The choice is kept in
+`steam-branches` (`SteamBranch`) and applies to the game's next download,
+update or repair. On an installed game whose record names another branch,
+**Download <branch>** (or **Download the public build**) switches it: files that
+match are kept and only what differs is fetched.
+
+A download asks for the chosen branch (`SteamLibraryFetcher.applyBranch`). A
+beta takes each depot's manifest for the branch (`manifests.<branch>`), and the
+public one for a depot the beta does not change, as Valve's client does; the
+manifest request code names the branch for a depot with its own beta manifest
+(`app_branch`). For a password-protected beta, the code is checked again and
+Steam's private depot section (`ClientPICSPrivateBeta`, binary KeyValues) gives
+the branch's manifests; without a code Steam accepts, the download stops with
+"needs a beta code" instead of taking the public build. A branch Steam no
+longer lists falls back to public. The install record states the branch's
+build and names the branch as `BetaKey` in `UserConfig` and `MountedConfig`,
+as Valve's client writes it, so the client keeps the game on that branch; the
+update badge compares against the recorded branch's build.
+
+Log: `[steam-branch] app=<id> choice=<branch>`, `code=kept|removed private=<n>`,
+`code-check ... eresult=<n> private=<n>`, `private-depots ... eresult=<n>
+bytes=<n>`, `private-manifests=<n>`, `branch-gone=1 using=public`, and
+`branch=<name>` on `[steam-depot] selection`. The code itself is never logged.
+
+Not checked on a device yet: whether Valve's client, started through Madeira
+Dock, starts a password-protected beta install without asking for the code
+itself. "The game" (SteamDirectStart) still picks among the launch entries
+without a beta key.
+
 ## Downloads in the background
 
 On iOS 26 and later, a download submits a `BGContinuedProcessingTask` when it
@@ -296,7 +335,7 @@ result codes, never payloads or credentials).
 
 ## Logs
 
-`[steam-library]`, `[steam-depot]`, `[steam-dlc]`, `[steam-repair]`, `[steam-cdn]`,
+`[steam-library]`, `[steam-depot]`, `[steam-dlc]`, `[steam-branch]`, `[steam-repair]`, `[steam-cdn]`,
 `[steam-shared]`, `[steam-shared-record]`, `[steam-record]`, `[steam-playtime]`,
 `[steam-account]`, `[steam-games]`, `[steam-start]` (Start with: the mode,
 where the program came from, how many launch entries and programs) and
@@ -514,8 +553,8 @@ live Steam, VPN, TLS-handshake or device behaviour.
 
 ## Not included, and limits
 
-- No Steam Cloud, no achievements, no workshop content, no branch (beta)
-  selection: the public branch. DLC: see "DLC" above.
+- No Steam Cloud, no achievements, no workshop content. Beta branches: see
+  "Version (beta branches)" above. DLC: see "DLC" above.
 - A file that a newer build no longer contains is not deleted by an update
   (the install keeps it); **Uninstall** removes the whole folder.
 - Only the account's licenses are read; family sharing and free-on-demand

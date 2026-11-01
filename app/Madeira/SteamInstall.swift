@@ -47,6 +47,15 @@ enum SteamInstallFiles {
         return language.lowercased()
     }
 
+    /// The beta branch the install record names (`UserConfig.BetaKey`, as
+    /// Madeira's downloads and Valve's client write it), or nil for public.
+    static func betaKey(appID: Int, steamApps: URL) -> String? {
+        guard let state = record(appID: appID, steamApps: steamApps),
+              let key = (state["MountedConfig"]?["BetaKey"] ?? state["UserConfig"]?["BetaKey"])?.string,
+              !key.isEmpty, key.lowercased() != "public", key.utf8.count <= 64 else { return nil }
+        return key
+    }
+
     /// The depots the install record holds: its own (`InstalledDepots`) and
     /// those shared from other apps (`SharedDepots`).
     static func depots(appID: Int, steamApps: URL) -> Set<Int> {

@@ -91,7 +91,7 @@ final class DepotDownloader {
         let depots = app.installDepots(ownedDLC: ownedDLC)
         guard !depots.isEmpty else { throw SteamError.depotNotFound(app.appID) }
         // Before the key requests, so a refused depot still has its selection logged.
-        SteamLog.event("[steam-depot] selection app=\(app.appID) build=\(app.buildID) language=\(app.depotLanguage)/\(app.gameLanguage) \(app.depotSelectionSummary(ownedDLC: ownedDLC))")
+        SteamLog.event("[steam-depot] selection app=\(app.appID) build=\(app.branchBuildID) branch=\(app.branch) language=\(app.depotLanguage)/\(app.gameLanguage) \(app.depotSelectionSummary(ownedDLC: ownedDLC))")
 
         let folderName = SteamInstallFiles.safeFolderName(app.installDir.isEmpty ? "app_\(app.appID)" : app.installDir)
         let installURL = steamApps.appendingPathComponent("common", isDirectory: true)
@@ -119,7 +119,7 @@ final class DepotDownloader {
         var accountID: UInt64 = 0
         for depot in depots {
             try Task.checkCancellation()
-            guard let gid = depot.publicManifestID else { continue }
+            guard let gid = depot.manifestID(app.branch) else { continue }
             let key: Data
             do {
                 key = try await depotKey(depotID: depot.depotID, appID: app.appID)
@@ -140,8 +140,10 @@ final class DepotDownloader {
             }
             if session.steamID != 0 { accountID = session.steamID }
             let contentAppID = !app.freeToDownload ? (depot.fromApp ?? app.appID) : app.appID
+            // A beta's own manifest is requested under its branch name.
             let manifest = try await fetchManifest(depotID: depot.depotID, appID: contentAppID,
-                                                   manifestGID: gid, key: key, hosts: hosts)
+                                                   manifestGID: gid, key: key, hosts: hosts,
+                                                   branch: depot.hasOwnManifest(app.branch) ? app.branch : nil)
             var auth: [String: String] = [:]
             for host in pool {
                 auth[host] = await cdnAuthFragment(depotID: depot.depotID, appID: contentAppID, host: host)
@@ -296,11 +298,11 @@ final class DepotDownloader {
         }
         if !custom.isEmpty { SteamLog.event("[steam-record] custom-executables app=\(app.appID) custom=\(custom.count)") }
         try AppManifestWriter.writeManifest(
-            appID: app.appID, name: app.name, installDir: folderName, buildID: app.buildID,
+            appID: app.appID, name: app.name, installDir: folderName, buildID: app.branchBuildID,
             steamID: accountID, sizeOnDisk: prepared.totalUncompressed,
             steamAppsPath: steamApps.path, installedDepots: own,
             sharedDepots: shared.map { ($0.depotID, Int(owners[UInt32($0.depotID)]!)) },
-            customExecutables: custom, language: app.gameLanguage)
+            customExecutables: custom, language: app.gameLanguage, betaKey: app.branch)
         if !shared.isEmpty {
             var written = 0, skipped = 0
             for ownerID in Set(owners.values).sorted() {
@@ -612,8 +614,8 @@ final class DepotDownloader {
     // MARK: - Manifest
 
     private func fetchManifest(depotID: UInt32, appID: UInt32, manifestGID: UInt64,
-                               key: Data, hosts: [String]) async throws -> DepotManifest {
-        let requestCode = try await manifestRequestCode(depotID: depotID, appID: appID, manifestGID: manifestGID)
+                               key: Data, hosts: [String], branch: String? = nil) async throws -> DepotManifest {
+        let requestCode = try await manifestRequestCode(depotID: depotID, appID: appID, manifestGID: manifestGID, branch: branch)
         var lastError: Error = SteamError.manifestFetchFailed("No content server returned the manifest.")
         for host in hosts.prefix(6) {
             try Task.checkCancellation()
@@ -741,12 +743,14 @@ final class DepotDownloader {
 
     // MARK: - Manifest Request Code
 
-    private func manifestRequestCode(depotID: UInt32, appID: UInt32, manifestGID: UInt64) async throws -> UInt64 {
+    private func manifestRequestCode(depotID: UInt32, appID: UInt32, manifestGID: UInt64, branch: String? = nil) async throws -> UInt64 {
         try await session.ensureConnected()
         var encoder = ProtobufEncoder()
         encoder.writeUInt32(fieldNumber: 1, value: appID)
         encoder.writeUInt32(fieldNumber: 2, value: depotID)
         encoder.writeUInt64(fieldNumber: 3, value: manifestGID)
+        // app_branch: a beta's manifest is issued under its branch.
+        if let branch, branch != SteamAppInfo.publicBranch { encoder.writeString(fieldNumber: 4, value: branch) }
 
         let responseData = try await session.callServiceMethod(
             method: .getManifestRequestCode,
