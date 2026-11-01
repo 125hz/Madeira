@@ -162,8 +162,11 @@ and check-frontend fails if a setting is hidden from it. A profile holds:
   when DXMT has its 40 FPS cap (`madeira_dxmt_has_40_cap`) and the panel reaches
   120 Hz, which is held while it runs (25 ms is three 120 Hz refreshes but
   rounds to 33 ms at 60 Hz); a saved 40 runs as 60 otherwise;
-- reduced-precision x87: off by default, as in FEX; only an explicit choice
-  exports `FEX_X87REDUCEDPRECISION=1`;
+- x87 precision: Automatic by default, which exports nothing, so FEX's own
+  default applies (reduced precision for 32-bit games, ml950, full for 64-bit
+  ones) along with any madeira.cfg line; Reduced exports
+  `FEX_X87REDUCEDPRECISION=1`, Full exports `0`. Full precision on a 32-bit
+  game costs 20-50 % of its CPU (Fallout: New Vegas fell to about 15 FPS);
 - **AVX and AVX2**: off by default, as in FEX's iOS build; only an explicit
   choice exports `MADEIRA_FEX_AVX=1`, which makes the ARM64EC FEX module report
   and emulate AVX/AVX2 for a game built for AVX processors (64-bit games; WOW64

@@ -190,9 +190,27 @@ struct LibraryEntry: Codable, Identifiable {
     var display: String?
     /// FPS limit: 1 = 60, 3 = 30, 4 = 40, 0 = display maximum, 2 = uncapped (madeira_set_vsync_locked).
     var fpsMode = 1
-    /// FEX's X87ReducedPrecision for this game. Export both states explicitly:
-    /// FEX defaults to reduced precision when no override is set.
+    /// FEX's X87ReducedPrecision for this game: true exports 1 (reduced, fast).
+    /// false leaves the engine's default unless `fullX87` asks for full precision:
+    /// the 32-bit (WOW64) module runs reduced by default (ml950: full precision
+    /// cost Fallout: New Vegas 20-50 % of its CPU and about half its frame rate),
+    /// the 64-bit one full. Saved entries all carry false, so "false" has to mean
+    /// the engine's default, not "full": exporting 0 for it (upstream #461) put
+    /// every 32-bit game on the slow path.
     var reducedX87 = false
+    /// Full 80-bit x87 for this game (exports 0), chosen on the Compatibility page;
+    /// nil = the engine's default. Ignored when reducedX87 is on.
+    var fullX87: Bool?
+
+    /// The Compatibility page's x87 choice over reducedX87 and fullX87.
+    enum X87Precision: String, CaseIterable { case automatic, reduced, full }
+    var x87Precision: X87Precision {
+        get { reducedX87 ? .reduced : (fullX87 == true ? .full : .automatic) }
+        set {
+            reducedX87 = newValue == .reduced
+            fullX87 = newValue == .full ? true : nil
+        }
+    }
     var liveLogs = false
     var performance = false
     var touchControls = false
@@ -729,7 +747,14 @@ struct LibraryEntry: Codable, Identifiable {
         configureLaunch()
         // MADEIRA_ARGS now holds an Epic game's sign-in code; nothing else needs it.
         Self.setTransientArguments(nil, for: id)
-        setenv("FEX_X87REDUCEDPRECISION", reducedX87 ? "1" : "0", 1)
+        // x87: exported only when chosen. Automatic leaves FEX's own default (reduced
+        // for 32-bit games, full for 64-bit) and any madeira.cfg line, and clears a
+        // previous game's choice.
+        switch x87Precision {
+        case .reduced: setenv("FEX_X87REDUCEDPRECISION", "1", 1)
+        case .full: setenv("FEX_X87REDUCEDPRECISION", "0", 1)
+        case .automatic: unsetenv("FEX_X87REDUCEDPRECISION")   // madeira.cfg's line, if any, comes later (WineProcessBridge per_launch)
+        }
         // Exported only when chosen: unset keeps the engine's own default (and any
         // madeira.cfg setting), as before these choices existed.
         // Unset otherwise, so a previous game's choice (a launch that died before the
@@ -3917,7 +3942,13 @@ struct LibraryDetail: View {
 
     @ViewBuilder private var compatibilityPage: some View {
         Section {
-            Toggle(isOn: $entry.reducedX87) { compatLabel("Reduced-precision x87", "Faster, less accurate") }
+            Picker(selection: $entry.x87Precision) {
+                Text("Automatic").tag(LibraryEntry.X87Precision.automatic)
+                Text("Reduced (faster)").tag(LibraryEntry.X87Precision.reduced)
+                Text("Full (accurate)").tag(LibraryEntry.X87Precision.full)
+            } label: {
+                compatLabel("x87 precision", "Automatic is fast for 32-bit games and accurate for 64-bit ones. Full can halve a 32-bit game's frame rate.")
+            }
             Toggle(isOn: Binding(get: { entry.largeReservations ?? false }, set: { entry.largeReservations = $0 ? true : nil })) {
                 compatLabel("Large memory reservations", "For requests of 64 GB or more. Backs up to 16 GB by default.")
             }
