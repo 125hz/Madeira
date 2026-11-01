@@ -1052,6 +1052,14 @@ OVERLAY = {
                         "D3DKMTQueryAdapterInfo answers like a WDDM 3.1 driver (driver version, caps, device ids, "
                         "memory, performance data). Off (default): no adapter is listed, as before. Read at "
                         "session start."},
+    # The registry's Fonts values for C:\windows\Fonts (wine dlls/win32u/font.c, update_external_font_keys).
+    "env.MADEIRA_FONT_KEYS_REPAIR": {"category": "Windows, display & input", "title": "Repair the registry's font list",
+                "kind": "bool", "default": "1",
+                "note": "On (default): a session that found no fonts leaves the registry's Fonts key alone, stale "
+                        "external entries that name a font of C:\\windows\\Fonts are dropped, and the Windows "
+                        "directory's fonts get their Fonts values back (DirectWrite lists only those, so without "
+                        "them embedded browsers crash and dialogs draw no text). 0: upstream Wine's font key "
+                        "update. Read at session start."},
     # madeira-bcd: the ARM64EC JIT's boundary with native code (FEX, the jit-boundary change of this wave; all on by default).
     "env.MADEIRA_FEX_CALLRET_ELIDE": {"category": "x86 emulation (FEX)", "title": "64-bit JIT without the call-return shadow stack",
                 "kind": "bool", "default": "1",
