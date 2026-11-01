@@ -50,6 +50,8 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
     /// Steam states no size.
     var downloadBytes: UInt64?
     var installBytes: UInt64?
+    /// The game has a Steam Workshop (SteamAppInfo.workshopVisible); nil in older caches.
+    var workshop: Bool?
     /// The DLC the account owns for the game (SteamOwnedDLC), by name; nil in
     /// older caches, whose downloads then take no DLC until the next refresh.
     var dlc: [SteamOwnedDLC]?
@@ -77,6 +79,7 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
         let download = info.downloadSize(for: "windows"), install = info.installSize(for: "windows")
         downloadBytes = download > 0 ? download : nil
         installBytes = install > 0 ? install : nil
+        workshop = info.workshopVisible
         dlc = SteamOwnedDLC.list(for: info, owned: ownedDLC)
         branches = info.branches
     }
@@ -560,6 +563,34 @@ final class SteamOwnedLibrary: ObservableObject {
         } catch {
             SteamLog.event("[steam-playtime] unavailable reason=\(Self.reason(error))")
         }
+    }
+
+    // MARK: Steam Workshop (docs/STEAM_WORKSHOP.md)
+
+    /// Off with `env.MADEIRA_STEAM_WORKSHOP = 0`: no Workshop page or area.
+    static var workshopEnabled: Bool { enabled && SteamSignIn.flag("MADEIRA_STEAM_WORKSHOP", default: true) }
+    /// Workshop calls use the app's own connection: signed in, and no game
+    /// session holds the account (Valve's client has it then).
+    var workshopReady: Bool { Self.workshopEnabled && signedIn && !inSession }
+    /// The logged-on account's ID (the low half of its SteamID), as Valve's
+    /// client records it beside an item it keeps for that account.
+    var workshopAccountID: UInt32 { UInt32(truncatingIfNeeded: session.steamID) }
+
+    /// One PublishedFile call (SteamWorkshop.swift). `body` gets the account's SteamID.
+    func workshopCall(_ method: SteamServiceMethod, timeout: TimeInterval = 20,
+                      body: (UInt64) -> Data) async throws -> (eresult: Int32, body: Data) {
+        guard workshopReady else { throw SteamError.disconnected }
+        try await session.ensureConnected()
+        return try await session.callServiceMethodWithResult(method: method, body: body(session.steamID), timeout: timeout)
+    }
+
+    /// Downloads one Workshop item's content into its folder (DepotDownloader).
+    func downloadWorkshopItem(appID: UInt32, itemID: UInt64, manifestGID: UInt64, into folder: URL, journalDir: URL,
+                              progress: @escaping (SteamDownloadProgress) -> Void) async throws -> UInt64 {
+        guard workshopReady else { throw SteamError.disconnected }
+        try await session.ensureConnected()
+        return try await downloader.installWorkshopItem(appID: appID, itemID: itemID, manifestGID: manifestGID,
+                                                        into: folder, journalDir: journalDir, progress: progress)
     }
 
     // MARK: Steam Cloud (docs/STEAM_CLOUD.md)
@@ -1108,6 +1139,7 @@ final class SteamOwnedLibrary: ObservableObject {
             for id in queue { resumeAfterSession.insert(id); downloads[id]?.state = .paused }
             queue.removeAll()
             gate.close()
+            SteamWorkshopModel.shared.stopForSession()
             SteamLog.event("[steam-depot] paused for a game session count=\(resumeAfterSession.count)")
         } else {
             // Madeira Dock may still hold the account (dockEnded() releases it).

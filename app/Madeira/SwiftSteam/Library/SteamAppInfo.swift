@@ -28,6 +28,8 @@ struct SteamAppInfo {
     var libraryHero: String?
     var headerImage: String?
     var parentID: UInt32?
+    /// The app has a Steam Workshop (`common.workshop_visible`).
+    var workshopVisible = false
     /// Steam's launch configuration (`config.launch`), in Steam's order.
     /// SteamDirectStart and Madeira Dock select an installed Windows entry;
     /// Dock passes its original key to Valve's client.
@@ -369,6 +371,7 @@ struct SteamAppInfo {
             info.type = AppType(pics: common["type"] as? String ?? "")
             info.oslist = common["oslist"] as? String ?? ""
             info.freeToDownload = (common["freetodownload"] as? String) == "1"
+            info.workshopVisible = (common["workshop_visible"] as? String) == "1"
             // Artwork names, English first, else any language.
             func asset(_ node: Any?) -> String? {
                 guard let languages = node as? [String: Any] else { return nil }

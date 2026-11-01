@@ -191,6 +191,8 @@
 		5A864326ABA078F978B4C2F1 /* MemoryHostTest.m in Sources */ = {isa = PBXBuildFile; fileRef = B31D214EB6F64F7E730134B5 /* MemoryHostTest.m */; };
 		A30972F13DC1D583109676F1 /* MemoryHost.m in Sources */ = {isa = PBXBuildFile; fileRef = 5AD9AA30E0294BF16811DD39 /* MemoryHost.m */; };
 		33A1199863C98CF2679931F9 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6D1BE8A3B1F0B4C1A8E2D9F0 /* Foundation.framework */; };
+		A1005C0F /* SteamWorkshopFiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2005C0F /* SteamWorkshopFiles.swift */; };
+		A1005C0E /* SteamWorkshop.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2005C0E /* SteamWorkshop.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -451,6 +453,8 @@
 		B31D214EB6F64F7E730134B5 /* MemoryHostTest.m */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.objc; path = MemoryHostTest.m; sourceTree = "<group>"; };
 		D80FB04E72418784BED70CF4 /* MadeiraMemoryHost.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MadeiraMemoryHost.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		6D1BE8A3B1F0B4C1A8E2D9F0 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+		A2005C0F /* SteamWorkshopFiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamWorkshopFiles.swift; sourceTree = "<group>"; };
+		A2005C0E /* SteamWorkshop.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamWorkshop.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -651,6 +655,8 @@
 				A200000A /* EntitlementChecker.swift */,
 				A2000036 /* StikJITHelper.swift */,
 				A2000980 /* JITPoolMeter.swift */,
+				A2005C0F /* SteamWorkshopFiles.swift */,
+				A2005C0E /* SteamWorkshop.swift */,
 				B2000001 /* JITSetup.swift */,
 				B2000050 /* JITNetwork.swift */,
 				B2000002 /* JITBuiltInHost.swift */,
@@ -1072,6 +1078,8 @@
 				C1000F01 /* PhonePointer.m in Sources */,
 				A1000035 /* StikJITHelper.swift in Sources */,
 				A1000980 /* JITPoolMeter.swift in Sources */,
+				A1005C0F /* SteamWorkshopFiles.swift in Sources */,
+				A1005C0E /* SteamWorkshop.swift in Sources */,
 				B1000001 /* JITSetup.swift in Sources */,
 				B1000050 /* JITNetwork.swift in Sources */,
 				B1000002 /* JITBuiltInHost.swift in Sources */,

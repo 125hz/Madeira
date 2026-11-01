@@ -469,6 +469,7 @@ struct SteamGamesSection: View {
     @AppStorage("madeiraSteamShowUninstalled") private var showUninstalled = true
     @State private var selected: SteamGameSelection?
     @State private var showSignIn = false
+    @State private var showWorkshop = false
 
     /// MADEIRA_LIBRARY_COLLAPSE=0: the section titles do not collapse.
     static var collapsible: Bool { MadeiraConfig.flag("MADEIRA_LIBRARY_COLLAPSE") }
@@ -533,6 +534,13 @@ struct SteamGamesSection: View {
                     LibrarySectionHeader(title: "Steam", count: installed.count,
                                          collapsed: collapsible ? $hideInstalled : nil) {
                         if steam.refreshing { ProgressView().accessibilityLabel("Refreshing Steam library") }
+                        // The Workshop area: every installed game's Workshop items (SteamWorkshop.swift).
+                        if SteamOwnedLibrary.workshopEnabled && signedIn && !installed.isEmpty {
+                            Button { showWorkshop = true } label: {
+                                Label("Workshop", systemImage: "square.stack.3d.up").font(.subheadline)
+                            }
+                            .accessibilityLabel("Steam Workshop")
+                        }
                     }
                     // Signed out: the account's games need a sign-in; say so here rather
                     // than hiding the section until someone finds Settings › Steam.
@@ -604,6 +612,7 @@ struct SteamGamesSection: View {
             }
         }
         .sheet(isPresented: $showSignIn) { SteamSignInView() }
+        .sheet(isPresented: $showWorkshop) { SteamWorkshopHub() }
         .alert("Steam", isPresented: Binding(get: { steam.error != nil }, set: { if !$0 { steam.error = nil } })) {
             Button("OK", role: .cancel) { steam.error = nil }
         } message: { Text(steam.error ?? "") }

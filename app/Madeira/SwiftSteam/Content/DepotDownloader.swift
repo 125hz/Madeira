@@ -981,3 +981,81 @@ extension URL {
         return nil
     }
 }
+
+// MARK: - Steam Workshop items
+
+extension DepotDownloader {
+    /// Downloads one Steam Workshop item stored as content (its
+    /// `hcontent_file`): Valve's client keeps an app's Workshop items in the
+    /// app's own depot (depot ID = app ID), each item one manifest of it. The
+    /// files go into `folder` (steamapps/workshop/content/<app>/<item>), with
+    /// the same journal, check and chunk path as a game. Returns the item's
+    /// size on disk. SteamWorkshop.swift writes the install record.
+    func installWorkshopItem(appID: UInt32, itemID: UInt64, manifestGID: UInt64, into folder: URL,
+                             journalDir: URL,
+                             progress report: @escaping (SteamDownloadProgress) -> Void) async throws -> UInt64 {
+        var state = SteamDownloadProgress()
+        report(state)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: journalDir, withIntermediateDirectories: true)
+        let hosts: [String]
+        if let provider = contentHosts { hosts = try await provider(appID) } else { hosts = try await contentServers(appID: appID) }
+        guard !hosts.isEmpty else { throw SteamError.chunkDownloadFailed("No content servers are available.") }
+        let key = try await depotKey(depotID: appID, appID: appID)
+        let manifest = try await fetchManifest(depotID: appID, appID: appID, manifestGID: manifestGID, key: key, hosts: hosts)
+        let pool = Array(hosts.prefix(hostPoolSize))
+        var auth: [String: String] = [:]
+        for host in pool { auth[host] = await cdnAuthFragment(depotID: appID, appID: appID, host: host) }
+        let plan = DepotPlan(depotID: appID, manifestGID: manifestGID, key: key, manifest: manifest, hosts: pool, auth: auth,
+                             declaredSize: manifest.totalUncompressedSize, health: ContentHostHealth(), installURL: folder)
+        let prepared = try await Task.detached(priority: .userInitiated) {
+            try Self.prepare(plans: [plan], journalDir: journalDir)
+        }.value
+        state.totalBytes = prepared.totalBytes
+        state.doneBytes = prepared.doneBytes
+        state.phase = .downloading
+        report(state)
+        SteamLog.event("[steam-workshop] download begin app=\(appID) item=\(itemID) files=\(prepared.fileCount) bytes=\(prepared.totalUncompressed)")
+        if let free = folder.freeSpace, UInt64(free) < prepared.remainingUncompressed {
+            throw SteamError.insufficientDiskSpace(needed: prepared.remainingUncompressed, available: UInt64(free))
+        }
+        var work = prepared.pending
+        try await checkExisting(plans: [plan], prepared: prepared, work: &work, state: &state, report: report)
+        let journal = try JournalWriter(url: prepared.journals[0])
+        defer { journal.close() }
+        let items = work[0], paths = prepared.paths[0], attempts = attemptsPerChunk
+        let started = Date(), resumedBytes = state.doneBytes
+        var lastReport = Date.distantPast
+        try await withThrowingTaskGroup(of: (UInt64, UInt64).self) { group in
+            var next = 0
+            func enqueue() {
+                guard next < items.count else { return }
+                let item = items[next]; next += 1
+                let chunk = plan.manifest.files[item.file].chunks[item.chunk]
+                let path = paths[item.file]
+                group.addTask {
+                    try await Self.fetchChunk(chunk, plan: plan, path: path, attempts: attempts, seed: item.file &+ item.chunk)
+                    return (item.key, UInt64(chunk.compressedSize))
+                }
+            }
+            for _ in 0..<min(maxConcurrentChunks, items.count) { enqueue() }
+            for try await (key, bytes) in group {
+                journal.append(key)
+                state.doneBytes += bytes
+                let now = Date()
+                if now.timeIntervalSince(lastReport) >= 0.25 {
+                    lastReport = now
+                    let elapsed = now.timeIntervalSince(started)
+                    if elapsed > 1 { state.bytesPerSecond = Double(state.doneBytes &- resumedBytes) / elapsed }
+                    report(state)
+                }
+                enqueue()
+            }
+        }
+        state.phase = .finishing
+        report(state)
+        try? FileManager.default.removeItem(at: journalDir)
+        SteamLog.event("[steam-workshop] download complete app=\(appID) item=\(itemID) bytes=\(prepared.totalUncompressed) seconds=\(Int(Date().timeIntervalSince(started)))")
+        return prepared.totalUncompressed
+    }
+}
