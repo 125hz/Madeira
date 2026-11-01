@@ -885,7 +885,12 @@ struct SteamDownloadStatus: View {
         case .failed(let message): return message
         case .active:
             switch p.phase {
-            case .preparing: return "Preparing download…"
+            case .preparing:
+                switch p.step {
+                case .start: return "Preparing download…"
+                case .fileList: return "Getting the game's file list from Steam…"
+                case .files: return "Looking over the game's files…"
+                }
             case .checking:
                 let done = p.checkTotal > 0 ? Int(Double(p.checkDone) / Double(p.checkTotal) * 100) : 0
                 return "Checking files already there: \(done)% · \(formatBytes(Int64(p.checkDone))) of \(formatBytes(Int64(p.checkTotal)))"

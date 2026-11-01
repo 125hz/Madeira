@@ -1443,6 +1443,9 @@ final class SteamOwnedLibrary: ObservableObject {
                 SteamLog.event("[steam-depot] failed app=\(appID) reason=drive-missing")
                 outcome = .failed(message)
             } else {
+                // Refused by the content servers: Try again asks Steam for new authorization.
+                if case SteamError.contentHTTP(let status) = error, status == 401 || status == 403 { downloader.forgetAuthorization() }
+                if case SteamError.contentRefused = error { downloader.forgetAuthorization() }
                 downloads[appID]?.state = .failed(SteamSignIn.message(error))
                 SteamLog.event("[steam-depot] failed app=\(appID) reason=\(Self.reason(error))")
                 outcome = .failed(SteamSignIn.message(error))
@@ -1470,6 +1473,8 @@ final class SteamOwnedLibrary: ObservableObject {
         case SteamError.chunkDecodeFailed(let format): return "decode-\(format)"
         case SteamError.manifestFetchFailed: return "manifest"
         case SteamError.chunkDownloadFailed: return "chunk"
+        case SteamError.contentHTTP(let status): return "http-\(status)"
+        case SteamError.contentRefused(let status): return "refused-\(status)"
         case let url as URLError: return "url-\(url.code.rawValue)"
         default: return String(describing: type(of: error))
         }
