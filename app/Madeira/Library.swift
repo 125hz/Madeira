@@ -3280,6 +3280,7 @@ struct LibraryView: View {
             }
             if settingsShow(".NET", "Mono", "Wine Mono", "framework", "download") { WineMonoSettingsSection() }
             if VCRedistModel.enabled, settingsShow("Visual C++", "C++", "runtime", "redist", "vcredist", "download") { VCRedistSettingsSection() }
+            if settingsShow("Gecko", "Wine Gecko", "web", "HTML", "Internet Explorer", "download") { WineGeckoSettingsSection() }
             if settingsShow("saves", "backup", "restore", "save games") { SavesSection() }
             if settingsShow("external", "drive", "USB", "SSD", "storage") { ExternalDrivesSection() }
             if settingsShow("appearance", "liquid metal", "metal", "glass") {
