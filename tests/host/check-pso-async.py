@@ -87,10 +87,11 @@ check('compute stays where it is first used (no async in mad_cpso_realize caller
 check('catalog: pso-async, default 0, Direct3D 12',
       re.search(r'key: "pso-async", title: "", kind: \.int, defaultValue: "0", category: "Direct3D 12"', catalog) is not None)
 
+# The version that took pso-async = 1, and every later one.
 for ident, version in (('gta5e-steam', 7), ('gta5e-other', 6)):
     m = re.search(r'id: "%s", title: "[^"]+", version: (\d+),\n\s*config: """\n(.*?)"""' % ident, recs, re.S)
-    check('%s version %d carries pso-async = 1' % (ident, version),
-          m is not None and int(m.group(1)) == version and '\n        pso-async = 1\n' in m.group(2))
+    check('%s version %d or later carries pso-async = 1' % (ident, version),
+          m is not None and int(m.group(1)) >= version and '\n        pso-async = 1\n' in m.group(2))
 
 # --- FPS readouts --------------------------------------------------------------
 nd = body(winios, '- (nullable id<CAMetalDrawable>)nextDrawable')
