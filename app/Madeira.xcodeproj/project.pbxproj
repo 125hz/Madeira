@@ -41,6 +41,7 @@
 		A1000715 /* DockGameSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000715 /* DockGameSession.swift */; };
 		A1000712 /* VCRedist.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000712 /* VCRedist.swift */; };
 		A1000713 /* CabinetReader.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000713 /* CabinetReader.c */; };
+		A10007A1 /* SettingsPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20007A1 /* SettingsPages.swift */; };
 		A1000602 /* SteamDownloadBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000602 /* SteamDownloadBackground.swift */; };
 		A1008B01 /* BackgroundRun.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2008B01 /* BackgroundRun.swift */; };
 		A1000600 /* SteamInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000600 /* SteamInstall.swift */; };
@@ -293,6 +294,7 @@
 		A2000712 /* VCRedist.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "VCRedist.swift"; sourceTree = "<group>"; };
 		A2000713 /* CabinetReader.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = CabinetReader.c; sourceTree = "<group>"; };
 		A2000714 /* CabinetReader.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = CabinetReader.h; sourceTree = "<group>"; };
+		A20007A1 /* SettingsPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SettingsPages.swift"; sourceTree = "<group>"; };
 		A2000602 /* SteamDownloadBackground.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamDownloadBackground.swift"; sourceTree = "<group>"; };
 		A2008B01 /* BackgroundRun.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundRun.swift; sourceTree = "<group>"; };
 		A2000600 /* SteamInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamInstall.swift"; sourceTree = "<group>"; };
@@ -593,6 +595,7 @@
 				A2000712 /* VCRedist.swift */,
 				A2000713 /* CabinetReader.c */,
 				A2000714 /* CabinetReader.h */,
+				A20007A1 /* SettingsPages.swift */,
 				A2000602 /* SteamDownloadBackground.swift */,
 				A2008B01 /* BackgroundRun.swift */,
 				A2000600 /* SteamInstall.swift */,
@@ -1026,6 +1029,7 @@
 				A1000715 /* DockGameSession.swift in Sources */,
 				A1000712 /* VCRedist.swift in Sources */,
 				A1000713 /* CabinetReader.c in Sources */,
+				A10007A1 /* SettingsPages.swift in Sources */,
 				A1000602 /* SteamDownloadBackground.swift in Sources */,
 				A1008B01 /* BackgroundRun.swift in Sources */,
 				A1000600 /* SteamInstall.swift in Sources */,

@@ -3185,7 +3185,7 @@ struct LibraryView: View {
                 .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
                 .tabItem { Image(systemName: "square.grid.2x2.fill").accessibilityLabel("Library") }
                 .tag(0)
-            settings
+            settingsTab
                 .tabItem { Image(systemName: "gearshape.fill").accessibilityLabel("Settings") }
                 .tag(1)
         }
@@ -3296,6 +3296,17 @@ struct LibraryView: View {
         let q = settingsSearch.trimmingCharacters(in: .whitespaces)
         return q.isEmpty || words.contains { $0.localizedCaseInsensitiveContains(q) || q.localizedCaseInsensitiveContains($0) }
     }
+    /// The Display and Memory and sync settings, on the long page and as pages.
+    static var runtimeSettingsShown: Bool { MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS") }
+    /// The Settings tab: its pages (SettingsPages.swift), or, while the search field holds
+    /// text or with env.MADEIRA_SETTINGS_PAGES = 0, the one long page below.
+    @ViewBuilder private var settingsTab: some View {
+        if SettingsPages.enabled, settingsSearch.trimmingCharacters(in: .whitespaces).isEmpty {
+            SettingsPagesList(startDock: startDock)
+        } else {
+            settings
+        }
+    }
     private var settings: some View {
         Form {
             // The status sits on the page, not in a card; JIT is enabled from the
@@ -3369,19 +3380,7 @@ struct LibraryView: View {
             }
             // Credits, last on the Settings page.
             if settingsShow("credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin", "Jesse", "JesseLovelace", "Dan Perks", "danperks", "bahacan16", "spitefulowl", "meshoklv", "TheHadesc") {
-                Section {
-                    MadeiraCredit(name: "Will Faust", handle: "willfaust", role: "Created Madeira")
-                    MadeiraCredit(name: "Nick", handle: "125hz", role: "32-bit game support, the game library and Madeira Dock")
-                    MadeiraCredit(name: "Jfishin", handle: "Jfishin", role: "The original native Steam sign-in, library and downloads")
-                    MadeiraCredit(name: "Jesse", handle: "JesseLovelace", role: "Steam Cloud saves, faster game launches, and fixes that let more games run")
-                    MadeiraCredit(name: "Dan Perks", handle: "danperks", role: "In-app JIT without StikDebug, and pairing without a computer")
-                    MadeiraCredit(name: "bahacan16", handle: "bahacan16", role: "Direct3D 12 and DXMT fixes, game launcher windows, per-game settings, PlayStation controllers, and save backups")
-                    MadeiraCredit(name: "spitefulowl", handle: "spitefulowl", role: "Wine and FEX runtime fixes, DXMT texture and memory fixes, audio, the swap tier, and library launch options")
-                    MadeiraCredit(name: "meshoklv", handle: "meshoklv", role: "Controller fixes for games that ship their own XInput or need focus, touch taps that stay off the mouse, and a crash-guard fix")
-                    MadeiraCredit(name: "TheHadesc", handle: "TheHadesc", role: "Madeira Dock starts for games whose Steam launch entries do not start at zero, and a touch gamepad that survives the in-game keyboard")
-                } header: { Text("Credits") } footer: {
-                    Text("Madeira is built on Wine, FEX-Emu, DXMT by Feifan He (3Shain) with the Direct3D 9 frontend by David Acevedo (dacevedo12), rpmalloc by Mattias Jansson, StikDebug, StikJIT and idevice. Thank you to everyone who contributes to these projects.")
-                }
+                SettingsCreditsSection()
             }
         }
         .alert("Restart Madeira", isPresented: $restartNotice) {
