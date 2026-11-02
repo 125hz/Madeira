@@ -1372,7 +1372,15 @@ static void *ios_pool_warmer_thread( void *arg )
              * walk is tens of thousands of kernel calls. */
             if (cycle == 2 || (cycle % ios_warmer_sweep_cycles()) == 0)
             {
-                struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
+                struct { unsigned long long base, size, dirty, res, swap; unsigned tag; int tier; } top[12];
+                /* Which tier holds the memory iOS compressed: donor RAM, the swap file
+                 * or neither (ios_swap_tier_at); the guest band's anonymous part apart. */
+                extern unsigned ios_swap_tier_snapshot( void );
+                extern int ios_swap_tier_at( unsigned long long addr );
+                static const char *tier_name[3] = { "anon", "file", "donor" };
+                unsigned long long tier_dirty[3] = {0}, tier_res[3] = {0}, tier_swap[3] = {0};
+                unsigned long long guest_anon_dirty = 0, guest_anon_res = 0, guest_anon_swap = 0;
+                unsigned tier_extents = ios_swap_tier_snapshot();
                 unsigned long long dirty_by_tag[256];
                 /* ml677: DIRTY IS NOT RESIDENCY. The top[12] rows carry res/swap
                  * but they are only the twelve dirtiest regions of the sweep, so
@@ -1458,6 +1466,18 @@ static void *ios_pool_warmer_thread( void *arg )
                         else b = B_OTHER;
                         band_dirty[b] += d;
                         band_res[b] += (unsigned long long)info.pages_resident << 14;
+                        {
+                            int tr = ios_swap_tier_at( raddr );
+                            tier_dirty[tr] += d;
+                            tier_res[tr] += (unsigned long long)info.pages_resident << 14;
+                            tier_swap[tr] += (unsigned long long)info.pages_swapped_out << 14;
+                            if (!tr && b == B_GUEST)
+                            {
+                                guest_anon_dirty += d;
+                                guest_anon_res += (unsigned long long)info.pages_resident << 14;
+                                guest_anon_swap += (unsigned long long)info.pages_swapped_out << 14;
+                            }
+                        }
                         if (b == B_HOST_LOW || b == B_PA)
                         {
                             int w = 0, q;
@@ -1526,6 +1546,7 @@ static void *ios_pool_warmer_thread( void *arg )
                             top[tj].res = (unsigned long long)info.pages_resident << 14;
                             top[tj].swap = (unsigned long long)info.pages_swapped_out << 14;
                             top[tj].tag = info.user_tag;
+                            top[tj].tier = ios_swap_tier_at( raddr );
                         }
                     }
                     raddr += rsize;
@@ -1540,10 +1561,16 @@ static void *ios_pool_warmer_thread( void *arg )
                 for (ti = 0; ti < 12; ti++)
                 {
                     if (!top[ti].dirty) continue;
-                    dprintf(2, "[phys-map]   0x%llx+0x%llx dirty=%llu MB res=%llu MB swap=%llu MB tag=%u\n",
+                    dprintf(2, "[phys-map]   0x%llx+0x%llx dirty=%llu MB res=%llu MB swap=%llu MB tag=%u tier=%s\n",
                             top[ti].base, top[ti].size, top[ti].dirty >> 20,
-                            top[ti].res >> 20, top[ti].swap >> 20, top[ti].tag);
+                            top[ti].res >> 20, top[ti].swap >> 20, top[ti].tag, tier_name[top[ti].tier]);
                 }
+                dprintf(2, "[phys-map] tiers (dirty/res/compressed MB): donor=%llu/%llu/%llu file=%llu/%llu/%llu "
+                           "anon=%llu/%llu/%llu, of which the guest band %llu/%llu/%llu (%u extents)\n",
+                        tier_dirty[2] >> 20, tier_res[2] >> 20, tier_swap[2] >> 20,
+                        tier_dirty[1] >> 20, tier_res[1] >> 20, tier_swap[1] >> 20,
+                        tier_dirty[0] >> 20, tier_res[0] >> 20, tier_swap[0] >> 20,
+                        guest_anon_dirty >> 20, guest_anon_res >> 20, guest_anon_swap >> 20, tier_extents);
                 for (ti = 0; ti < 256; ti++)
                     if ((dirty_by_tag[ti] >> 20) >= 32 || (res_by_tag[ti] >> 20) >= 32 ||
                         (swap_by_tag[ti] >> 20) >= 32)
@@ -23672,6 +23699,53 @@ static int ios_swap_overlaps( const void *base, size_t size )
     return 0;
 }
 int ios_swap_overlaps_probe( const void *base, size_t size ) { return ios_swap_overlaps( base, size ); }
+/* The census walk's tiers: whether a region lies in donor RAM, in the swap file,
+ * or in neither (anonymous memory, which iOS compresses under pressure; donor RAM
+ * is compressed the same way, since it stays where it is). A sorted copy of the
+ * extent table, read without virtual_mutex as the stats line reads it: an extent
+ * that changes during the copy blurs one count of a diagnostic. */
+struct ios_swap_tier { unsigned long long va, end; int donor; };
+static struct ios_swap_tier ios_swap_tier_tab[16384];
+static unsigned ios_swap_tier_n;
+
+static int ios_swap_tier_cmp( const void *a, const void *b )
+{
+    unsigned long long x = ((const struct ios_swap_tier *)a)->va;
+    unsigned long long y = ((const struct ios_swap_tier *)b)->va;
+    return x < y ? -1 : x > y;
+}
+
+unsigned ios_swap_tier_snapshot( void )
+{
+    unsigned i, n = 0, count = __atomic_load_n( &ios_swap_n, __ATOMIC_RELAXED );
+    if (count > 16384) count = 16384;
+    for (i = 0; i < count; i++)
+    {
+        unsigned long long va = (unsigned long long)(uintptr_t)ios_swap_ext[i].va, len = ios_swap_ext[i].len;
+        if (!va || !len) continue;
+        ios_swap_tier_tab[n].va = va;
+        ios_swap_tier_tab[n].end = va + len;
+        ios_swap_tier_tab[n].donor = (ios_swap_ext[i].off & IOS_DONOR_FLAG) != 0;
+        n++;
+    }
+    qsort( ios_swap_tier_tab, n, sizeof(ios_swap_tier_tab[0]), ios_swap_tier_cmp );
+    ios_swap_tier_n = n;
+    return n;
+}
+
+/* 0 neither (anonymous), 1 the swap file, 2 donor RAM */
+int ios_swap_tier_at( unsigned long long addr )
+{
+    unsigned lo = 0, hi = ios_swap_tier_n;
+    while (lo < hi)
+    {
+        unsigned mid = (lo + hi) / 2;
+        if (ios_swap_tier_tab[mid].va <= addr) lo = mid + 1; else hi = mid;
+    }
+    if (!lo || addr >= ios_swap_tier_tab[lo - 1].end) return 0;
+    return ios_swap_tier_tab[lo - 1].donor ? 2 : 1;
+}
+
 void ios_swap_stats_line( void )
 {
     unsigned long long disk;
