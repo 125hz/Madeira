@@ -535,6 +535,28 @@ static void test_deferred_punch( void )
 }
 
 /* ml1297: a range whose punch failed is never reused */
+/* The census's tiers: a sorted copy of the extent table, donor offsets apart,
+ * an address outside every extent anonymous. Run last: it rewrites the table. */
+static void test_tiers( void )
+{
+    ios_swap_n = 0;
+    ios_swap_ext[ios_swap_n].va = (char *)0x7300000000ull; ios_swap_ext[ios_swap_n].len = 0x100000;
+    ios_swap_ext[ios_swap_n++].off = 0x200000;
+    ios_swap_ext[ios_swap_n].va = (char *)0x7100000000ull; ios_swap_ext[ios_swap_n].len = 0x400000;
+    ios_swap_ext[ios_swap_n++].off = IOS_DONOR_FLAG | 0x1000000;
+    ios_swap_ext[ios_swap_n].va = (char *)0x7200000000ull; ios_swap_ext[ios_swap_n].len = 0;   /* a released slot */
+    ios_swap_ext[ios_swap_n++].off = 0;
+    CHECK( ios_swap_tier_snapshot() == 2, "tiers: two live extents copied" );
+    CHECK( ios_swap_tier_at( 0x7100000000ull ) == 2, "tiers: a donor extent's start" );
+    CHECK( ios_swap_tier_at( 0x71003fffffull ) == 2, "tiers: a donor extent's last byte" );
+    CHECK( ios_swap_tier_at( 0x7100400000ull ) == 0, "tiers: past a donor extent, anonymous" );
+    CHECK( ios_swap_tier_at( 0x7300080000ull ) == 1, "tiers: inside a file extent" );
+    CHECK( ios_swap_tier_at( 0x7200000000ull ) == 0, "tiers: a released slot is anonymous" );
+    CHECK( ios_swap_tier_at( 0x7000000000ull ) == 0, "tiers: below every extent" );
+    ios_swap_n = 0;
+    CHECK( ios_swap_tier_snapshot() == 0 && ios_swap_tier_at( 0x7300000000ull ) == 0, "tiers: an empty table" );
+}
+
 static void test_punch_failure( void )
 {
     int fd = ios_swap_fd, nullfd = open( "/dev/null", O_RDONLY ), waited;
@@ -606,6 +628,7 @@ int main( int argc, char **argv )
     test_punch_failure();
     env( "blocks", NULL, NULL );
     ios_swap_tick( 1 );
+    test_tiers();
     printf( "%d failures\n", bad );
     return bad != 0;
 }
